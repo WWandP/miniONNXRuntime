@@ -17,11 +17,19 @@ env/
 
 # Build / packaging
 build/
+build-*/
 dist/
 *.egg-info/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+Makefile
 
 # IDE / editor
 .DS_Store
 .idea/
-.vscode/
-
+.vscode/*
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/launch.json
+!.vscode/extensions.json

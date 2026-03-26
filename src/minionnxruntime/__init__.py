@@ -1,2 +1,0 @@
-"""miniONNXRuntime teaching project."""
-
