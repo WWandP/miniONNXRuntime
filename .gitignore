@@ -18,12 +18,15 @@ env/
 # Build / packaging
 build/
 build-*/
+build_*/
 dist/
 *.egg-info/
 CMakeFiles/
 CMakeCache.txt
 cmake_install.cmake
 Makefile
+outputs/
+resume/
 
 # IDE / editor
 .DS_Store

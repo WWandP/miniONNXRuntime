@@ -1,6 +1,7 @@
 #include "miniort/loader/onnx_loader.h"
 
 #include <deque>
+#include <cstring>
 #include <fstream>
 #include <iterator>
 #include <stdexcept>
@@ -98,6 +99,21 @@ TensorData ParseTensorData(const onnx::TensorProto& tensor_proto) {
   data.int32_data.assign(tensor_proto.int32_data().begin(), tensor_proto.int32_data().end());
   data.int64_data.assign(tensor_proto.int64_data().begin(), tensor_proto.int64_data().end());
   data.string_data.assign(tensor_proto.string_data().begin(), tensor_proto.string_data().end());
+
+  if (!data.raw_data.empty()) {
+    if (data.dtype == "float32" && data.float_data.empty() &&
+        data.raw_data.size() % sizeof(float) == 0) {
+      const auto count = data.raw_data.size() / sizeof(float);
+      data.float_data.resize(count);
+      std::memcpy(data.float_data.data(), data.raw_data.data(), data.raw_data.size());
+    }
+    if (data.dtype == "int64" && data.int64_data.empty() &&
+        data.raw_data.size() % sizeof(std::int64_t) == 0) {
+      const auto count = data.raw_data.size() / sizeof(std::int64_t);
+      data.int64_data.resize(count);
+      std::memcpy(data.int64_data.data(), data.raw_data.data(), data.raw_data.size());
+    }
+  }
 
   return data;
 }
