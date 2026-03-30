@@ -9,6 +9,7 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 option(MINIORT_BUILD_INSPECT "Build phase-1 inspect tool" ON)
 option(MINIORT_BUILD_RUNTIME_TOOLS "Build phase-2/3 runtime tools" ON)
 option(MINIORT_BUILD_DETECT_TOOL "Build yolov8n detect demo tool" ON)
+option(MINIORT_BUILD_OPTIMIZER_TOOLS "Build graph optimizer demo tool" OFF)
 
 set(MINIORT_THIRD_PARTY_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party")
 set(MINIORT_ONNX_DIR "${MINIORT_THIRD_PARTY_DIR}/onnx")
@@ -81,6 +82,8 @@ if(MINIORT_BUILD_RUNTIME_TOOLS OR MINIORT_BUILD_DETECT_TOOL)
     src/runtime/tensor.cc
     src/runtime/execution_context.cc
     src/runtime/kernel_registry.cc
+    src/optimizer/graph_optimizer.cc
+    src/tools/yolo_detection.cc
     src/runtime/basic_kernels.cc
     src/runtime/builtin_kernels.cc
     src/runtime/elementwise_kernels.cc
@@ -126,6 +129,14 @@ if(MINIORT_BUILD_RUNTIME_TOOLS)
   )
 
   target_link_libraries(miniort_session_trace PRIVATE miniort_runtime)
+endif()
+
+if(MINIORT_BUILD_OPTIMIZER_TOOLS)
+  add_executable(miniort_optimize_model
+    tools/optimize_model.cc
+  )
+
+  target_link_libraries(miniort_optimize_model PRIVATE miniort_runtime)
 endif()
 
 if(MINIORT_BUILD_DETECT_TOOL)

@@ -54,7 +54,7 @@ Options ParseArgs(int argc, char* argv[]) {
 int main(int argc, char* argv[]) {
   try {
     const auto options = ParseArgs(argc, argv);
-    auto graph = miniort::LoadOnnxGraph(options.model_path);
+    auto graph = miniort::LoadOnnxGraph(options.model_path, &std::cout);
 
     miniort::Session session(std::move(graph),
                              {.verbose = options.verbose,

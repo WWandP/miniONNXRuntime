@@ -16,6 +16,7 @@ struct Options {
   std::string model_path;
   std::string image_path;
   bool verbose{false};
+  bool profile{false};
   bool allow_missing_kernels{true};
   std::size_t context_dump_limit{20};
   std::size_t max_nodes{0};
@@ -24,7 +25,7 @@ struct Options {
 Options ParseArgs(int argc, char* argv[]) {
   if (argc < 2) {
     throw std::runtime_error(
-        "usage: miniort_run <model.onnx> [--image path] [--verbose] [--strict-kernel] [--context-dump-limit N]");
+        "usage: miniort_run <model.onnx> [--image path] [--verbose] [--profile] [--strict-kernel] [--context-dump-limit N]");
   }
 
   Options options;
@@ -33,6 +34,10 @@ Options ParseArgs(int argc, char* argv[]) {
     const std::string arg = argv[i];
     if (arg == "--verbose") {
       options.verbose = true;
+      continue;
+    }
+    if (arg == "--profile") {
+      options.profile = true;
       continue;
     }
     if (arg == "--image" && i + 1 < argc) {
@@ -62,7 +67,8 @@ Options ParseArgs(int argc, char* argv[]) {
 int main(int argc, char* argv[]) {
   try {
     const auto options = ParseArgs(argc, argv);
-    auto graph = miniort::LoadOnnxGraph(options.model_path);
+    std::ostream* trace = (options.verbose || options.profile) ? &std::cout : nullptr;
+    auto graph = miniort::LoadOnnxGraph(options.model_path, trace);
     std::unordered_map<std::string, miniort::Tensor> feeds;
     if (!options.image_path.empty()) {
       if (graph.inputs.empty()) {
@@ -71,7 +77,7 @@ int main(int argc, char* argv[]) {
       const auto& input = graph.inputs.front();
       feeds.emplace(input.name,
                     miniort::LoadImageAsNchwTensor(std::filesystem::path(options.image_path), input.name, input.info,
-                                                   &std::cout));
+                                                   trace));
     }
 
     miniort::Session session(std::move(graph),
@@ -81,7 +87,7 @@ int main(int argc, char* argv[]) {
                               .max_nodes = options.max_nodes});
 
     miniort::ExecutionContext context;
-    const auto summary = session.Run(feeds, context, &std::cout);
+    const auto summary = session.Run(feeds, context, trace);
 
     std::cout << "\nfinal_context\n";
     context.Dump(std::cout, options.context_dump_limit);

@@ -9,6 +9,8 @@
 
 #include <onnx/onnx_pb.h>
 
+#include "miniort/runtime/profiling.h"
+
 namespace miniort {
 
 namespace {
@@ -214,105 +216,131 @@ std::vector<std::size_t> BuildTopologicalOrder(const std::vector<Node>& nodes) {
 
 }  // namespace
 
-Graph LoadOnnxGraph(const std::filesystem::path& model_path) {
+Graph LoadOnnxGraph(const std::filesystem::path& model_path, std::ostream* trace) {
+  TimingMap timings;
   std::ifstream input(model_path, std::ios::binary);
   if (!input) {
     throw std::runtime_error("failed to open model: " + model_path.string());
   }
 
   onnx::ModelProto model;
-  if (!model.ParseFromIstream(&input)) {
-    throw std::runtime_error("failed to parse ONNX ModelProto: " + model_path.string());
+  {
+    ScopedTimer timer("loader.parse_model_proto", trace, &timings["loader.parse_model_proto"]);
+    if (!model.ParseFromIstream(&input)) {
+      throw std::runtime_error("failed to parse ONNX ModelProto: " + model_path.string());
+    }
   }
 
   const auto& graph_proto = model.graph();
   Graph graph;
 
-  // Copy high-level model metadata into the minimal internal graph.
-  // This is mostly a direct transfer, with a few defaults filled in locally
-  // (for example, graph name and the default ONNX domain).
-  graph.name = graph_proto.name().empty() ? model_path.stem().string() : graph_proto.name();
-  graph.metadata.model_path = model_path.string();
-  graph.metadata.ir_version = model.ir_version();
-  graph.metadata.producer_name = model.producer_name();
-  graph.metadata.producer_version = model.producer_version();
+  {
+    ScopedTimer timer("loader.read_metadata", trace, &timings["loader.read_metadata"]);
+    // Copy high-level model metadata into the minimal internal graph.
+    // This is mostly a direct transfer, with a few defaults filled in locally
+    // (for example, graph name and the default ONNX domain).
+    graph.name = graph_proto.name().empty() ? model_path.stem().string() : graph_proto.name();
+    graph.metadata.model_path = model_path.string();
+    graph.metadata.ir_version = model.ir_version();
+    graph.metadata.producer_name = model.producer_name();
+    graph.metadata.producer_version = model.producer_version();
 
-  for (const auto& opset : model.opset_import()) {
-    const auto domain = opset.domain().empty() ? "ai.onnx" : opset.domain();
-    graph.metadata.opset_imports[domain] = opset.version();
+    for (const auto& opset : model.opset_import()) {
+      const auto domain = opset.domain().empty() ? "ai.onnx" : opset.domain();
+      graph.metadata.opset_imports[domain] = opset.version();
+    }
   }
 
-  // Collect type/shape metadata for named values.
-  // We keep only the TensorInfo needed by this project and intentionally drop
-  // richer ONNX type details that are not used by the current mini runtime.
-  for (const auto& value_info : graph_proto.input()) {
-    AddValueInfo(value_info, graph);
-  }
-  for (const auto& value_info : graph_proto.output()) {
-    AddValueInfo(value_info, graph);
-  }
-  for (const auto& value_info : graph_proto.value_info()) {
-    AddValueInfo(value_info, graph);
+  {
+    ScopedTimer timer("loader.collect_value_infos", trace, &timings["loader.collect_value_infos"]);
+    // Collect type/shape metadata for named values.
+    // We keep only the TensorInfo needed by this project and intentionally drop
+    // richer ONNX type details that are not used by the current mini runtime.
+    for (const auto& value_info : graph_proto.input()) {
+      AddValueInfo(value_info, graph);
+    }
+    for (const auto& value_info : graph_proto.output()) {
+      AddValueInfo(value_info, graph);
+    }
+    for (const auto& value_info : graph_proto.value_info()) {
+      AddValueInfo(value_info, graph);
+    }
   }
 
   std::unordered_set<std::string> initializer_names;
-  // Lift initializers into a dedicated map of constant values.
-  // Here we keep basic tensor metadata and a minimal constant-data view for
-  // simple scalar/list payloads and raw bytes. More advanced TensorProto
-  // storage modes are still intentionally left out.
-  for (const auto& initializer : graph_proto.initializer()) {
-    Value value;
-    value.name = initializer.name();
-    value.info = MakeTensorInfo(initializer);
-    value.data = ParseTensorData(initializer);
-    graph.initializers.emplace(value.name, value);
-    graph.value_infos[value.name] = value.info;
-    initializer_names.insert(value.name);
-  }
-
-  // Build the true graph input list by excluding entries that are also
-  // initializers. ONNX may list weights in graph inputs, but for this project
-  // we separate runtime feeds from constant parameters.
-  for (const auto& input_value : graph_proto.input()) {
-    if (initializer_names.contains(input_value.name())) {
-      continue;
+  {
+    ScopedTimer timer("loader.collect_initializers", trace, &timings["loader.collect_initializers"]);
+    // Lift initializers into a dedicated map of constant values.
+    // Here we keep basic tensor metadata and a minimal constant-data view for
+    // simple scalar/list payloads and raw bytes. More advanced TensorProto
+    // storage modes are still intentionally left out.
+    for (const auto& initializer : graph_proto.initializer()) {
+      Value value;
+      value.name = initializer.name();
+      value.info = MakeTensorInfo(initializer);
+      value.data = ParseTensorData(initializer);
+      graph.initializers.emplace(value.name, value);
+      graph.value_infos[value.name] = value.info;
+      initializer_names.insert(value.name);
     }
-    Value value;
-    value.name = input_value.name();
-    value.info = graph.value_infos[value.name];
-    graph.inputs.push_back(std::move(value));
   }
 
-  for (const auto& output_value : graph_proto.output()) {
-    Value value;
-    value.name = output_value.name();
-    value.info = graph.value_infos[value.name];
-    graph.outputs.push_back(std::move(value));
-  }
-
-  // Convert ONNX nodes into the minimal internal node form.
-  // We keep only name, op type, and input/output edges. Attributes, domains,
-  // and doc strings are still trimmed, but basic attributes are now captured
-  // in a compact internal form so later passes/runtime code can inspect them.
-  graph.nodes.reserve(static_cast<std::size_t>(graph_proto.node_size()));
-  for (int i = 0; i < graph_proto.node_size(); ++i) {
-    const auto& node_proto = graph_proto.node(i);
-    Node node;
-    node.name = node_proto.name().empty() ? node_proto.op_type() + "_" + std::to_string(i) : node_proto.name();
-    node.op_type = node_proto.op_type();
-    node.inputs.assign(node_proto.input().begin(), node_proto.input().end());
-    node.outputs.assign(node_proto.output().begin(), node_proto.output().end());
-    for (const auto& attr : node_proto.attribute()) {
-      node.attributes.emplace(attr.name(), ParseAttributeValue(attr));
+  {
+    ScopedTimer timer("loader.collect_inputs_outputs", trace, &timings["loader.collect_inputs_outputs"]);
+    // Build the true graph input list by excluding entries that are also
+    // initializers. ONNX may list weights in graph inputs, but for this project
+    // we separate runtime feeds from constant parameters.
+    for (const auto& input_value : graph_proto.input()) {
+      if (initializer_names.contains(input_value.name())) {
+        continue;
+      }
+      Value value;
+      value.name = input_value.name();
+      value.info = graph.value_infos[value.name];
+      graph.inputs.push_back(std::move(value));
     }
-    graph.node_name_to_index[node.name] = graph.nodes.size();
-    ++graph.op_type_histogram[node.op_type];
-    graph.nodes.push_back(std::move(node));
+
+    for (const auto& output_value : graph_proto.output()) {
+      Value value;
+      value.name = output_value.name();
+      value.info = graph.value_infos[value.name];
+      graph.outputs.push_back(std::move(value));
+    }
   }
 
-  // Derive runtime-friendly helper structures that do not exist in the raw
-  // ONNX graph: a name index, op histogram, and topological execution order.
-  graph.topological_order = BuildTopologicalOrder(graph.nodes);
+  {
+    ScopedTimer timer("loader.collect_nodes", trace, &timings["loader.collect_nodes"]);
+    // Convert ONNX nodes into the minimal internal node form.
+    // We keep only name, op type, and input/output edges. Attributes, domains,
+    // and doc strings are still trimmed, but basic attributes are now captured
+    // in a compact internal form so later passes/runtime code can inspect them.
+    graph.nodes.reserve(static_cast<std::size_t>(graph_proto.node_size()));
+    for (int i = 0; i < graph_proto.node_size(); ++i) {
+      const auto& node_proto = graph_proto.node(i);
+      Node node;
+      node.name = node_proto.name().empty() ? node_proto.op_type() + "_" + std::to_string(i) : node_proto.name();
+      node.op_type = node_proto.op_type();
+      node.inputs.assign(node_proto.input().begin(), node_proto.input().end());
+      node.outputs.assign(node_proto.output().begin(), node_proto.output().end());
+      for (const auto& attr : node_proto.attribute()) {
+        node.attributes.emplace(attr.name(), ParseAttributeValue(attr));
+      }
+      graph.node_name_to_index[node.name] = graph.nodes.size();
+      ++graph.op_type_histogram[node.op_type];
+      graph.nodes.push_back(std::move(node));
+    }
+  }
+
+  {
+    ScopedTimer timer("loader.build_topological_order", trace, &timings["loader.build_topological_order"]);
+    // Derive runtime-friendly helper structures that do not exist in the raw
+    // ONNX graph: a name index, op histogram, and topological execution order.
+    graph.topological_order = BuildTopologicalOrder(graph.nodes);
+  }
+
+  if (trace != nullptr) {
+    PrintTimingSummary(timings, *trace, "loader timing summary");
+  }
   return graph;
 }
 
