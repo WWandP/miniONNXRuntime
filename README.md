@@ -32,6 +32,8 @@ flowchart LR
 - buffer reuse / 内存优化
 - 更通用的模型支持
 
+图优化细节记录在 [GRAPH_OPTIMIZATION.md](./GRAPH_OPTIMIZATION.md)。
+
 ## Quick Start
 
 ```bash

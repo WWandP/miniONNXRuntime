@@ -59,6 +59,67 @@ Value MakeInitializerValueFromTensor(const Tensor& tensor) {
   return value;
 }
 
+std::optional<std::int64_t> ParseConcreteDim(const std::string& dim) {
+  if (dim.empty() || dim == "?") {
+    return std::nullopt;
+  }
+
+  std::size_t parsed = 0;
+  try {
+    const auto value = std::stoll(dim, &parsed);
+    if (parsed == dim.size()) {
+      return value;
+    }
+  } catch (...) {
+  }
+  return std::nullopt;
+}
+
+std::optional<std::vector<std::int64_t>> ResolveStaticShapeOfValue(const Graph& graph, const std::string& name) {
+  auto try_info = [](const TensorInfo& info) -> std::optional<std::vector<std::int64_t>> {
+    std::vector<std::int64_t> shape;
+    shape.reserve(info.shape.size());
+    for (const auto& dim : info.shape) {
+      const auto concrete = ParseConcreteDim(dim);
+      if (!concrete.has_value()) {
+        return std::nullopt;
+      }
+      shape.push_back(*concrete);
+    }
+    return shape;
+  };
+
+  const auto init_it = graph.initializers.find(name);
+  if (init_it != graph.initializers.end() && init_it->second.data.has_value()) {
+    return init_it->second.data->shape;
+  }
+
+  const auto value_info_it = graph.value_infos.find(name);
+  if (value_info_it != graph.value_infos.end()) {
+    if (const auto shape = try_info(value_info_it->second); shape.has_value()) {
+      return shape;
+    }
+  }
+
+  const auto input_it = std::find_if(graph.inputs.begin(), graph.inputs.end(),
+                                     [&name](const Value& value) { return value.name == name; });
+  if (input_it != graph.inputs.end()) {
+    if (const auto shape = try_info(input_it->info); shape.has_value()) {
+      return shape;
+    }
+  }
+
+  const auto output_it = std::find_if(graph.outputs.begin(), graph.outputs.end(),
+                                      [&name](const Value& value) { return value.name == name; });
+  if (output_it != graph.outputs.end()) {
+    if (const auto shape = try_info(output_it->info); shape.has_value()) {
+      return shape;
+    }
+  }
+
+  return std::nullopt;
+}
+
 std::optional<Tensor> ResolveConstantTensor(const Graph& graph, const std::string& name) {
   if (name.empty()) {
     return std::nullopt;
@@ -120,6 +181,87 @@ float ReadScalarFloat32AllowEmpty(const Tensor& tensor, const std::string& op_ty
     throw std::runtime_error(op_type + " requires scalar float32 input: " + tensor.name);
   }
   return data.front();
+}
+
+bool IsZeroTensor(const Tensor& tensor) {
+  if (tensor.dtype == "float32") {
+    const auto& data = RequireFloatDataAllowEmpty(tensor, "constant check");
+    if (data.empty() && GetElementCount(tensor.shape) != 0) {
+      return false;
+    }
+    return std::all_of(data.begin(), data.end(), [](float value) { return value == 0.0f; });
+  }
+  if (tensor.dtype == "int64") {
+    const auto& data = RequireInt64DataAllowEmpty(tensor, "constant check");
+    if (data.empty() && GetElementCount(tensor.shape) != 0) {
+      return false;
+    }
+    return std::all_of(data.begin(), data.end(), [](std::int64_t value) { return value == 0; });
+  }
+  return false;
+}
+
+bool IsOneTensor(const Tensor& tensor) {
+  if (tensor.dtype == "float32") {
+    const auto& data = RequireFloatDataAllowEmpty(tensor, "constant check");
+    if (data.empty() && GetElementCount(tensor.shape) != 0) {
+      return false;
+    }
+    return std::all_of(data.begin(), data.end(), [](float value) { return value == 1.0f; });
+  }
+  if (tensor.dtype == "int64") {
+    const auto& data = RequireInt64DataAllowEmpty(tensor, "constant check");
+    if (data.empty() && GetElementCount(tensor.shape) != 0) {
+      return false;
+    }
+    return std::all_of(data.begin(), data.end(), [](std::int64_t value) { return value == 1; });
+  }
+  return false;
+}
+
+void ReplaceTensorNameUses(Graph& graph, const std::string& from, const std::string& to) {
+  if (from == to) {
+    return;
+  }
+
+  for (auto& node : graph.nodes) {
+    for (auto& input : node.inputs) {
+      if (input == from) {
+        input = to;
+      }
+    }
+  }
+
+  for (auto& output : graph.outputs) {
+    if (output.name == from) {
+      output.name = to;
+    }
+  }
+}
+
+std::optional<Tensor> MakeFilledTensorFromStaticShape(const Graph& graph, const std::string& name,
+                                                     const Tensor& source, bool fill_one) {
+  const auto static_shape = ResolveStaticShapeOfValue(graph, name);
+  if (!static_shape.has_value()) {
+    return std::nullopt;
+  }
+
+  Tensor output;
+  output.name = source.name;
+  output.dtype = source.dtype;
+  output.shape = *static_shape;
+  output.is_placeholder = false;
+
+  const auto element_count = GetElementCount(output.shape);
+  if (source.dtype == "float32") {
+    output.float_data.assign(element_count, fill_one ? 1.0f : 0.0f);
+  } else if (source.dtype == "int64") {
+    output.int64_data.assign(element_count, fill_one ? 1 : 0);
+  } else {
+    return std::nullopt;
+  }
+
+  return output;
 }
 
 void RebuildGraphDerivedState(Graph& graph) {
@@ -243,7 +385,159 @@ std::optional<Tensor> FoldConcatNode(const Node& node, const std::vector<Tensor>
   return std::nullopt;
 }
 
-std::optional<Tensor> FoldConstantNode(const Graph& graph, const Node& node) {
+std::optional<Tensor> SimplifyBinaryElementwiseNode(Graph& graph, const Node& node, bool* rewired_to_input) {
+  if (node.inputs.size() != 2 || node.outputs.empty()) {
+    return std::nullopt;
+  }
+
+  if (rewired_to_input != nullptr) {
+    *rewired_to_input = false;
+  }
+
+  const auto lhs_name = node.inputs.at(0);
+  const auto rhs_name = node.inputs.at(1);
+  const auto output_name = node.outputs.at(0);
+  const auto lhs = ResolveConstantTensor(graph, lhs_name);
+  const auto rhs = ResolveConstantTensor(graph, rhs_name);
+
+  if (node.op_type == "Add") {
+    if (rhs.has_value() && IsZeroTensor(*rhs)) {
+      ReplaceTensorNameUses(graph, output_name, lhs_name);
+      graph.value_infos.erase(output_name);
+      graph.initializers.erase(output_name);
+      if (rewired_to_input != nullptr) {
+        *rewired_to_input = true;
+      }
+      return std::nullopt;
+    }
+    if (lhs.has_value() && IsZeroTensor(*lhs)) {
+      ReplaceTensorNameUses(graph, output_name, rhs_name);
+      graph.value_infos.erase(output_name);
+      graph.initializers.erase(output_name);
+      if (rewired_to_input != nullptr) {
+        *rewired_to_input = true;
+      }
+      return std::nullopt;
+    }
+  } else if (node.op_type == "Sub") {
+    if (rhs.has_value() && IsZeroTensor(*rhs)) {
+      ReplaceTensorNameUses(graph, output_name, lhs_name);
+      graph.value_infos.erase(output_name);
+      graph.initializers.erase(output_name);
+      if (rewired_to_input != nullptr) {
+        *rewired_to_input = true;
+      }
+      return std::nullopt;
+    }
+  } else if (node.op_type == "Mul") {
+    if (rhs.has_value() && IsZeroTensor(*rhs)) {
+      if (auto zero = MakeFilledTensorFromStaticShape(graph, lhs_name, *rhs, false)) {
+        zero->name = output_name;
+        return zero;
+      }
+    }
+    if (lhs.has_value() && IsZeroTensor(*lhs)) {
+      if (auto zero = MakeFilledTensorFromStaticShape(graph, rhs_name, *lhs, false)) {
+        zero->name = output_name;
+        return zero;
+      }
+    }
+    if (rhs.has_value() && IsOneTensor(*rhs)) {
+      ReplaceTensorNameUses(graph, output_name, lhs_name);
+      graph.value_infos.erase(output_name);
+      graph.initializers.erase(output_name);
+      if (rewired_to_input != nullptr) {
+        *rewired_to_input = true;
+      }
+      return std::nullopt;
+    }
+    if (lhs.has_value() && IsOneTensor(*lhs)) {
+      ReplaceTensorNameUses(graph, output_name, rhs_name);
+      graph.value_infos.erase(output_name);
+      graph.initializers.erase(output_name);
+      if (rewired_to_input != nullptr) {
+        *rewired_to_input = true;
+      }
+      return std::nullopt;
+    }
+  } else if (node.op_type == "Div") {
+    if (rhs.has_value() && IsOneTensor(*rhs)) {
+      ReplaceTensorNameUses(graph, output_name, lhs_name);
+      graph.value_infos.erase(output_name);
+      graph.initializers.erase(output_name);
+      if (rewired_to_input != nullptr) {
+        *rewired_to_input = true;
+      }
+      return std::nullopt;
+    }
+  }
+
+  return std::nullopt;
+}
+
+struct ConvSiLUFusionMatch {
+  std::size_t conv_index{0};
+  std::size_t sigmoid_index{0};
+  std::size_t mul_index{0};
+};
+
+std::optional<ConvSiLUFusionMatch> MatchConvSiLUFusion(
+    const Graph& graph, const std::unordered_map<std::string, std::vector<std::size_t>>& consumers,
+    std::size_t conv_index) {
+  const auto& conv = graph.nodes.at(conv_index);
+  if (conv.op_type != "Conv" || conv.outputs.size() != 1 || conv.inputs.size() < 2) {
+    return std::nullopt;
+  }
+
+  const auto& conv_output = conv.outputs.at(0);
+  const auto consumer_it = consumers.find(conv_output);
+  if (consumer_it == consumers.end() || consumer_it->second.size() != 2) {
+    return std::nullopt;
+  }
+
+  std::optional<std::size_t> sigmoid_index;
+  std::optional<std::size_t> mul_index;
+  for (const auto index : consumer_it->second) {
+    const auto& consumer = graph.nodes.at(index);
+    if (consumer.op_type == "Sigmoid") {
+      sigmoid_index = index;
+    } else if (consumer.op_type == "Mul") {
+      mul_index = index;
+    }
+  }
+
+  if (!sigmoid_index.has_value() || !mul_index.has_value()) {
+    return std::nullopt;
+  }
+
+  const auto& sigmoid = graph.nodes.at(*sigmoid_index);
+  if (sigmoid.inputs.size() != 1 || sigmoid.outputs.size() != 1) {
+    return std::nullopt;
+  }
+
+  const auto& sigmoid_output = sigmoid.outputs.at(0);
+  const auto sigmoid_consumer_it = consumers.find(sigmoid_output);
+  if (sigmoid_consumer_it == consumers.end() || sigmoid_consumer_it->second.size() != 1 ||
+      sigmoid_consumer_it->second.front() != *mul_index) {
+    return std::nullopt;
+  }
+
+  const auto& mul = graph.nodes.at(*mul_index);
+  if (mul.inputs.size() != 2 || mul.outputs.size() != 1) {
+    return std::nullopt;
+  }
+
+  const bool matched =
+      (mul.inputs.at(0) == conv_output && mul.inputs.at(1) == sigmoid_output) ||
+      (mul.inputs.at(1) == conv_output && mul.inputs.at(0) == sigmoid_output);
+  if (!matched) {
+    return std::nullopt;
+  }
+
+  return ConvSiLUFusionMatch{conv_index, *sigmoid_index, *mul_index};
+}
+
+std::optional<Tensor> FoldConstantNode(const Graph& graph, const Node& node, bool allow_static_shape = false) {
   const auto get_input = [&](std::size_t index) -> std::optional<Tensor> {
     if (index >= node.inputs.size()) {
       return std::nullopt;
@@ -274,15 +568,29 @@ std::optional<Tensor> FoldConstantNode(const Graph& graph, const Node& node) {
 
   if (node.op_type == "Shape") {
     const auto input = get_input(0);
-    if (!input.has_value() || !HasConcreteShape(input->shape)) {
-      return std::nullopt;
+    if (input.has_value() && HasConcreteShape(input->shape)) {
+      Tensor output;
+      output.name = node.outputs.at(0);
+      output.dtype = "int64";
+      output.shape = {static_cast<std::int64_t>(input->shape.size())};
+      output.int64_data = input->shape;
+      return output;
     }
-    Tensor output;
-    output.name = node.outputs.at(0);
-    output.dtype = "int64";
-    output.shape = {static_cast<std::int64_t>(input->shape.size())};
-    output.int64_data = input->shape;
-    return output;
+
+    if (allow_static_shape) {
+      const auto static_shape = ResolveStaticShapeOfValue(graph, node.inputs.at(0));
+      if (!static_shape.has_value()) {
+        return std::nullopt;
+      }
+      Tensor output;
+      output.name = node.outputs.at(0);
+      output.dtype = "int64";
+      output.shape = {static_cast<std::int64_t>(static_shape->size())};
+      output.int64_data = *static_shape;
+      return output;
+    }
+
+    return std::nullopt;
   }
 
   if (node.op_type == "Gather") {
@@ -934,6 +1242,128 @@ std::optional<Tensor> FoldConstantNode(const Graph& graph, const Node& node) {
   return std::nullopt;
 }
 
+bool IsIdentityTranspose(const Node& node, const Tensor& input) {
+  std::vector<std::int64_t> perm;
+  const auto perm_it = node.attributes.find("perm");
+  if (perm_it == node.attributes.end() || perm_it->second.ints.empty()) {
+    perm.resize(input.shape.size());
+    for (std::size_t i = 0; i < perm.size(); ++i) {
+      perm[i] = static_cast<std::int64_t>(perm.size() - 1 - i);
+    }
+  } else {
+    perm = perm_it->second.ints;
+  }
+
+  if (input.shape.empty()) {
+    return perm.empty();
+  }
+
+  if (perm.size() != input.shape.size()) {
+    return false;
+  }
+
+  for (std::size_t i = 0; i < perm.size(); ++i) {
+    if (perm[i] != static_cast<std::int64_t>(i)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+bool IsIdentityReshape(const Tensor& input, const Tensor& shape_tensor) {
+  const auto requested_shape = ReadVectorAsInt64AllowEmpty(shape_tensor, "Reshape");
+  std::vector<std::int64_t> resolved;
+  resolved.reserve(requested_shape.size());
+
+  const std::size_t input_count = GetElementCount(input.shape);
+  std::int64_t infer_index = -1;
+  std::size_t known_product = 1;
+  for (std::size_t i = 0; i < requested_shape.size(); ++i) {
+    const auto dim = requested_shape[i];
+    if (dim == 0) {
+      if (i >= input.shape.size()) {
+        return false;
+      }
+      resolved.push_back(input.shape[i]);
+      known_product *= static_cast<std::size_t>(input.shape[i]);
+    } else if (dim == -1) {
+      if (infer_index != -1) {
+        return false;
+      }
+      infer_index = static_cast<std::int64_t>(i);
+      resolved.push_back(-1);
+    } else {
+      resolved.push_back(dim);
+      known_product *= static_cast<std::size_t>(dim);
+    }
+  }
+
+  if (infer_index != -1) {
+    if (known_product == 0 || input_count % known_product != 0) {
+      return false;
+    }
+    resolved[static_cast<std::size_t>(infer_index)] = static_cast<std::int64_t>(input_count / known_product);
+  }
+
+  if (resolved.size() != input.shape.size()) {
+    return false;
+  }
+  return resolved == input.shape;
+}
+
+bool IsIdentitySlice(const Tensor& data, const Tensor& starts_tensor, const Tensor& ends_tensor,
+                     const std::optional<Tensor>& axes_tensor, const std::optional<Tensor>& steps_tensor) {
+  const auto starts = ReadVectorAsInt64AllowEmpty(starts_tensor, "Slice");
+  const auto ends = ReadVectorAsInt64AllowEmpty(ends_tensor, "Slice");
+  if (starts.size() != ends.size()) {
+    return false;
+  }
+
+  std::vector<std::int64_t> axes(starts.size());
+  if (axes_tensor.has_value()) {
+    axes = ReadVectorAsInt64AllowEmpty(*axes_tensor, "Slice");
+  } else {
+    for (std::size_t i = 0; i < axes.size(); ++i) {
+      axes[i] = static_cast<std::int64_t>(i);
+    }
+  }
+  if (axes.size() != starts.size()) {
+    return false;
+  }
+
+  std::vector<std::int64_t> steps(starts.size(), 1);
+  if (steps_tensor.has_value()) {
+    steps = ReadVectorAsInt64AllowEmpty(*steps_tensor, "Slice");
+  }
+  if (steps.size() != starts.size()) {
+    return false;
+  }
+
+  for (std::size_t i = 0; i < starts.size(); ++i) {
+    const auto axis = static_cast<std::size_t>(NormalizeAxis(axes[i], data.shape.size(), "Slice"));
+    const auto dim = data.shape[axis];
+    const auto step = steps[i];
+    if (step != 1) {
+      return false;
+    }
+
+    auto start = starts[i];
+    auto end = ends[i];
+    if (start < 0) {
+      start += dim;
+    }
+    if (end < 0) {
+      end += dim;
+    }
+
+    if (start != 0 || end != dim) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
 bool RunConstantFolding(Graph& graph, std::ostream* trace) {
   std::vector<Node> kept_nodes;
   kept_nodes.reserve(graph.nodes.size());
@@ -943,7 +1373,7 @@ bool RunConstantFolding(Graph& graph, std::ostream* trace) {
   for (const auto& node : graph.nodes) {
     std::optional<Tensor> folded;
     try {
-      folded = FoldConstantNode(graph, node);
+      folded = FoldConstantNode(graph, node, false);
     } catch (const std::exception&) {
       folded = std::nullopt;
     }
@@ -1071,12 +1501,187 @@ bool RunDeadNodeCleanup(Graph& graph, std::ostream* trace) {
   return true;
 }
 
-bool RunShapeSimplification(Graph& graph, std::ostream* trace) {
-  if (trace != nullptr) {
-    *trace << "  [pass] ShapeSimplification (scaffold, no-op for now)\n";
+bool RunConvRewrite(Graph& graph, std::ostream* trace) {
+  std::unordered_map<std::string, std::vector<std::size_t>> consumers;
+  consumers.reserve(graph.nodes.size());
+  for (std::size_t i = 0; i < graph.nodes.size(); ++i) {
+    for (const auto& input : graph.nodes[i].inputs) {
+      if (input.empty()) {
+        continue;
+      }
+      consumers[input].push_back(i);
+    }
   }
+
+  std::vector<bool> removed(graph.nodes.size(), false);
+  std::vector<Node> kept_nodes;
+  kept_nodes.reserve(graph.nodes.size());
+  std::size_t fused_nodes = 0;
+
+  for (std::size_t i = 0; i < graph.nodes.size(); ++i) {
+    if (removed[i]) {
+      continue;
+    }
+
+    const auto& node = graph.nodes[i];
+    if (node.op_type == "Conv") {
+      const auto match = MatchConvSiLUFusion(graph, consumers, i);
+      if (match.has_value()) {
+        const auto& conv = graph.nodes[match->conv_index];
+        const auto& sigmoid = graph.nodes[match->sigmoid_index];
+        const auto& mul = graph.nodes[match->mul_index];
+
+        Node fused;
+        fused.name = conv.name.empty() ? mul.name + "_ConvSiLU" : conv.name + "_ConvSiLU";
+        fused.op_type = "ConvSiLU";
+        fused.inputs = conv.inputs;
+        fused.outputs = mul.outputs;
+        fused.attributes = conv.attributes;
+        kept_nodes.push_back(std::move(fused));
+
+        graph.value_infos.erase(conv.outputs.at(0));
+        graph.value_infos.erase(sigmoid.outputs.at(0));
+        removed[match->sigmoid_index] = true;
+        removed[match->mul_index] = true;
+        ++fused_nodes;
+        continue;
+      }
+    }
+
+    kept_nodes.push_back(node);
+  }
+
+  if (fused_nodes == 0) {
+    if (trace != nullptr) {
+      *trace << "  [pass] ConvRewrite (no changes)\n";
+    }
+    return false;
+  }
+
+  graph.nodes = std::move(kept_nodes);
   RebuildGraphDerivedState(graph);
-  return false;
+
+  if (trace != nullptr) {
+    *trace << "  [pass] ConvRewrite fused " << fused_nodes << " Conv+Sigmoid+Mul patterns\n";
+  }
+  return true;
+}
+
+bool RunShapeSimplification(Graph& graph, std::ostream* trace) {
+  std::vector<Node> kept_nodes;
+  kept_nodes.reserve(graph.nodes.size());
+  std::size_t simplified_nodes = 0;
+  std::size_t materialized_constants = 0;
+
+  for (const auto& node : graph.nodes) {
+    bool removed = false;
+    if (node.op_type == "Transpose") {
+      const auto input = ResolveConstantTensor(graph, node.inputs.at(0));
+      if (input.has_value() && IsIdentityTranspose(node, *input)) {
+        ++simplified_nodes;
+        ++materialized_constants;
+        graph.initializers[node.outputs.at(0)] = MakeInitializerValueFromTensor(*input);
+        graph.value_infos[node.outputs.at(0)] = MakeTensorInfoFromRuntimeTensor(*input);
+        removed = true;
+      }
+    } else if (node.op_type == "Reshape") {
+      const auto data = ResolveConstantTensor(graph, node.inputs.at(0));
+      const auto shape_tensor = ResolveConstantTensor(graph, node.inputs.at(1));
+      if (data.has_value() && shape_tensor.has_value() && IsIdentityReshape(*data, *shape_tensor)) {
+        ++simplified_nodes;
+        ++materialized_constants;
+        graph.initializers[node.outputs.at(0)] = MakeInitializerValueFromTensor(*data);
+        graph.value_infos[node.outputs.at(0)] = MakeTensorInfoFromRuntimeTensor(*data);
+        removed = true;
+      }
+    } else if (node.op_type == "Slice") {
+      const auto data = ResolveConstantTensor(graph, node.inputs.at(0));
+      const auto starts_tensor = ResolveConstantTensor(graph, node.inputs.at(1));
+      const auto ends_tensor = ResolveConstantTensor(graph, node.inputs.at(2));
+      if (data.has_value() && starts_tensor.has_value() && ends_tensor.has_value()) {
+        std::optional<Tensor> axes_tensor;
+        std::optional<Tensor> steps_tensor;
+        if (node.inputs.size() > 3 && !node.inputs.at(3).empty()) {
+          axes_tensor = ResolveConstantTensor(graph, node.inputs.at(3));
+          if (!axes_tensor.has_value()) {
+            goto no_slice_simplify;
+          }
+        }
+        if (node.inputs.size() > 4 && !node.inputs.at(4).empty()) {
+          steps_tensor = ResolveConstantTensor(graph, node.inputs.at(4));
+          if (!steps_tensor.has_value()) {
+            goto no_slice_simplify;
+          }
+        }
+
+        if (IsIdentitySlice(*data, *starts_tensor, *ends_tensor, axes_tensor, steps_tensor)) {
+          ++simplified_nodes;
+          ++materialized_constants;
+          graph.initializers[node.outputs.at(0)] = MakeInitializerValueFromTensor(*data);
+          graph.value_infos[node.outputs.at(0)] = MakeTensorInfoFromRuntimeTensor(*data);
+          removed = true;
+        }
+      }
+    } else if (node.op_type == "Concat") {
+      if (node.inputs.size() == 1 && !node.outputs.empty()) {
+        ReplaceTensorNameUses(graph, node.outputs.at(0), node.inputs.at(0));
+        graph.value_infos.erase(node.outputs.at(0));
+        graph.initializers.erase(node.outputs.at(0));
+        ++simplified_nodes;
+        removed = true;
+      }
+    } else if (node.op_type == "Add" || node.op_type == "Sub" || node.op_type == "Mul" || node.op_type == "Div") {
+      bool rewired_to_input = false;
+      if (const auto simplified = SimplifyBinaryElementwiseNode(graph, node, &rewired_to_input)) {
+        ++simplified_nodes;
+        ++materialized_constants;
+        graph.initializers[simplified->name] = MakeInitializerValueFromTensor(*simplified);
+        graph.value_infos[simplified->name] = MakeTensorInfoFromRuntimeTensor(*simplified);
+        removed = true;
+      } else if (rewired_to_input) {
+        ++simplified_nodes;
+        removed = true;
+      }
+    }
+
+  no_slice_simplify:
+    if (removed) {
+      continue;
+    }
+
+    std::optional<Tensor> folded;
+    try {
+      folded = FoldConstantNode(graph, node, true);
+    } catch (const std::exception&) {
+      folded = std::nullopt;
+    }
+
+    if (!folded.has_value()) {
+      kept_nodes.push_back(node);
+      continue;
+    }
+
+    ++simplified_nodes;
+    graph.initializers[folded->name] = MakeInitializerValueFromTensor(*folded);
+    graph.value_infos[folded->name] = MakeTensorInfoFromRuntimeTensor(*folded);
+    ++materialized_constants;
+  }
+
+  if (simplified_nodes == 0) {
+    if (trace != nullptr) {
+      *trace << "  [pass] ShapeSimplification (no changes)\n";
+    }
+    return false;
+  }
+
+  graph.nodes = std::move(kept_nodes);
+  RebuildGraphDerivedState(graph);
+
+  if (trace != nullptr) {
+    *trace << "  [pass] ShapeSimplification removed " << simplified_nodes << " nodes, materialized "
+           << materialized_constants << " constants\n";
+  }
+  return true;
 }
 
 }  // namespace
@@ -1100,6 +1705,7 @@ Graph OptimizeGraph(Graph graph, const GraphOptimizationOptions& options,
 
     run_pass("ConstantFolding", options.enable_constant_folding, RunConstantFolding);
     run_pass("DeadNodeCleanup", options.enable_dead_node_cleanup, RunDeadNodeCleanup);
+    run_pass("ConvRewrite", options.enable_conv_silu_fusion, RunConvRewrite);
     run_pass("ShapeSimplification", options.enable_shape_simplification, RunShapeSimplification);
   }
 

@@ -13,6 +13,7 @@ struct GraphOptimizationOptions {
   bool verbose{false};
   bool enable_constant_folding{true};
   bool enable_dead_node_cleanup{true};
+  bool enable_conv_silu_fusion{true};
   bool enable_shape_simplification{true};
 };
 
@@ -29,4 +30,3 @@ Graph OptimizeGraph(Graph graph, const GraphOptimizationOptions& options = {},
 void PrintGraphOptimizationSummary(const GraphOptimizationSummary& summary, std::ostream& os);
 
 }  // namespace miniort
-

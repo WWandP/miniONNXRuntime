@@ -11,6 +11,130 @@
 
 namespace miniort {
 
+namespace {
+
+Tensor RunConv2D(const Node& node, const Tensor& input, const Tensor& weight, const Tensor* bias) {
+  const auto& input_data = RequireFloatData(input, "Conv");
+  const auto& weight_data = RequireFloatData(weight, "Conv");
+  const std::vector<float>* bias_data = nullptr;
+  if (bias != nullptr) {
+    bias_data = &RequireFloatData(*bias, "Conv");
+  }
+
+  if (input.shape.size() != 4 || weight.shape.size() != 4) {
+    throw std::runtime_error("Conv currently only supports 2D NCHW tensors");
+  }
+
+  const auto group = ReadIntAttribute(node, "group", 1);
+  if (group != 1) {
+    throw std::runtime_error("Conv currently only supports group=1");
+  }
+
+  const auto dilations = ReadIntsAttribute(node, "dilations", {1, 1});
+  const auto strides = ReadIntsAttribute(node, "strides", {1, 1});
+  const auto pads = ReadIntsAttribute(node, "pads", {0, 0, 0, 0});
+  if (dilations.size() != 2 || strides.size() != 2 || pads.size() != 4) {
+    throw std::runtime_error("Conv attribute rank is not supported");
+  }
+
+  const auto n = static_cast<std::size_t>(input.shape[0]);
+  const auto c_in = static_cast<std::size_t>(input.shape[1]);
+  const auto h_in = static_cast<std::size_t>(input.shape[2]);
+  const auto w_in = static_cast<std::size_t>(input.shape[3]);
+  const auto c_out = static_cast<std::size_t>(weight.shape[0]);
+  const auto w_c_in = static_cast<std::size_t>(weight.shape[1]);
+  const auto k_h = static_cast<std::size_t>(weight.shape[2]);
+  const auto k_w = static_cast<std::size_t>(weight.shape[3]);
+
+  if (c_in != w_c_in) {
+    throw std::runtime_error("Conv input channel count does not match weight");
+  }
+  if (bias_data != nullptr && bias_data->size() != c_out) {
+    throw std::runtime_error("Conv bias size does not match output channels");
+  }
+
+  const auto pad_top = pads[0];
+  const auto pad_left = pads[1];
+  const auto pad_bottom = pads[2];
+  const auto pad_right = pads[3];
+  const auto dilation_h = dilations[0];
+  const auto dilation_w = dilations[1];
+  const auto stride_h = strides[0];
+  const auto stride_w = strides[1];
+
+  const auto effective_kh = static_cast<std::int64_t>((k_h - 1) * dilation_h + 1);
+  const auto effective_kw = static_cast<std::int64_t>((k_w - 1) * dilation_w + 1);
+  const auto h_out = (static_cast<std::int64_t>(h_in) + pad_top + pad_bottom - effective_kh) / stride_h + 1;
+  const auto w_out = (static_cast<std::int64_t>(w_in) + pad_left + pad_right - effective_kw) / stride_w + 1;
+  if (h_out <= 0 || w_out <= 0) {
+    throw std::runtime_error("Conv output shape is invalid");
+  }
+
+  Tensor output;
+  output.name = node.outputs.at(0);
+  output.dtype = "float32";
+  output.shape = {static_cast<std::int64_t>(n), static_cast<std::int64_t>(c_out), h_out, w_out};
+  output.is_placeholder = false;
+  output.float_data.assign(GetElementCount(output.shape), 0.0f);
+
+  const auto input_hw = h_in * w_in;
+  const auto output_hw = static_cast<std::size_t>(h_out) * static_cast<std::size_t>(w_out);
+  const auto kernel_hw = k_h * k_w;
+  const auto output_w = static_cast<std::size_t>(w_out);
+
+  for (std::size_t batch = 0; batch < n; ++batch) {
+    const auto* batch_input = input_data.data() + batch * c_in * input_hw;
+    auto* batch_output = output.float_data.data() + batch * c_out * output_hw;
+    for (std::size_t oc = 0; oc < c_out; ++oc) {
+      auto* output_plane = batch_output + oc * output_hw;
+      const float bias_value = bias_data != nullptr ? (*bias_data)[oc] : 0.0f;
+      std::fill_n(output_plane, output_hw, bias_value);
+
+      const auto* weight_oc = weight_data.data() + oc * c_in * kernel_hw;
+      for (std::size_t ic = 0; ic < c_in; ++ic) {
+        const auto* input_plane = batch_input + ic * input_hw;
+        const auto* weight_ic = weight_oc + ic * kernel_hw;
+
+        for (std::size_t kh = 0; kh < k_h; ++kh) {
+          const auto input_h_base = static_cast<std::int64_t>(kh) * dilation_h - pad_top;
+          const auto oh_begin = input_h_base >= 0 ? 0 : static_cast<std::size_t>((-input_h_base + stride_h - 1) / stride_h);
+          const auto oh_end = static_cast<std::size_t>(
+              std::min<std::int64_t>(h_out, (static_cast<std::int64_t>(h_in) - 1 - input_h_base) / stride_h + 1));
+          if (oh_begin >= oh_end) {
+            continue;
+          }
+
+          for (std::size_t kw = 0; kw < k_w; ++kw) {
+            const auto input_w_base = static_cast<std::int64_t>(kw) * dilation_w - pad_left;
+            const auto ow_begin =
+                input_w_base >= 0 ? 0 : static_cast<std::size_t>((-input_w_base + stride_w - 1) / stride_w);
+            const auto ow_end = static_cast<std::size_t>(
+                std::min<std::int64_t>(w_out, (static_cast<std::int64_t>(w_in) - 1 - input_w_base) / stride_w + 1));
+            if (ow_begin >= ow_end) {
+              continue;
+            }
+
+            const float weight_value = weight_ic[kh * k_w + kw];
+            for (std::size_t oh = oh_begin; oh < oh_end; ++oh) {
+              const auto ih = static_cast<std::size_t>(static_cast<std::int64_t>(oh) * stride_h + input_h_base);
+              const auto* input_row = input_plane + ih * w_in;
+              auto* output_row = output_plane + oh * output_w;
+              for (std::size_t ow = ow_begin; ow < ow_end; ++ow) {
+                const auto iw = static_cast<std::size_t>(static_cast<std::int64_t>(ow) * stride_w + input_w_base);
+                output_row[ow] += input_row[iw] * weight_value;
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+
+  return output;
+}
+
+}  // namespace
+
 void RegisterNnKernels(KernelRegistry& registry) {
   registry.Register("Conv", [](const Node& node, ExecutionContext& context, std::ostream* trace) {
     const auto& input = RequireTensor(context, node.inputs.at(0));
@@ -19,127 +143,29 @@ void RegisterNnKernels(KernelRegistry& registry) {
     if (node.inputs.size() > 2 && !node.inputs.at(2).empty()) {
       bias = &RequireTensor(context, node.inputs.at(2));
     }
+    auto output = RunConv2D(node, input, weight, bias);
+    context.BindTensor(std::move(output));
+    if (trace != nullptr) {
+      *trace << "    kernel Conv produced " << node.outputs.at(0) << "\n";
+    }
+  });
 
-    const auto& input_data = RequireFloatData(input, "Conv");
-    const auto& weight_data = RequireFloatData(weight, "Conv");
-    const std::vector<float>* bias_data = nullptr;
-    if (bias != nullptr) {
-      bias_data = &RequireFloatData(*bias, "Conv");
+  registry.Register("ConvSiLU", [](const Node& node, ExecutionContext& context, std::ostream* trace) {
+    const auto& input = RequireTensor(context, node.inputs.at(0));
+    const auto& weight = RequireTensor(context, node.inputs.at(1));
+    const Tensor* bias = nullptr;
+    if (node.inputs.size() > 2 && !node.inputs.at(2).empty()) {
+      bias = &RequireTensor(context, node.inputs.at(2));
     }
 
-    if (input.shape.size() != 4 || weight.shape.size() != 4) {
-      throw std::runtime_error("Conv currently only supports 2D NCHW tensors");
-    }
-
-    const auto group = ReadIntAttribute(node, "group", 1);
-    if (group != 1) {
-      throw std::runtime_error("Conv currently only supports group=1");
-    }
-
-    const auto dilations = ReadIntsAttribute(node, "dilations", {1, 1});
-    const auto strides = ReadIntsAttribute(node, "strides", {1, 1});
-    const auto pads = ReadIntsAttribute(node, "pads", {0, 0, 0, 0});
-    if (dilations.size() != 2 || strides.size() != 2 || pads.size() != 4) {
-      throw std::runtime_error("Conv attribute rank is not supported");
-    }
-
-    const auto n = static_cast<std::size_t>(input.shape[0]);
-    const auto c_in = static_cast<std::size_t>(input.shape[1]);
-    const auto h_in = static_cast<std::size_t>(input.shape[2]);
-    const auto w_in = static_cast<std::size_t>(input.shape[3]);
-    const auto c_out = static_cast<std::size_t>(weight.shape[0]);
-    const auto w_c_in = static_cast<std::size_t>(weight.shape[1]);
-    const auto k_h = static_cast<std::size_t>(weight.shape[2]);
-    const auto k_w = static_cast<std::size_t>(weight.shape[3]);
-
-    if (c_in != w_c_in) {
-      throw std::runtime_error("Conv input channel count does not match weight");
-    }
-    if (bias_data != nullptr && bias_data->size() != c_out) {
-      throw std::runtime_error("Conv bias size does not match output channels");
-    }
-
-    const auto pad_top = pads[0];
-    const auto pad_left = pads[1];
-    const auto pad_bottom = pads[2];
-    const auto pad_right = pads[3];
-    const auto dilation_h = dilations[0];
-    const auto dilation_w = dilations[1];
-    const auto stride_h = strides[0];
-    const auto stride_w = strides[1];
-
-    const auto effective_kh = static_cast<std::int64_t>((k_h - 1) * dilation_h + 1);
-    const auto effective_kw = static_cast<std::int64_t>((k_w - 1) * dilation_w + 1);
-    const auto h_out = (static_cast<std::int64_t>(h_in) + pad_top + pad_bottom - effective_kh) / stride_h + 1;
-    const auto w_out = (static_cast<std::int64_t>(w_in) + pad_left + pad_right - effective_kw) / stride_w + 1;
-    if (h_out <= 0 || w_out <= 0) {
-      throw std::runtime_error("Conv output shape is invalid");
-    }
-
-    Tensor output;
-    output.name = node.outputs.at(0);
-    output.dtype = "float32";
-    output.shape = {static_cast<std::int64_t>(n), static_cast<std::int64_t>(c_out), h_out, w_out};
-    output.is_placeholder = false;
-    output.float_data.assign(GetElementCount(output.shape), 0.0f);
-
-    const auto input_hw = h_in * w_in;
-    const auto output_hw = static_cast<std::size_t>(h_out) * static_cast<std::size_t>(w_out);
-    const auto kernel_hw = k_h * k_w;
-    const auto output_w = static_cast<std::size_t>(w_out);
-    const auto output_h = static_cast<std::size_t>(h_out);
-
-    for (std::size_t batch = 0; batch < n; ++batch) {
-      const auto* batch_input = input_data.data() + batch * c_in * input_hw;
-      auto* batch_output = output.float_data.data() + batch * c_out * output_hw;
-      for (std::size_t oc = 0; oc < c_out; ++oc) {
-        auto* output_plane = batch_output + oc * output_hw;
-        const float bias_value = bias_data != nullptr ? (*bias_data)[oc] : 0.0f;
-        std::fill_n(output_plane, output_hw, bias_value);
-
-        const auto* weight_oc = weight_data.data() + oc * c_in * kernel_hw;
-        for (std::size_t ic = 0; ic < c_in; ++ic) {
-          const auto* input_plane = batch_input + ic * input_hw;
-          const auto* weight_ic = weight_oc + ic * kernel_hw;
-
-          for (std::size_t kh = 0; kh < k_h; ++kh) {
-            const auto input_h_base = static_cast<std::int64_t>(kh) * dilation_h - pad_top;
-            const auto oh_begin = input_h_base >= 0 ? 0 : static_cast<std::size_t>((-input_h_base + stride_h - 1) / stride_h);
-            const auto oh_end = static_cast<std::size_t>(
-                std::min<std::int64_t>(h_out, (static_cast<std::int64_t>(h_in) - 1 - input_h_base) / stride_h + 1));
-            if (oh_begin >= oh_end) {
-              continue;
-            }
-
-            for (std::size_t kw = 0; kw < k_w; ++kw) {
-              const auto input_w_base = static_cast<std::int64_t>(kw) * dilation_w - pad_left;
-              const auto ow_begin =
-                  input_w_base >= 0 ? 0 : static_cast<std::size_t>((-input_w_base + stride_w - 1) / stride_w);
-              const auto ow_end = static_cast<std::size_t>(
-                  std::min<std::int64_t>(w_out, (static_cast<std::int64_t>(w_in) - 1 - input_w_base) / stride_w + 1));
-              if (ow_begin >= ow_end) {
-                continue;
-              }
-
-              const float weight_value = weight_ic[kh * k_w + kw];
-              for (std::size_t oh = oh_begin; oh < oh_end; ++oh) {
-                const auto ih = static_cast<std::size_t>(static_cast<std::int64_t>(oh) * stride_h + input_h_base);
-                const auto* input_row = input_plane + ih * w_in;
-                auto* output_row = output_plane + oh * output_w;
-                for (std::size_t ow = ow_begin; ow < ow_end; ++ow) {
-                  const auto iw = static_cast<std::size_t>(static_cast<std::int64_t>(ow) * stride_w + input_w_base);
-                  output_row[ow] += input_row[iw] * weight_value;
-                }
-              }
-            }
-          }
-        }
-      }
+    auto output = RunConv2D(node, input, weight, bias);
+    for (auto& value : output.float_data) {
+      value = value * (1.0f / (1.0f + std::exp(-value)));
     }
 
     context.BindTensor(std::move(output));
     if (trace != nullptr) {
-      *trace << "    kernel Conv produced " << node.outputs.at(0) << "\n";
+      *trace << "    kernel ConvSiLU produced " << node.outputs.at(0) << "\n";
     }
   });
 
