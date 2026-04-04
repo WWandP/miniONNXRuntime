@@ -32,7 +32,8 @@ flowchart LR
 - buffer reuse / 内存优化
 - 更通用的模型支持
 
-图优化细节记录在 [GRAPH_OPTIMIZATION.md](./GRAPH_OPTIMIZATION.md)。
+图优化的整理版说明在 [docs/blog_graph_optimization.md](./docs/blog_graph_optimization.md)，实验记录保留在 [GRAPH_OPTIMIZATION.md](./GRAPH_OPTIMIZATION.md)。  
+内存优化的基线和后续规划记录在 [docs/memory_optimization.md](./docs/memory_optimization.md)。
 
 ## Quick Start
 
@@ -79,6 +80,7 @@ src/
 tools/
   miniort_inspect        静态查看图结构
   miniort_session_trace  查看执行主线和 value 流转
+  miniort_memory_trace   查看执行过程中的内存占用与张量生命周期
   miniort_run            使用真实输入跑整图
   miniort_detect_yolov8n 导出检测结果和可视化
   miniort_optimize_model  优化图后再跑 YOLO
@@ -131,6 +133,23 @@ tools/
 
 适合 `phase3`：跑完整推理主线。
 
+### `miniort_memory_trace`
+
+```bash
+./build/miniort_memory_trace models/yolov8n.onnx --image pic/bus.jpg
+```
+
+- `--image path`
+  - 可选，提供真实输入时会更接近实际运行内存
+- `--live-limit N`
+  - 每个节点最多打印前 `N` 个 live tensor 名称
+- `--no-plan`
+  - 关闭启动时的静态生命周期计划
+- `--no-live-tensors`
+  - 关闭逐节点 live tensor 列表
+
+适合 phase4 之前的内存基线观察：先看现在的 tensor 生命周期和峰值，再做 buffer reuse。
+
 ### `miniort_detect_yolov8n`
 
 ```bash
@@ -166,5 +185,7 @@ tools/
   - 输出更详细 trace
 - `--strict-kernel`
   - 遇到未注册算子直接报错
+- `--memory-reuse`
+  - 显式打开中间 tensor 的释放和 buffer 复用
 
 适合 `phase4`：先优化图，再跑同一套 YOLO 后处理。

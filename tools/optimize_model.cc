@@ -26,6 +26,7 @@ struct Options {
   bool verbose{false};
   bool profile{false};
   bool allow_missing_kernels{true};
+  bool enable_memory_reuse{false};
   std::size_t max_nodes{0};
 };
 
@@ -33,7 +34,8 @@ Options ParseArgs(int argc, char* argv[]) {
   if (argc < 2) {
     throw std::runtime_error(
         "usage: miniort_optimize_model <model.onnx> [--image path] [--save-vis out.png] [--dump-json out.json] "
-        "[--score-threshold 0.25] [--iou-threshold 0.45] [--verbose] [--profile] [--strict-kernel] [--max-nodes N]");
+        "[--score-threshold 0.25] [--iou-threshold 0.45] [--verbose] [--profile] [--strict-kernel] "
+        "[--memory-reuse] [--max-nodes N]");
   }
 
   Options options;
@@ -70,6 +72,10 @@ Options ParseArgs(int argc, char* argv[]) {
     }
     if (arg == "--strict-kernel") {
       options.allow_missing_kernels = false;
+      continue;
+    }
+    if (arg == "--memory-reuse") {
+      options.enable_memory_reuse = true;
       continue;
     }
     if (arg == "--max-nodes" && i + 1 < argc) {
@@ -142,6 +148,7 @@ int main(int argc, char* argv[]) {
                                {.verbose = options.verbose,
                                 .allow_missing_kernels = options.allow_missing_kernels,
                                 .auto_bind_placeholder_inputs = true,
+                                .evict_dead_tensors = options.enable_memory_reuse,
                                 .max_nodes = options.max_nodes});
       miniort::ExecutionContext context;
       const auto run_summary = session.Run(feeds, context, trace);

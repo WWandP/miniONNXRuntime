@@ -1,9 +1,11 @@
 #include "miniort/runtime/builtin_kernels.h"
 #include "miniort/runtime/session.h"
 
+#include <algorithm>
 #include <iomanip>
 #include <unordered_map>
 #include <stdexcept>
+#include <vector>
 
 #include "miniort/runtime/profiling.h"
 
@@ -12,6 +14,39 @@ namespace miniort {
 Session::Session(Graph graph, SessionOptions options)
     : graph_(std::move(graph)), options_(options) {
   RegisterBuiltinKernels(kernel_registry_);
+
+  for (const auto& initializer : graph_.initializers) {
+    tensor_is_persistent_[initializer.first] = true;
+  }
+  for (const auto& input : graph_.inputs) {
+    tensor_is_persistent_[input.name] = true;
+  }
+  for (const auto& output : graph_.outputs) {
+    tensor_is_persistent_[output.name] = true;
+  }
+
+  for (std::size_t topo_index = 0; topo_index < graph_.topological_order.size(); ++topo_index) {
+    const auto node_index = graph_.topological_order[topo_index];
+    const auto& node = graph_.nodes[node_index];
+    for (const auto& input : node.inputs) {
+      if (input.empty() || tensor_is_persistent_.contains(input)) {
+        continue;
+      }
+      tensor_last_use_topo_index_[input] = topo_index;
+    }
+    for (const auto& output : node.outputs) {
+      if (output.empty()) {
+        continue;
+      }
+      tensor_last_use_topo_index_.try_emplace(output, topo_index);
+      if (graph_.value_infos.contains(output) &&
+          tensor_is_persistent_.contains(output) == false &&
+          std::any_of(graph_.outputs.begin(), graph_.outputs.end(),
+                      [&output](const Value& value) { return value.name == output; })) {
+        tensor_is_persistent_[output] = true;
+      }
+    }
+  }
 }
 
 Graph& Session::graph() {
@@ -90,6 +125,10 @@ RunSummary Session::Run(const std::unordered_map<std::string, Tensor>& feeds, Ex
         }
       }
 
+      if (options_.before_node) {
+        options_.before_node(topo_index, node, context, trace);
+      }
+
       const auto* kernel = kernel_registry_.Lookup(node.op_type);
       if (kernel != nullptr) {
         const auto node_start = Clock::now();
@@ -141,6 +180,14 @@ RunSummary Session::Run(const std::unordered_map<std::string, Tensor>& feeds, Ex
           *trace << "\n";
         }
       }
+
+      if (options_.evict_dead_tensors) {
+        EvictDeadTensors(topo_index, node, context, trace, summary);
+      }
+
+      if (options_.after_node) {
+        options_.after_node(topo_index, node, context, trace);
+      }
     }
 
   }
@@ -148,7 +195,8 @@ RunSummary Session::Run(const std::unordered_map<std::string, Tensor>& feeds, Ex
   if (trace != nullptr) {
     *trace << "session.run end executed=" << summary.executed_nodes
            << " skipped=" << summary.skipped_nodes
-           << " materialized_outputs=" << summary.materialized_outputs << "\n";
+           << " materialized_outputs=" << summary.materialized_outputs
+           << " released_tensors=" << summary.released_tensors << "\n";
     PrintTimingSummary(timings, *trace, "session timing summary");
   }
 
@@ -170,6 +218,36 @@ void Session::MaybeBindPlaceholderInputs(ExecutionContext& context, std::ostream
       *trace << "  auto-bound placeholder input " << FormatTensorSummary(placeholder) << "\n";
     }
   }
+}
+
+void Session::EvictDeadTensors(std::size_t topo_index, const Node& node, ExecutionContext& context,
+                               std::ostream* trace, RunSummary& summary) const {
+  std::vector<std::string> candidates;
+  candidates.reserve(node.inputs.size() + node.outputs.size());
+  candidates.insert(candidates.end(), node.inputs.begin(), node.inputs.end());
+  candidates.insert(candidates.end(), node.outputs.begin(), node.outputs.end());
+
+  std::size_t released_tensors = 0;
+  for (const auto& name : candidates) {
+    if (name.empty()) {
+      continue;
+    }
+    const auto last_use_it = tensor_last_use_topo_index_.find(name);
+    if (last_use_it == tensor_last_use_topo_index_.end() || last_use_it->second != topo_index) {
+      continue;
+    }
+    if (tensor_is_persistent_.contains(name)) {
+      continue;
+    }
+    if (context.EraseTensor(name)) {
+      ++released_tensors;
+      if (trace != nullptr) {
+        *trace << "    evicted dead tensor " << name << "\n";
+      }
+    }
+  }
+
+  summary.released_tensors += released_tensors;
 }
 
 void Session::MaterializeOutputsFromMetadata(const Node& node, ExecutionContext& context, std::ostream* trace,

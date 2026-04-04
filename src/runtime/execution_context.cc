@@ -1,6 +1,7 @@
 #include "miniort/runtime/execution_context.h"
 
 #include <algorithm>
+#include <limits>
 
 namespace miniort {
 
@@ -24,25 +25,64 @@ Tensor TensorFromValue(const Value& value) {
 }  // namespace
 
 void ExecutionContext::BindTensor(const Tensor& tensor) {
+  if (auto it = tensors_.find(tensor.name); it != tensors_.end()) {
+    RecycleTensorStorage(std::move(it->second));
+    it->second = tensor;
+    return;
+  }
   tensors_[tensor.name] = tensor;
 }
 
 void ExecutionContext::BindTensor(Tensor&& tensor) {
+  if (auto it = tensors_.find(tensor.name); it != tensors_.end()) {
+    RecycleTensorStorage(std::move(it->second));
+    it->second = std::move(tensor);
+    return;
+  }
   tensors_[tensor.name] = std::move(tensor);
 }
 
+bool ExecutionContext::EraseTensor(const std::string& name) {
+  auto it = tensors_.find(name);
+  if (it == tensors_.end()) {
+    return false;
+  }
+  RecycleTensorStorage(std::move(it->second));
+  tensors_.erase(it);
+  return true;
+}
+
 bool ExecutionContext::HasTensor(const std::string& name) const {
-  return tensors_.contains(name);
+  if (tensors_.contains(name)) {
+    return true;
+  }
+  return graph_ != nullptr && graph_->initializers.contains(name);
 }
 
 const Tensor* ExecutionContext::FindTensor(const std::string& name) const {
   const auto it = tensors_.find(name);
-  return it == tensors_.end() ? nullptr : &it->second;
+  if (it != tensors_.end()) {
+    return &it->second;
+  }
+  return MaterializeInitializer(name);
 }
 
 Tensor* ExecutionContext::FindTensor(const std::string& name) {
   const auto it = tensors_.find(name);
-  return it == tensors_.end() ? nullptr : &it->second;
+  if (it != tensors_.end()) {
+    return &it->second;
+  }
+  if (graph_ == nullptr) {
+    return nullptr;
+  }
+  const auto init_it = graph_->initializers.find(name);
+  if (init_it == graph_->initializers.end()) {
+    return nullptr;
+  }
+  auto tensor = TensorFromValue(init_it->second);
+  auto [inserted_it, inserted] = tensors_.emplace(name, std::move(tensor));
+  (void)inserted;
+  return &inserted_it->second;
 }
 
 const std::unordered_map<std::string, Tensor>& ExecutionContext::tensors() const {
@@ -50,9 +90,81 @@ const std::unordered_map<std::string, Tensor>& ExecutionContext::tensors() const
 }
 
 void ExecutionContext::LoadInitializers(const Graph& graph) {
-  for (const auto& [name, value] : graph.initializers) {
-    (void)name;
-    BindTensor(TensorFromValue(value));
+  graph_ = &graph;
+}
+
+const Tensor* ExecutionContext::MaterializeInitializer(const std::string& name) const {
+  if (graph_ == nullptr) {
+    return nullptr;
+  }
+  const auto init_it = graph_->initializers.find(name);
+  if (init_it == graph_->initializers.end()) {
+    return nullptr;
+  }
+
+  const auto it = tensors_.find(name);
+  if (it != tensors_.end()) {
+    return &it->second;
+  }
+
+  auto tensor = TensorFromValue(init_it->second);
+  auto [inserted_it, inserted] = tensors_.emplace(name, std::move(tensor));
+  (void)inserted;
+  return &inserted_it->second;
+}
+
+std::vector<float> ExecutionContext::AcquireFloatBuffer(std::size_t element_count) {
+  auto best_it = float_buffer_pool_.end();
+  for (auto it = float_buffer_pool_.begin(); it != float_buffer_pool_.end(); ++it) {
+    if (it->capacity() < element_count) {
+      continue;
+    }
+    if (best_it == float_buffer_pool_.end() || it->capacity() < best_it->capacity()) {
+      best_it = it;
+    }
+  }
+  if (best_it != float_buffer_pool_.end()) {
+    std::vector<float> buffer = std::move(*best_it);
+    float_buffer_pool_.erase(best_it);
+    buffer.clear();
+    buffer.reserve(element_count);
+    return buffer;
+  }
+
+  std::vector<float> buffer;
+  buffer.reserve(element_count);
+  return buffer;
+}
+
+std::vector<std::int64_t> ExecutionContext::AcquireInt64Buffer(std::size_t element_count) {
+  auto best_it = int64_buffer_pool_.end();
+  for (auto it = int64_buffer_pool_.begin(); it != int64_buffer_pool_.end(); ++it) {
+    if (it->capacity() < element_count) {
+      continue;
+    }
+    if (best_it == int64_buffer_pool_.end() || it->capacity() < best_it->capacity()) {
+      best_it = it;
+    }
+  }
+  if (best_it != int64_buffer_pool_.end()) {
+    std::vector<std::int64_t> buffer = std::move(*best_it);
+    int64_buffer_pool_.erase(best_it);
+    buffer.clear();
+    buffer.reserve(element_count);
+    return buffer;
+  }
+
+  std::vector<std::int64_t> buffer;
+  buffer.reserve(element_count);
+  return buffer;
+}
+
+void ExecutionContext::RecycleTensorStorage(Tensor&& tensor) {
+  if (!tensor.float_data.empty()) {
+    float_buffer_pool_.push_back(std::move(tensor.float_data));
+  }
+  if (!tensor.int64_data.empty()) {
+    int64_buffer_pool_.push_back(std::move(tensor.int64_data));
   }
 }
 

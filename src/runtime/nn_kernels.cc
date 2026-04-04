@@ -13,7 +13,8 @@ namespace miniort {
 
 namespace {
 
-Tensor RunConv2D(const Node& node, const Tensor& input, const Tensor& weight, const Tensor* bias) {
+Tensor RunConv2D(const Node& node, const Tensor& input, const Tensor& weight, const Tensor* bias,
+                 ExecutionContext& context) {
   const auto& input_data = RequireFloatData(input, "Conv");
   const auto& weight_data = RequireFloatData(weight, "Conv");
   const std::vector<float>* bias_data = nullptr;
@@ -70,12 +71,9 @@ Tensor RunConv2D(const Node& node, const Tensor& input, const Tensor& weight, co
     throw std::runtime_error("Conv output shape is invalid");
   }
 
-  Tensor output;
-  output.name = node.outputs.at(0);
-  output.dtype = "float32";
-  output.shape = {static_cast<std::int64_t>(n), static_cast<std::int64_t>(c_out), h_out, w_out};
-  output.is_placeholder = false;
-  output.float_data.assign(GetElementCount(output.shape), 0.0f);
+  auto output = MakeFloatOutput(node.outputs.at(0),
+                                {static_cast<std::int64_t>(n), static_cast<std::int64_t>(c_out), h_out, w_out},
+                                context);
 
   const auto input_hw = h_in * w_in;
   const auto output_hw = static_cast<std::size_t>(h_out) * static_cast<std::size_t>(w_out);
@@ -143,7 +141,7 @@ void RegisterNnKernels(KernelRegistry& registry) {
     if (node.inputs.size() > 2 && !node.inputs.at(2).empty()) {
       bias = &RequireTensor(context, node.inputs.at(2));
     }
-    auto output = RunConv2D(node, input, weight, bias);
+    auto output = RunConv2D(node, input, weight, bias, context);
     context.BindTensor(std::move(output));
     if (trace != nullptr) {
       *trace << "    kernel Conv produced " << node.outputs.at(0) << "\n";
@@ -158,7 +156,7 @@ void RegisterNnKernels(KernelRegistry& registry) {
       bias = &RequireTensor(context, node.inputs.at(2));
     }
 
-    auto output = RunConv2D(node, input, weight, bias);
+    auto output = RunConv2D(node, input, weight, bias, context);
     for (auto& value : output.float_data) {
       value = value * (1.0f / (1.0f + std::exp(-value)));
     }
@@ -211,12 +209,9 @@ void RegisterNnKernels(KernelRegistry& registry) {
       throw std::runtime_error("MaxPool output shape is invalid");
     }
 
-    Tensor output;
-    output.name = node.outputs.at(0);
-    output.dtype = "float32";
-    output.shape = {static_cast<std::int64_t>(n), static_cast<std::int64_t>(c), h_out, w_out};
-    output.is_placeholder = false;
-    output.float_data.assign(GetElementCount(output.shape), 0.0f);
+    auto output = MakeFloatOutput(node.outputs.at(0),
+                                  {static_cast<std::int64_t>(n), static_cast<std::int64_t>(c), h_out, w_out},
+                                  context);
 
     const auto input_hw = h_in * w_in;
     const auto output_hw = static_cast<std::size_t>(h_out) * static_cast<std::size_t>(w_out);
@@ -299,12 +294,8 @@ void RegisterNnKernels(KernelRegistry& registry) {
     const auto h_in = static_cast<std::size_t>(input.shape[2]);
     const auto w_in = static_cast<std::size_t>(input.shape[3]);
 
-    Tensor output;
-    output.name = node.outputs.at(0);
-    output.dtype = "float32";
-    output.shape = {input.shape[0], input.shape[1], h_out, w_out};
-    output.is_placeholder = false;
-    output.float_data.assign(GetElementCount(output.shape), 0.0f);
+    auto output = MakeFloatOutput(node.outputs.at(0),
+                                  {input.shape[0], input.shape[1], h_out, w_out}, context);
 
     const auto input_hw = h_in * w_in;
     const auto output_hw = static_cast<std::size_t>(h_out) * static_cast<std::size_t>(w_out);
@@ -348,8 +339,7 @@ void RegisterNnKernels(KernelRegistry& registry) {
       inner *= static_cast<std::size_t>(input.shape[i]);
     }
 
-    Tensor output = MakeOutputLike(node.outputs.at(0), input);
-    output.float_data.resize(input_data.size());
+    auto output = MakeOutputLikeWithReusedStorage(node.outputs.at(0), input, context);
     for (std::size_t outer_index = 0; outer_index < outer; ++outer_index) {
       for (std::size_t inner_index = 0; inner_index < inner; ++inner_index) {
         float max_value = -std::numeric_limits<float>::infinity();

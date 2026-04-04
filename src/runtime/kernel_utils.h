@@ -31,6 +31,110 @@ inline Tensor MakeOutputLike(const std::string& name, const Tensor& source) {
   return tensor;
 }
 
+inline const std::vector<float>& RequireFloatData(const Tensor& tensor, const std::string& op_type);
+inline const std::vector<std::int64_t>& RequireInt64Data(const Tensor& tensor, const std::string& op_type);
+
+inline Tensor MakeFloatOutput(const std::string& name, const std::vector<std::int64_t>& shape,
+                              ExecutionContext& context) {
+  Tensor tensor;
+  tensor.name = name;
+  tensor.dtype = "float32";
+  tensor.shape = shape;
+  tensor.is_placeholder = false;
+  tensor.float_data = context.AcquireFloatBuffer(GetElementCount(shape));
+  tensor.float_data.resize(GetElementCount(shape));
+  return tensor;
+}
+
+inline Tensor MakeInt64Output(const std::string& name, const std::vector<std::int64_t>& shape,
+                              ExecutionContext& context) {
+  Tensor tensor;
+  tensor.name = name;
+  tensor.dtype = "int64";
+  tensor.shape = shape;
+  tensor.is_placeholder = false;
+  tensor.int64_data = context.AcquireInt64Buffer(GetElementCount(shape));
+  tensor.int64_data.resize(GetElementCount(shape));
+  return tensor;
+}
+
+inline Tensor MakeOutputLikeWithReusedStorage(const std::string& name, const Tensor& source,
+                                              ExecutionContext& context) {
+  Tensor tensor;
+  tensor.name = name;
+  tensor.dtype = source.dtype;
+  tensor.shape = source.shape;
+  tensor.is_placeholder = false;
+  const auto element_count = GetElementCount(tensor.shape);
+  if (tensor.dtype == "float32") {
+    tensor.float_data = context.AcquireFloatBuffer(element_count);
+    tensor.float_data.resize(element_count);
+  } else if (tensor.dtype == "int64") {
+    tensor.int64_data = context.AcquireInt64Buffer(element_count);
+    tensor.int64_data.resize(element_count);
+  }
+  return tensor;
+}
+
+inline Tensor MakeTensorWithReusedStorage(const std::string& name, const std::string& dtype,
+                                         const std::vector<std::int64_t>& shape, ExecutionContext& context) {
+  Tensor tensor;
+  tensor.name = name;
+  tensor.dtype = dtype;
+  tensor.shape = shape;
+  tensor.is_placeholder = false;
+  const auto element_count = GetElementCount(shape);
+  if (dtype == "float32") {
+    tensor.float_data = context.AcquireFloatBuffer(element_count);
+    tensor.float_data.resize(element_count);
+  } else if (dtype == "int64") {
+    tensor.int64_data = context.AcquireInt64Buffer(element_count);
+    tensor.int64_data.resize(element_count);
+  }
+  return tensor;
+}
+
+inline Tensor MakeCopiedTensorWithReusedStorage(const std::string& name, const Tensor& source,
+                                                const std::vector<std::int64_t>& shape, ExecutionContext& context) {
+  Tensor tensor = MakeTensorWithReusedStorage(name, source.dtype, shape, context);
+  if (source.dtype == "float32") {
+    const auto& input = RequireFloatData(source, "copy");
+    if (tensor.float_data.size() != input.size()) {
+      throw std::runtime_error("copied float tensor size mismatch: " + name);
+    }
+    std::copy(input.begin(), input.end(), tensor.float_data.begin());
+  } else if (source.dtype == "int64") {
+    const auto& input = RequireInt64Data(source, "copy");
+    if (tensor.int64_data.size() != input.size()) {
+      throw std::runtime_error("copied int64 tensor size mismatch: " + name);
+    }
+    std::copy(input.begin(), input.end(), tensor.int64_data.begin());
+  }
+  return tensor;
+}
+
+inline Tensor MakeTensorFromDataWithReusedStorage(const std::string& name, const TensorData& source,
+                                                 ExecutionContext& context) {
+  Tensor tensor;
+  tensor.name = name;
+  tensor.dtype = source.dtype.empty() ? "unknown" : source.dtype;
+  tensor.shape = source.shape;
+  tensor.is_placeholder = false;
+
+  if (source.dtype == "float32" && !source.float_data.empty()) {
+    tensor.float_data = context.AcquireFloatBuffer(source.float_data.size());
+    tensor.float_data.resize(source.float_data.size());
+    std::copy(source.float_data.begin(), source.float_data.end(), tensor.float_data.begin());
+  } else if (source.dtype == "int64" && !source.int64_data.empty()) {
+    tensor.int64_data = context.AcquireInt64Buffer(source.int64_data.size());
+    tensor.int64_data.resize(source.int64_data.size());
+    std::copy(source.int64_data.begin(), source.int64_data.end(), tensor.int64_data.begin());
+  } else {
+    tensor.is_placeholder = true;
+  }
+  return tensor;
+}
+
 inline std::vector<std::int64_t> ReadIntsAttribute(const Node& node, const std::string& name,
                                                    std::vector<std::int64_t> default_value) {
   const auto it = node.attributes.find(name);
@@ -246,7 +350,7 @@ inline std::vector<std::int64_t> ReadVectorAsInt64(const Tensor& tensor, const s
 }
 
 template <typename T>
-inline Tensor ConcatTensors(const Node& node, std::ostream* trace, const std::string& dtype,
+inline Tensor ConcatTensors(const Node& node, ExecutionContext* context, std::ostream* trace, const std::string& dtype,
                             const std::vector<Tensor>& inputs,
                             const std::function<const std::vector<T>&(const Tensor&)>& get_data) {
   const auto axis_it = node.attributes.find("axis");
@@ -297,7 +401,16 @@ inline Tensor ConcatTensors(const Node& node, std::ostream* trace, const std::st
   output.shape = output_shape;
   output.is_placeholder = false;
 
-  std::vector<T> concatenated(GetElementCount(output_shape));
+  if (context != nullptr) {
+    output = MakeTensorWithReusedStorage(output.name, dtype, output_shape, *context);
+  } else {
+    if constexpr (std::is_same_v<T, float>) {
+      output.float_data.resize(GetElementCount(output_shape));
+    } else {
+      output.int64_data.resize(GetElementCount(output_shape));
+    }
+  }
+
   std::size_t output_offset = 0;
   for (std::size_t outer_index = 0; outer_index < outer; ++outer_index) {
     for (const auto& input : inputs) {
@@ -305,16 +418,15 @@ inline Tensor ConcatTensors(const Node& node, std::ostream* trace, const std::st
       const auto copy_count = axis_dim * inner;
       const auto& data = get_data(input);
       const auto input_base = outer_index * axis_dim * inner;
-      std::copy_n(data.begin() + static_cast<std::ptrdiff_t>(input_base), static_cast<std::ptrdiff_t>(copy_count),
-                  concatenated.begin() + static_cast<std::ptrdiff_t>(output_offset));
+      if constexpr (std::is_same_v<T, float>) {
+        std::copy_n(data.begin() + static_cast<std::ptrdiff_t>(input_base), static_cast<std::ptrdiff_t>(copy_count),
+                    output.float_data.begin() + static_cast<std::ptrdiff_t>(output_offset));
+      } else {
+        std::copy_n(data.begin() + static_cast<std::ptrdiff_t>(input_base), static_cast<std::ptrdiff_t>(copy_count),
+                    output.int64_data.begin() + static_cast<std::ptrdiff_t>(output_offset));
+      }
       output_offset += copy_count;
     }
-  }
-
-  if constexpr (std::is_same_v<T, float>) {
-    output.float_data = std::move(concatenated);
-  } else {
-    output.int64_data = std::move(concatenated);
   }
 
   if (trace != nullptr) {

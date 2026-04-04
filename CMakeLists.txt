@@ -82,6 +82,7 @@ if(MINIORT_BUILD_RUNTIME_TOOLS OR MINIORT_BUILD_DETECT_TOOL)
     src/runtime/tensor.cc
     src/runtime/execution_context.cc
     src/runtime/kernel_registry.cc
+    src/runtime/memory_profile.cc
     src/optimizer/graph_optimizer.cc
     src/tools/yolo_detection.cc
     src/runtime/basic_kernels.cc
@@ -129,6 +130,12 @@ if(MINIORT_BUILD_RUNTIME_TOOLS)
   )
 
   target_link_libraries(miniort_session_trace PRIVATE miniort_runtime)
+
+  add_executable(miniort_memory_trace
+    tools/memory_trace.cc
+  )
+
+  target_link_libraries(miniort_memory_trace PRIVATE miniort_runtime)
 endif()
 
 if(MINIORT_BUILD_OPTIMIZER_TOOLS)

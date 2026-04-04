@@ -15,8 +15,7 @@ void RegisterElementwiseKernels(KernelRegistry& registry) {
   registry.Register("Sigmoid", [](const Node& node, ExecutionContext& context, std::ostream* trace) {
     const auto& input = RequireTensor(context, node.inputs.at(0));
     const auto& input_data = RequireFloatData(input, "Sigmoid");
-    auto output = MakeOutputLike(node.outputs.at(0), input);
-    output.float_data.resize(input_data.size());
+    auto output = MakeOutputLikeWithReusedStorage(node.outputs.at(0), input, context);
     std::transform(input_data.begin(), input_data.end(), output.float_data.begin(),
                    [](float value) { return 1.0f / (1.0f + std::exp(-value)); });
     context.BindTensor(std::move(output));
@@ -38,16 +37,11 @@ void RegisterElementwiseKernels(KernelRegistry& registry) {
           const auto rhs_strides = ComputeStrides(rhs.shape);
 
           Tensor output;
-          output.name = node.outputs.at(0);
-          output.shape = output_shape;
-          output.is_placeholder = false;
-
           const auto element_count = GetElementCount(output_shape);
           if (lhs.dtype == "int64" && rhs.dtype == "int64") {
             const auto& lhs_data = RequireInt64Data(lhs, op_type);
             const auto& rhs_data = RequireInt64Data(rhs, op_type);
-            output.dtype = "int64";
-            output.int64_data.resize(element_count);
+            output = MakeInt64Output(node.outputs.at(0), output_shape, context);
             for (std::size_t i = 0; i < element_count; ++i) {
               const auto output_index = UnravelIndex(i, output_shape, output_strides);
               const auto lhs_offset = ComputeBroadcastOffset(output_index, lhs.shape, lhs_strides);
@@ -55,8 +49,7 @@ void RegisterElementwiseKernels(KernelRegistry& registry) {
               output.int64_data[i] = eval_int(lhs_data[lhs_offset], rhs_data[rhs_offset]);
             }
           } else {
-            output.dtype = "float32";
-            output.float_data.resize(element_count);
+            output = MakeFloatOutput(node.outputs.at(0), output_shape, context);
             for (std::size_t i = 0; i < element_count; ++i) {
               const auto output_index = UnravelIndex(i, output_shape, output_strides);
               const auto lhs_offset = ComputeBroadcastOffset(output_index, lhs.shape, lhs_strides);
@@ -109,43 +102,38 @@ void RegisterElementwiseKernels(KernelRegistry& registry) {
       throw std::runtime_error("Cast missing to attribute");
     }
 
-    Tensor output;
-    output.name = node.outputs.at(0);
-    output.shape = input.shape;
-    output.is_placeholder = false;
-
     const auto to_type = to_it->second.int_value;
     if (to_type == 1) {
-      output.dtype = "float32";
-      output.float_data.reserve(GetElementCount(input.shape));
+      auto output = MakeFloatOutput(node.outputs.at(0), input.shape, context);
       if (input.dtype == "float32") {
-        output.float_data = RequireFloatData(input, "Cast");
+        const auto& input_data = RequireFloatData(input, "Cast");
+        std::copy(input_data.begin(), input_data.end(), output.float_data.begin());
       } else if (input.dtype == "int64") {
         const auto& input_data = RequireInt64Data(input, "Cast");
-        for (const auto value : input_data) {
-          output.float_data.push_back(static_cast<float>(value));
+        for (std::size_t i = 0; i < input_data.size(); ++i) {
+          output.float_data[i] = static_cast<float>(input_data[i]);
         }
       } else {
         throw std::runtime_error("Cast to float32 currently supports int64/float32 only");
       }
+      context.BindTensor(std::move(output));
     } else if (to_type == 7 || to_type == 6) {
-      output.dtype = "int64";
-      output.int64_data.reserve(GetElementCount(input.shape));
+      auto output = MakeInt64Output(node.outputs.at(0), input.shape, context);
       if (input.dtype == "int64") {
-        output.int64_data = RequireInt64Data(input, "Cast");
+        std::copy(RequireInt64Data(input, "Cast").begin(), RequireInt64Data(input, "Cast").end(),
+                  output.int64_data.begin());
       } else if (input.dtype == "float32") {
         const auto& input_data = RequireFloatData(input, "Cast");
-        for (const auto value : input_data) {
-          output.int64_data.push_back(static_cast<std::int64_t>(value));
+        for (std::size_t i = 0; i < input_data.size(); ++i) {
+          output.int64_data[i] = static_cast<std::int64_t>(input_data[i]);
         }
       } else {
         throw std::runtime_error("Cast to int64 currently supports int64/float32 only");
       }
+      context.BindTensor(std::move(output));
     } else {
       throw std::runtime_error("Cast currently supports only float32/int32/int64 outputs");
     }
-
-    context.BindTensor(std::move(output));
     if (trace != nullptr) {
       *trace << "    kernel Cast produced " << node.outputs.at(0) << "\n";
     }

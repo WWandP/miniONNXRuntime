@@ -33,3 +33,7 @@ resume/
 .idea/
 .vscode/
 docs/
+!docs/
+docs/*
+!docs/blog_graph_optimization.md
+!docs/memory_optimization.md

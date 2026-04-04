@@ -16,11 +16,6 @@ void RegisterShapeKernels(KernelRegistry& registry) {
     const auto& shape_tensor = RequireTensor(context, node.inputs.at(0));
     const auto shape = ReadVectorAsInt64(shape_tensor, "ConstantOfShape");
 
-    Tensor output;
-    output.name = node.outputs.at(0);
-    output.shape = shape;
-    output.is_placeholder = false;
-
     float fill_value = 0.0f;
     const auto value_it = node.attributes.find("value");
     if (value_it != node.attributes.end() && value_it->second.tensor.has_value()) {
@@ -32,8 +27,8 @@ void RegisterShapeKernels(KernelRegistry& registry) {
       }
     }
 
-    output.dtype = "float32";
-    output.float_data.assign(GetElementCount(output.shape), fill_value);
+    auto output = MakeFloatOutput(node.outputs.at(0), shape, context);
+    std::fill(output.float_data.begin(), output.float_data.end(), fill_value);
     context.BindTensor(std::move(output));
     if (trace != nullptr) {
       *trace << "    kernel ConstantOfShape produced " << node.outputs.at(0) << "\n";
@@ -42,12 +37,8 @@ void RegisterShapeKernels(KernelRegistry& registry) {
 
   registry.Register("Shape", [](const Node& node, ExecutionContext& context, std::ostream* trace) {
     const auto& input = RequireTensor(context, node.inputs.at(0));
-    Tensor output;
-    output.name = node.outputs.at(0);
-    output.dtype = "int64";
-    output.shape = {static_cast<std::int64_t>(input.shape.size())};
-    output.int64_data = input.shape;
-    output.is_placeholder = false;
+    auto output = MakeInt64Output(node.outputs.at(0), {static_cast<std::int64_t>(input.shape.size())}, context);
+    std::copy(input.shape.begin(), input.shape.end(), output.int64_data.begin());
     context.BindTensor(std::move(output));
     if (trace != nullptr) {
       *trace << "    kernel Shape produced " << node.outputs.at(0) << "\n";
@@ -64,36 +55,33 @@ void RegisterShapeKernels(KernelRegistry& registry) {
       throw std::runtime_error("Gather currently only supports axis=0 on scalar/1D tensors");
     }
 
-    Tensor output;
-    output.name = node.outputs.at(0);
-    output.dtype = data.dtype;
-    output.shape = indices.shape.empty() ? std::vector<std::int64_t>{} : indices.shape;
-    output.is_placeholder = false;
-
     const auto& index_data = RequireInt64Data(indices, "Gather");
+    const std::vector<std::int64_t> output_shape = indices.shape.empty() ? std::vector<std::int64_t>{} : indices.shape;
     if (data.dtype == "int64") {
       const auto& data_values = RequireInt64Data(data, "Gather");
-      output.int64_data.reserve(index_data.size());
-      for (auto index : index_data) {
+      auto output = MakeInt64Output(node.outputs.at(0), output_shape, context);
+      for (std::size_t i = 0; i < index_data.size(); ++i) {
+        const auto index = index_data[i];
         if (data.shape.empty() && index != 0) {
           throw std::runtime_error("Gather scalar data only supports index 0");
         }
-        output.int64_data.push_back(data_values.at(static_cast<std::size_t>(index)));
+        output.int64_data[i] = data_values.at(static_cast<std::size_t>(index));
       }
+      context.BindTensor(std::move(output));
     } else if (data.dtype == "float32") {
       const auto& data_values = RequireFloatData(data, "Gather");
-      output.float_data.reserve(index_data.size());
-      for (auto index : index_data) {
+      auto output = MakeFloatOutput(node.outputs.at(0), output_shape, context);
+      for (std::size_t i = 0; i < index_data.size(); ++i) {
+        const auto index = index_data[i];
         if (data.shape.empty() && index != 0) {
           throw std::runtime_error("Gather scalar data only supports index 0");
         }
-        output.float_data.push_back(data_values.at(static_cast<std::size_t>(index)));
+        output.float_data[i] = data_values.at(static_cast<std::size_t>(index));
       }
+      context.BindTensor(std::move(output));
     } else {
       throw std::runtime_error("Gather currently supports float32/int64 data only");
     }
-
-    context.BindTensor(std::move(output));
     if (trace != nullptr) {
       *trace << "    kernel Gather produced " << node.outputs.at(0) << "\n";
     }
@@ -114,21 +102,20 @@ void RegisterShapeKernels(KernelRegistry& registry) {
 
     const auto rank = data.shape.size() + axes.size();
     auto normalized = NormalizeAxes(axes, rank);
-    auto output = data;
-    output.name = node.outputs.at(0);
-    output.shape.clear();
-    output.shape.reserve(rank);
+    std::vector<std::int64_t> output_shape;
+    output_shape.reserve(rank);
     std::size_t data_index = 0;
     std::size_t axis_index = 0;
     for (std::size_t i = 0; i < rank; ++i) {
       if (axis_index < normalized.size() && normalized[axis_index] == static_cast<std::int64_t>(i)) {
-        output.shape.push_back(1);
+        output_shape.push_back(1);
         ++axis_index;
       } else {
-        output.shape.push_back(data.shape[data_index++]);
+        output_shape.push_back(data.shape[data_index++]);
       }
     }
-    output.is_placeholder = false;
+    auto output = MakeCopiedTensorWithReusedStorage(node.outputs.at(0), data, output_shape, context);
+    output.shape = std::move(output_shape);
     context.BindTensor(std::move(output));
     if (trace != nullptr) {
       *trace << "    kernel Unsqueeze produced " << node.outputs.at(0) << "\n";
@@ -150,12 +137,12 @@ void RegisterShapeKernels(KernelRegistry& registry) {
 
     Tensor output;
     if (inputs.front().dtype == "float32") {
-      output = ConcatTensors<float>(node, trace, "float32", inputs,
+      output = ConcatTensors<float>(node, &context, trace, "float32", inputs,
                                     [](const Tensor& tensor) -> const std::vector<float>& {
                                       return RequireFloatData(tensor, "Concat");
                                     });
     } else if (inputs.front().dtype == "int64") {
-      output = ConcatTensors<std::int64_t>(node, trace, "int64", inputs,
+      output = ConcatTensors<std::int64_t>(node, &context, trace, "int64", inputs,
                                            [](const Tensor& tensor) -> const std::vector<std::int64_t>& {
                                              return RequireInt64Data(tensor, "Concat");
                                            });
@@ -168,10 +155,9 @@ void RegisterShapeKernels(KernelRegistry& registry) {
   registry.Register("Reshape", [](const Node& node, ExecutionContext& context, std::ostream* trace) {
     const auto& data = RequireTensor(context, node.inputs.at(0));
     const auto& shape_tensor = RequireTensor(context, node.inputs.at(1));
-    Tensor output = data;
-    output.name = node.outputs.at(0);
-    output.shape = ResolveReshapeDims(data, shape_tensor);
-    output.is_placeholder = false;
+    const auto output_shape = ResolveReshapeDims(data, shape_tensor);
+    auto output = MakeCopiedTensorWithReusedStorage(node.outputs.at(0), data, output_shape, context);
+    output.shape = output_shape;
     context.BindTensor(std::move(output));
     if (trace != nullptr) {
       *trace << "    kernel Reshape produced " << node.outputs.at(0) << "\n";
@@ -183,10 +169,6 @@ void RegisterShapeKernels(KernelRegistry& registry) {
     const auto& limit_tensor = RequireTensor(context, node.inputs.at(1));
     const auto& delta_tensor = RequireTensor(context, node.inputs.at(2));
 
-    Tensor output;
-    output.name = node.outputs.at(0);
-    output.is_placeholder = false;
-
     if (start_tensor.dtype == "float32" || limit_tensor.dtype == "float32" || delta_tensor.dtype == "float32") {
       const auto start = ReadScalarAsFloat32(start_tensor, "Range");
       const auto limit = ReadScalarAsFloat32(limit_tensor, "Range");
@@ -194,11 +176,14 @@ void RegisterShapeKernels(KernelRegistry& registry) {
       if (delta == 0.0f) {
         throw std::runtime_error("Range delta must not be zero");
       }
-      output.dtype = "float32";
+      std::vector<float> values;
       for (float value = start; (delta > 0.0f) ? (value < limit) : (value > limit); value += delta) {
-        output.float_data.push_back(value);
+        values.push_back(value);
       }
-      output.shape = {static_cast<std::int64_t>(output.float_data.size())};
+      auto output =
+          MakeFloatOutput(node.outputs.at(0), {static_cast<std::int64_t>(values.size())}, context);
+      std::copy(values.begin(), values.end(), output.float_data.begin());
+      context.BindTensor(std::move(output));
     } else if (start_tensor.dtype == "int64" && limit_tensor.dtype == "int64" && delta_tensor.dtype == "int64") {
       const auto start = ReadScalarAsInt64(start_tensor, "Range");
       const auto limit = ReadScalarAsInt64(limit_tensor, "Range");
@@ -206,14 +191,17 @@ void RegisterShapeKernels(KernelRegistry& registry) {
       if (delta == 0) {
         throw std::runtime_error("Range delta must not be zero");
       }
-      output.dtype = "int64";
+      std::vector<std::int64_t> values;
       for (std::int64_t value = start; (delta > 0) ? (value < limit) : (value > limit); value += delta) {
-        output.int64_data.push_back(value);
+        values.push_back(value);
       }
-      output.shape = {static_cast<std::int64_t>(output.int64_data.size())};
+      auto output =
+          MakeInt64Output(node.outputs.at(0), {static_cast<std::int64_t>(values.size())}, context);
+      std::copy(values.begin(), values.end(), output.int64_data.begin());
+      context.BindTensor(std::move(output));
+    } else {
+      throw std::runtime_error("Range currently supports float32/int64 only");
     }
-
-    context.BindTensor(std::move(output));
     if (trace != nullptr) {
       *trace << "    kernel Range produced " << node.outputs.at(0) << "\n";
     }
@@ -246,7 +234,7 @@ void RegisterShapeKernels(KernelRegistry& registry) {
       inner *= static_cast<std::size_t>(data.shape[i]);
     }
 
-    const auto emit_split = [&](auto storage, const auto& input_data) {
+    const auto emit_split_float = [&](const std::vector<float>& input_data) {
       std::size_t axis_offset = 0;
       for (std::size_t output_index = 0; output_index < node.outputs.size(); ++output_index) {
         const auto split_dim = static_cast<std::size_t>(splits[output_index]);
@@ -256,7 +244,8 @@ void RegisterShapeKernels(KernelRegistry& registry) {
         output.shape = data.shape;
         output.shape[static_cast<std::size_t>(axis)] = static_cast<std::int64_t>(split_dim);
         output.is_placeholder = false;
-        storage(output).resize(GetElementCount(output.shape));
+        output.float_data = context.AcquireFloatBuffer(GetElementCount(output.shape));
+        output.float_data.resize(GetElementCount(output.shape));
 
         std::size_t output_offset = 0;
         for (std::size_t outer_index = 0; outer_index < outer; ++outer_index) {
@@ -265,7 +254,38 @@ void RegisterShapeKernels(KernelRegistry& registry) {
           const auto copy_count = split_dim * inner;
           std::copy_n(input_data.begin() + static_cast<std::ptrdiff_t>(input_base),
                       static_cast<std::ptrdiff_t>(copy_count),
-                      storage(output).begin() + static_cast<std::ptrdiff_t>(output_offset));
+                      output.float_data.begin() + static_cast<std::ptrdiff_t>(output_offset));
+          output_offset += copy_count;
+        }
+        axis_offset += split_dim;
+        context.BindTensor(std::move(output));
+        if (trace != nullptr) {
+          *trace << "    kernel Split produced " << node.outputs[output_index] << "\n";
+        }
+      }
+    };
+
+    const auto emit_split_int64 = [&](const std::vector<std::int64_t>& input_data) {
+      std::size_t axis_offset = 0;
+      for (std::size_t output_index = 0; output_index < node.outputs.size(); ++output_index) {
+        const auto split_dim = static_cast<std::size_t>(splits[output_index]);
+        Tensor output;
+        output.name = node.outputs[output_index];
+        output.dtype = data.dtype;
+        output.shape = data.shape;
+        output.shape[static_cast<std::size_t>(axis)] = static_cast<std::int64_t>(split_dim);
+        output.is_placeholder = false;
+        output.int64_data = context.AcquireInt64Buffer(GetElementCount(output.shape));
+        output.int64_data.resize(GetElementCount(output.shape));
+
+        std::size_t output_offset = 0;
+        for (std::size_t outer_index = 0; outer_index < outer; ++outer_index) {
+          const auto input_base =
+              (outer_index * static_cast<std::size_t>(data.shape[static_cast<std::size_t>(axis)]) + axis_offset) * inner;
+          const auto copy_count = split_dim * inner;
+          std::copy_n(input_data.begin() + static_cast<std::ptrdiff_t>(input_base),
+                      static_cast<std::ptrdiff_t>(copy_count),
+                      output.int64_data.begin() + static_cast<std::ptrdiff_t>(output_offset));
           output_offset += copy_count;
         }
         axis_offset += split_dim;
@@ -277,11 +297,9 @@ void RegisterShapeKernels(KernelRegistry& registry) {
     };
 
     if (data.dtype == "float32") {
-      emit_split([](Tensor& tensor) -> std::vector<float>& { return tensor.float_data; },
-                 RequireFloatData(data, "Split"));
+      emit_split_float(RequireFloatData(data, "Split"));
     } else if (data.dtype == "int64") {
-      emit_split([](Tensor& tensor) -> std::vector<std::int64_t>& { return tensor.int64_data; },
-                 RequireInt64Data(data, "Split"));
+      emit_split_int64(RequireInt64Data(data, "Split"));
     } else {
       throw std::runtime_error("Split currently supports float32/int64 only");
     }
@@ -305,33 +323,27 @@ void RegisterShapeKernels(KernelRegistry& registry) {
       }
     }
 
-    Tensor output;
-    output.name = node.outputs.at(0);
-    output.dtype = data.dtype;
-    output.shape = output_shape;
-    output.is_placeholder = false;
-
     if (data.dtype == "float32") {
       const auto& input_data = RequireFloatData(data, "Expand");
-      output.float_data.resize(GetElementCount(output_shape));
+      auto output = MakeFloatOutput(node.outputs.at(0), output_shape, context);
       for (std::size_t i = 0; i < output.float_data.size(); ++i) {
         const auto output_index = UnravelIndex(i, output_shape, output_strides);
         const auto input_offset = ComputeBroadcastOffset(output_index, data.shape, input_strides);
         output.float_data[i] = input_data[input_offset];
       }
+      context.BindTensor(std::move(output));
     } else if (data.dtype == "int64") {
       const auto& input_data = RequireInt64Data(data, "Expand");
-      output.int64_data.resize(GetElementCount(output_shape));
+      auto output = MakeInt64Output(node.outputs.at(0), output_shape, context);
       for (std::size_t i = 0; i < output.int64_data.size(); ++i) {
         const auto output_index = UnravelIndex(i, output_shape, output_strides);
         const auto input_offset = ComputeBroadcastOffset(output_index, data.shape, input_strides);
         output.int64_data[i] = input_data[input_offset];
       }
+      context.BindTensor(std::move(output));
     } else {
       throw std::runtime_error("Expand currently supports float32/int64 only");
     }
-
-    context.BindTensor(std::move(output));
     if (trace != nullptr) {
       *trace << "    kernel Expand produced " << node.outputs.at(0) << "\n";
     }
@@ -366,6 +378,7 @@ void RegisterShapeKernels(KernelRegistry& registry) {
     const auto output_strides = ComputeStrides(output.shape);
     if (input.dtype == "float32") {
       const auto& input_data = RequireFloatData(input, "Transpose");
+      output.float_data = context.AcquireFloatBuffer(GetElementCount(output.shape));
       output.float_data.resize(GetElementCount(output.shape));
       for (std::size_t i = 0; i < output.float_data.size(); ++i) {
         const auto output_index = UnravelIndex(i, output.shape, output_strides);
@@ -377,6 +390,7 @@ void RegisterShapeKernels(KernelRegistry& registry) {
       }
     } else if (input.dtype == "int64") {
       const auto& input_data = RequireInt64Data(input, "Transpose");
+      output.int64_data = context.AcquireInt64Buffer(GetElementCount(output.shape));
       output.int64_data.resize(GetElementCount(output.shape));
       for (std::size_t i = 0; i < output.int64_data.size(); ++i) {
         const auto output_index = UnravelIndex(i, output.shape, output_strides);
@@ -456,12 +470,6 @@ void RegisterShapeKernels(KernelRegistry& registry) {
     const auto input_strides = ComputeStrides(data.shape);
     const auto output_strides = ComputeStrides(output_shape);
 
-    Tensor output;
-    output.name = node.outputs.at(0);
-    output.dtype = data.dtype;
-    output.shape = output_shape;
-    output.is_placeholder = false;
-
     const auto emit_slice = [&](auto& output_data, const auto& input_data) {
       output_data.resize(GetElementCount(output_shape));
       for (std::size_t i = 0; i < output_data.size(); ++i) {
@@ -475,14 +483,16 @@ void RegisterShapeKernels(KernelRegistry& registry) {
     };
 
     if (data.dtype == "float32") {
+      auto output = MakeFloatOutput(node.outputs.at(0), output_shape, context);
       emit_slice(output.float_data, RequireFloatData(data, "Slice"));
+      context.BindTensor(std::move(output));
     } else if (data.dtype == "int64") {
+      auto output = MakeInt64Output(node.outputs.at(0), output_shape, context);
       emit_slice(output.int64_data, RequireInt64Data(data, "Slice"));
+      context.BindTensor(std::move(output));
     } else {
       throw std::runtime_error("Slice currently supports float32/int64 only");
     }
-
-    context.BindTensor(std::move(output));
     if (trace != nullptr) {
       *trace << "    kernel Slice produced " << node.outputs.at(0) << "\n";
     }
@@ -507,12 +517,7 @@ void RegisterShapeKernels(KernelRegistry& registry) {
 
     const auto input_strides = ComputeStrides(input.shape);
     const auto output_strides = ComputeStrides(output_shape);
-    Tensor output;
-    output.name = node.outputs.at(0);
-    output.dtype = "float32";
-    output.shape = output_shape;
-    output.is_placeholder = false;
-    output.float_data.resize(GetElementCount(output_shape));
+    auto output = MakeFloatOutput(node.outputs.at(0), output_shape, context);
 
     for (std::size_t i = 0; i < output.float_data.size(); ++i) {
       auto output_index = UnravelIndex(i, output_shape, output_strides);
@@ -558,12 +563,7 @@ void RegisterShapeKernels(KernelRegistry& registry) {
 
     const auto input_strides = ComputeStrides(input.shape);
     const auto output_strides = ComputeStrides(output_shape);
-    Tensor output;
-    output.name = node.outputs.at(0);
-    output.dtype = "int64";
-    output.shape = output_shape;
-    output.is_placeholder = false;
-    output.int64_data.resize(GetElementCount(output_shape));
+    auto output = MakeInt64Output(node.outputs.at(0), output_shape, context);
 
     for (std::size_t i = 0; i < output.int64_data.size(); ++i) {
       auto output_index = UnravelIndex(i, output_shape, output_strides);
