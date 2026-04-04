@@ -16,12 +16,6 @@
 - Protobuf
   - 需要 `protoc`
   - CMake 会优先尝试 `find_package(Protobuf CONFIG QUIET)`，失败时回退到系统自带的 `FindProtobuf`
-  - Ubuntu / Debian 可以直接安装：
-
-    ```bash
-    sudo apt update
-    sudo apt install -y libprotobuf-dev protobuf-compiler
-    ```
 
 项目自带了用于解析 ONNX 的 `third_party/onnx`，不需要额外单独下载 ONNX 代码。
 
