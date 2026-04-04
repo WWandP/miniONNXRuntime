@@ -1,20 +1,18 @@
 <!doctype html>
-<html lang="zh-CN">
+<html lang="en">
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>miniONNXRuntime Overview</title>
+  <title>miniONNXRuntime Logo</title>
   <style>
     :root {
       --bg: #0b1020;
-      --panel: #11192d;
-      --panel-2: #0f1730;
-      --text: #eef3ff;
-      --muted: #9aa8c1;
-      --accent: #f6c177;
-      --accent-2: #74d3ae;
-      --accent-3: #6db3ff;
-      --line: rgba(255, 255, 255, 0.12);
+      --ink: #eef3ff;
+      --muted: rgba(238, 243, 255, 0.7);
+      --line: rgba(255, 255, 255, 0.08);
+      --a: #6db3ff;
+      --b: #f6c177;
+      --c: #74d3ae;
     }
 
     * { box-sizing: border-box; }
@@ -23,10 +21,11 @@
       width: 100%;
       height: 100%;
       background:
-        radial-gradient(circle at 15% 20%, rgba(109, 179, 255, 0.20), transparent 28%),
-        radial-gradient(circle at 88% 18%, rgba(246, 193, 119, 0.15), transparent 24%),
-        linear-gradient(180deg, #0b1020 0%, #0c1325 100%);
-      color: var(--text);
+        radial-gradient(circle at 28% 28%, rgba(109, 179, 255, 0.20), transparent 18%),
+        radial-gradient(circle at 72% 26%, rgba(246, 193, 119, 0.16), transparent 16%),
+        radial-gradient(circle at 50% 72%, rgba(116, 211, 174, 0.16), transparent 20%),
+        linear-gradient(180deg, #0b1020 0%, #09101b 100%);
+      overflow: hidden;
       font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
     }
 
@@ -34,253 +33,181 @@
       width: 1600px;
       height: 900px;
       margin: 0 auto;
-      padding: 54px 60px;
       position: relative;
+      overflow: hidden;
     }
 
-    .badge {
-      display: inline-flex;
-      align-items: center;
-      gap: 10px;
-      padding: 10px 16px;
-      border-radius: 999px;
-      background: rgba(255,255,255,0.05);
-      border: 1px solid rgba(255,255,255,0.08);
-      color: var(--muted);
-      font-size: 14px;
-      letter-spacing: 0.02em;
+    .grid {
+      position: absolute;
+      inset: 0;
+      background-image:
+        linear-gradient(var(--line) 1px, transparent 1px),
+        linear-gradient(90deg, var(--line) 1px, transparent 1px);
+      background-size: 80px 80px;
+      opacity: 0.32;
+      mask-image: linear-gradient(180deg, rgba(0,0,0,0.55), transparent 92%);
     }
 
-    .dot {
-      width: 10px;
-      height: 10px;
+    .halo {
+      position: absolute;
+      left: 50%;
+      top: 50%;
+      width: 760px;
+      height: 760px;
+      transform: translate(-50%, -50%);
       border-radius: 50%;
-      background: linear-gradient(180deg, var(--accent), #ff9d6f);
-      box-shadow: 0 0 14px rgba(246, 193, 119, 0.6);
+      background:
+        radial-gradient(circle, rgba(255,255,255,0.03) 0 20%, transparent 21%),
+        radial-gradient(circle, rgba(109,179,255,0.12) 0 33%, transparent 34%),
+        radial-gradient(circle, rgba(246,193,119,0.08) 0 48%, transparent 49%),
+        radial-gradient(circle, rgba(116,211,174,0.06) 0 62%, transparent 63%);
+      filter: blur(1px);
+      opacity: 0.8;
     }
 
-    h1 {
-      margin: 22px 0 14px;
-      font-size: 64px;
-      line-height: 0.96;
-      letter-spacing: -0.045em;
-      max-width: 920px;
-    }
-
-    .subtitle {
-      max-width: 980px;
-      font-size: 22px;
-      line-height: 1.55;
-      color: var(--muted);
-      margin-bottom: 34px;
-    }
-
-    .flow {
-      display: grid;
-      grid-template-columns: 1fr 80px 1fr 80px 1fr;
-      align-items: center;
-      gap: 0;
-      margin-top: 10px;
-    }
-
-    .card {
-      min-height: 270px;
-      border-radius: 28px;
-      background: linear-gradient(180deg, rgba(255,255,255,0.05), rgba(255,255,255,0.03));
-      border: 1px solid var(--line);
-      padding: 28px 28px 24px;
-      box-shadow: 0 22px 60px rgba(0, 0, 0, 0.25);
-    }
-
-    .card .eyebrow {
-      color: var(--muted);
-      text-transform: uppercase;
-      letter-spacing: 0.12em;
-      font-size: 12px;
-      margin-bottom: 14px;
-    }
-
-    .card h2 {
-      margin: 0 0 10px;
-      font-size: 28px;
-      letter-spacing: -0.03em;
-    }
-
-    .card p {
-      margin: 0;
-      color: #cfdaee;
-      font-size: 16px;
-      line-height: 1.7;
-    }
-
-    .card ul {
-      margin: 18px 0 0;
-      padding: 0;
-      list-style: none;
-      display: grid;
-      gap: 10px;
-    }
-
-    .card li {
-      display: flex;
-      align-items: center;
-      gap: 10px;
-      color: #dfe7f5;
-      font-size: 15px;
-    }
-
-    .pill {
-      display: inline-flex;
-      align-items: center;
-      padding: 6px 10px;
-      border-radius: 999px;
-      background: rgba(255,255,255,0.05);
-      border: 1px solid rgba(255,255,255,0.08);
-      font-size: 12px;
-      color: var(--muted);
-      margin-left: 8px;
-    }
-
-    .arrow {
+    .logo-wrap {
+      position: absolute;
+      left: 50%;
+      top: 50%;
+      width: 620px;
+      height: 620px;
+      transform: translate(-50%, -50%);
       display: grid;
       place-items: center;
-      font-size: 38px;
-      font-weight: 700;
-      color: rgba(255,255,255,0.72);
     }
 
-    .arrow span {
-      display: inline-block;
-      transform: translateY(-2px);
-    }
-
-    .footer {
-      margin-top: 28px;
+    .logo {
+      position: relative;
+      width: 420px;
+      height: 420px;
       display: grid;
-      grid-template-columns: 1.15fr 0.85fr;
-      gap: 20px;
+      place-items: center;
+      filter: drop-shadow(0 18px 44px rgba(0,0,0,0.38));
     }
 
-    .mini {
-      border-radius: 22px;
-      padding: 22px 24px;
-      background: rgba(255,255,255,0.04);
-      border: 1px solid rgba(255,255,255,0.08);
+    .core {
+      position: absolute;
+      width: 170px;
+      height: 170px;
+      border-radius: 34px;
+      background:
+        linear-gradient(145deg, rgba(255,255,255,0.14), rgba(255,255,255,0.02)),
+        linear-gradient(180deg, #10182b, #0d1322);
+      border: 1px solid rgba(255,255,255,0.10);
+      transform: rotate(45deg);
+      box-shadow:
+        inset 0 0 0 1px rgba(255,255,255,0.04),
+        0 0 0 24px rgba(255,255,255,0.03);
     }
 
-    .mini h3 {
-      margin: 0 0 10px;
-      font-size: 18px;
-    }
-
-    .mini p {
-      margin: 0;
-      color: var(--muted);
-      line-height: 1.65;
-      font-size: 14px;
-    }
-
-    .flowline {
-      height: 2px;
-      background: linear-gradient(90deg, rgba(109,179,255,0.0), rgba(109,179,255,0.75), rgba(246,193,119,0.75), rgba(116,211,174,0.75), rgba(116,211,174,0.0));
-      margin: 20px 0 0;
-      border-radius: 999px;
-      opacity: 0.85;
-    }
-
-    .notes {
-      display: grid;
-      gap: 10px;
-      grid-template-columns: repeat(3, 1fr);
-      margin-top: 14px;
-    }
-
-    .note {
-      border-radius: 18px;
-      padding: 14px 16px;
-      background: rgba(255,255,255,0.035);
+    .core::before,
+    .core::after {
+      content: "";
+      position: absolute;
+      inset: 30px;
+      border-radius: 26px;
       border: 1px solid rgba(255,255,255,0.06);
-      color: #dfe7f5;
-      font-size: 14px;
-      line-height: 1.55;
-      min-height: 82px;
     }
 
-    .note b {
-      color: var(--text);
+    .ring {
+      position: absolute;
+      border-radius: 50%;
+      border: 2px solid rgba(255,255,255,0.18);
+      box-shadow:
+        0 0 0 10px rgba(255,255,255,0.02),
+        inset 0 0 24px rgba(255,255,255,0.02);
+    }
+
+    .ring.one {
+      width: 300px;
+      height: 300px;
+      border-color: rgba(109, 179, 255, 0.22);
+      clip-path: polygon(0 0, 100% 0, 100% 38%, 0 38%);
+      transform: rotate(12deg);
+    }
+
+    .ring.two {
+      width: 300px;
+      height: 300px;
+      border-color: rgba(246, 193, 119, 0.22);
+      clip-path: polygon(0 62%, 100% 62%, 100% 100%, 0 100%);
+      transform: rotate(-10deg);
+    }
+
+    .ring.three {
+      width: 300px;
+      height: 300px;
+      border-color: rgba(116, 211, 174, 0.22);
+      clip-path: polygon(0 0, 38% 0, 38% 100%, 0 100%);
+      transform: rotate(-12deg);
+    }
+
+    .ring.four {
+      width: 300px;
+      height: 300px;
+      border-color: rgba(255,255,255,0.12);
+      clip-path: polygon(62% 0, 100% 0, 100% 100%, 62% 100%);
+      transform: rotate(8deg);
+    }
+
+    .orb {
+      position: absolute;
+      width: 26px;
+      height: 26px;
+      border-radius: 50%;
+      box-shadow:
+        0 0 20px currentColor,
+        0 0 44px rgba(255,255,255,0.16);
+    }
+
+    .orb.a { color: var(--a); background: var(--a); top: 42px; left: 92px; }
+    .orb.b { color: var(--b); background: var(--b); top: 42px; right: 92px; }
+    .orb.c { color: var(--c); background: var(--c); bottom: 42px; left: 92px; }
+    .orb.d { color: #cfd9ea; background: #cfd9ea; bottom: 42px; right: 92px; }
+
+    .link {
+      position: absolute;
+      width: 220px;
+      height: 2px;
+      background: linear-gradient(90deg, transparent, rgba(255,255,255,0.22), transparent);
+      transform-origin: left center;
+    }
+
+    .link.one { left: 90px; top: 54px; transform: rotate(24deg); }
+    .link.two { right: 90px; top: 54px; transform: rotate(-24deg); }
+    .link.three { left: 90px; bottom: 54px; transform: rotate(-24deg); }
+    .link.four { right: 90px; bottom: 54px; transform: rotate(24deg); }
+
+    .accent {
+      position: absolute;
+      inset: 0;
+      background:
+        radial-gradient(circle at 50% 50%, rgba(255,255,255,0.0) 0 32%, rgba(255,255,255,0.03) 33% 34%, transparent 35%),
+        radial-gradient(circle at 50% 50%, rgba(255,255,255,0.0) 0 48%, rgba(255,255,255,0.03) 49% 50%, transparent 51%);
+      opacity: 0.85;
     }
   </style>
 </head>
 <body>
   <div class="canvas">
-    <div class="badge"><span class="dot"></span> miniONNXRuntime · project snapshot</div>
-    <h1>把 ONNX 推理拆成一条能看懂的最小主线</h1>
-    <div class="subtitle">
-      这个项目的目的很简单：从模型解析、图优化，到 CPU 执行、YOLO 后处理，再到内存生命周期分析，
-      每一步都能直接观察，而不是只看一个黑盒结果。
-    </div>
-
-    <div class="flow">
-      <section class="card">
-        <div class="eyebrow">1 · Parse</div>
-        <h2>LoadOnnxGraph</h2>
-        <p>把 `.onnx` 转成内部 Graph，先把图结构、initializer、value_info 看清楚。</p>
-        <ul>
-          <li>图结构</li>
-          <li>节点属性</li>
-          <li>拓扑顺序</li>
-        </ul>
-      </section>
-
-      <div class="arrow"><span>→</span></div>
-
-      <section class="card">
-        <div class="eyebrow">2 · Optimize</div>
-        <h2>GraphOptimizer</h2>
-        <p>做常量折叠、死节点清理和形状简化，让图更短、更容易执行。</p>
-        <ul>
-          <li>ConstantFolding <span class="pill">phase4</span></li>
-          <li>DeadNodeCleanup</li>
-          <li>ShapeSimplification</li>
-        </ul>
-      </section>
-
-      <div class="arrow"><span>→</span></div>
-
-      <section class="card">
-        <div class="eyebrow">3 · Run</div>
-        <h2>Session + Kernels</h2>
-        <p>在 CPU 上执行节点，最后输出 detections 和可视化结果。</p>
-        <ul>
-          <li>Session::Run</li>
-          <li>CPU Kernels</li>
-          <li>YOLO Postprocess</li>
-        </ul>
-      </section>
-    </div>
-
-    <div class="flowline"></div>
-
-    <div class="footer">
-      <div class="mini">
-        <h3>Memory story</h3>
-        <p>
-          initializer 先按需 materialize，再做 dead tensor eviction 和 buffer reuse。
-          这张图的重点是：让“图在怎么变”和“内存怎么变”都能直观看到。
-        </p>
-        <div class="notes">
-          <div class="note"><b>Before:</b> 权重和中间值常驻，峰值更高。</div>
-          <div class="note"><b>Now:</b> runtime 只保留当前路径需要的少量张量。</div>
-          <div class="note"><b>Next:</b> 再往 ExecutionProvider / Mac backend 走。</div>
-        </div>
-      </div>
-      <div class="mini">
-        <h3>Quick commands</h3>
-        <p>
-          <code>miniort_inspect model.onnx</code><br />
-          <code>miniort_run model.onnx --image pic/bus.jpg</code><br />
-          <code>miniort_optimize_model model.onnx --image pic/bus.jpg</code>
-        </p>
+    <div class="grid"></div>
+    <div class="halo"></div>
+    <div class="logo-wrap">
+      <div class="logo" aria-label="miniONNXRuntime logo mark">
+        <div class="accent"></div>
+        <div class="ring one"></div>
+        <div class="ring two"></div>
+        <div class="ring three"></div>
+        <div class="ring four"></div>
+        <div class="link one"></div>
+        <div class="link two"></div>
+        <div class="link three"></div>
+        <div class="link four"></div>
+        <div class="core"></div>
+        <div class="orb a"></div>
+        <div class="orb b"></div>
+        <div class="orb c"></div>
+        <div class="orb d"></div>
       </div>
     </div>
   </div>
