@@ -3,507 +3,284 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>miniONNXRuntime Showcase</title>
+  <title>miniONNXRuntime Overview</title>
   <style>
     :root {
-      color-scheme: dark;
-      --bg: #081018;
-      --panel: rgba(12, 20, 31, 0.86);
-      --panel-strong: rgba(16, 27, 41, 0.96);
-      --text: #f4f7fb;
-      --muted: #a7b3c5;
-      --accent: #f4b860;
+      --bg: #0b1020;
+      --panel: #11192d;
+      --panel-2: #0f1730;
+      --text: #eef3ff;
+      --muted: #9aa8c1;
+      --accent: #f6c177;
       --accent-2: #74d3ae;
       --accent-3: #6db3ff;
-      --line: rgba(255, 255, 255, 0.09);
-      --shadow: 0 24px 80px rgba(0, 0, 0, 0.4);
+      --line: rgba(255, 255, 255, 0.12);
     }
 
     * { box-sizing: border-box; }
-    html, body { margin: 0; min-height: 100%; background: var(--bg); }
-    body {
-      font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    html, body {
+      margin: 0;
+      width: 100%;
+      height: 100%;
+      background:
+        radial-gradient(circle at 15% 20%, rgba(109, 179, 255, 0.20), transparent 28%),
+        radial-gradient(circle at 88% 18%, rgba(246, 193, 119, 0.15), transparent 24%),
+        linear-gradient(180deg, #0b1020 0%, #0c1325 100%);
       color: var(--text);
-      overflow: hidden;
+      font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
     }
 
     .canvas {
       width: 1600px;
       height: 900px;
       margin: 0 auto;
-      position: relative;
-      background:
-        radial-gradient(circle at 10% 15%, rgba(109, 179, 255, 0.22), transparent 28%),
-        radial-gradient(circle at 86% 12%, rgba(244, 184, 96, 0.18), transparent 24%),
-        radial-gradient(circle at 72% 88%, rgba(116, 211, 174, 0.15), transparent 28%),
-        linear-gradient(180deg, #081018 0%, #0b1320 48%, #091017 100%);
-    }
-
-    .noise {
-      position: absolute;
-      inset: 0;
-      background-image:
-        linear-gradient(rgba(255,255,255,0.03) 1px, transparent 1px),
-        linear-gradient(90deg, rgba(255,255,255,0.03) 1px, transparent 1px);
-      background-size: 64px 64px;
-      mask-image: linear-gradient(180deg, rgba(0,0,0,0.7), transparent 88%);
-      opacity: 0.32;
-      pointer-events: none;
-    }
-
-    .content {
-      position: relative;
-      z-index: 1;
-      padding: 44px 52px 34px;
-      width: 100%;
-      height: 100%;
-      display: grid;
-      grid-template-rows: auto auto 1fr auto;
-      gap: 22px;
-    }
-
-    .top {
-      display: grid;
-      grid-template-columns: 1.2fr 0.8fr;
-      gap: 22px;
-      align-items: stretch;
-    }
-
-    .hero, .stats, .panel, .footer {
-      border: 1px solid var(--line);
-      background: var(--panel);
-      backdrop-filter: blur(16px);
-      box-shadow: var(--shadow);
-    }
-
-    .hero {
-      border-radius: 28px;
-      padding: 34px 34px 30px;
-      overflow: hidden;
+      padding: 54px 60px;
       position: relative;
     }
 
-    .hero::after {
-      content: "";
-      position: absolute;
-      inset: auto -120px -160px auto;
-      width: 360px;
-      height: 360px;
-      border-radius: 50%;
-      background: radial-gradient(circle, rgba(244, 184, 96, 0.18), transparent 68%);
-      filter: blur(10px);
-      pointer-events: none;
-    }
-
-    .eyebrow {
+    .badge {
       display: inline-flex;
       align-items: center;
       gap: 10px;
-      padding: 8px 14px;
+      padding: 10px 16px;
       border-radius: 999px;
-      background: rgba(255, 255, 255, 0.06);
-      border: 1px solid rgba(255, 255, 255, 0.08);
+      background: rgba(255,255,255,0.05);
+      border: 1px solid rgba(255,255,255,0.08);
       color: var(--muted);
       font-size: 14px;
       letter-spacing: 0.02em;
-      margin-bottom: 18px;
     }
 
     .dot {
       width: 10px;
       height: 10px;
       border-radius: 50%;
-      background: linear-gradient(180deg, var(--accent), #ff9b54);
-      box-shadow: 0 0 16px rgba(244, 184, 96, 0.65);
+      background: linear-gradient(180deg, var(--accent), #ff9d6f);
+      box-shadow: 0 0 14px rgba(246, 193, 119, 0.6);
     }
 
     h1 {
-      margin: 0;
-      font-size: 60px;
-      line-height: 0.94;
-      letter-spacing: -0.04em;
+      margin: 22px 0 14px;
+      font-size: 64px;
+      line-height: 0.96;
+      letter-spacing: -0.045em;
+      max-width: 920px;
     }
 
     .subtitle {
-      margin-top: 16px;
-      max-width: 720px;
+      max-width: 980px;
+      font-size: 22px;
+      line-height: 1.55;
       color: var(--muted);
-      font-size: 18px;
-      line-height: 1.65;
-    }
-
-    .chips {
-      margin-top: 24px;
-      display: flex;
-      flex-wrap: wrap;
-      gap: 10px;
-    }
-
-    .chip {
-      display: inline-flex;
-      align-items: center;
-      gap: 8px;
-      padding: 10px 14px;
-      border-radius: 999px;
-      background: rgba(255, 255, 255, 0.05);
-      border: 1px solid rgba(255, 255, 255, 0.08);
-      font-size: 14px;
-      color: #dbe5f2;
-    }
-
-    .chip b {
-      color: var(--text);
-      font-weight: 700;
-    }
-
-    .stats {
-      border-radius: 28px;
-      padding: 26px;
-      display: grid;
-      gap: 14px;
-      grid-template-columns: 1fr 1fr;
-    }
-
-    .metric {
-      padding: 18px;
-      border-radius: 22px;
-      background: var(--panel-strong);
-      border: 1px solid rgba(255, 255, 255, 0.06);
-    }
-
-    .metric .label {
-      color: var(--muted);
-      font-size: 13px;
-      letter-spacing: 0.08em;
-      text-transform: uppercase;
-      margin-bottom: 8px;
-    }
-
-    .metric .value {
-      font-size: 34px;
-      font-weight: 800;
-      letter-spacing: -0.04em;
-      line-height: 1;
-    }
-
-    .metric .hint {
-      margin-top: 6px;
-      color: #c9d4e3;
-      font-size: 13px;
-      line-height: 1.5;
-    }
-
-    .section {
-      display: grid;
-      grid-template-columns: 1fr 1fr 1fr;
-      gap: 18px;
-    }
-
-    .panel {
-      border-radius: 28px;
-      padding: 24px;
-      display: flex;
-      flex-direction: column;
-      gap: 16px;
-      min-height: 100%;
-    }
-
-    .panel h2 {
-      margin: 0;
-      font-size: 18px;
-      letter-spacing: -0.02em;
-    }
-
-    .panel p {
-      margin: 0;
-      color: var(--muted);
-      line-height: 1.6;
-      font-size: 15px;
+      margin-bottom: 34px;
     }
 
     .flow {
       display: grid;
-      gap: 12px;
-    }
-
-    .flow-item {
-      display: grid;
-      grid-template-columns: 44px 1fr;
-      gap: 14px;
+      grid-template-columns: 1fr 80px 1fr 80px 1fr;
       align-items: center;
-      padding: 14px 16px;
-      border-radius: 18px;
-      background: rgba(255, 255, 255, 0.04);
-      border: 1px solid rgba(255, 255, 255, 0.06);
+      gap: 0;
+      margin-top: 10px;
     }
 
-    .num {
-      width: 44px;
-      height: 44px;
-      display: grid;
-      place-items: center;
-      border-radius: 14px;
-      font-weight: 800;
-      color: #081018;
-      background: linear-gradient(180deg, #f4b860, #f1d08d);
+    .card {
+      min-height: 270px;
+      border-radius: 28px;
+      background: linear-gradient(180deg, rgba(255,255,255,0.05), rgba(255,255,255,0.03));
+      border: 1px solid var(--line);
+      padding: 28px 28px 24px;
+      box-shadow: 0 22px 60px rgba(0, 0, 0, 0.25);
     }
 
-    .flow-item strong {
-      display: block;
-      font-size: 15px;
-      margin-bottom: 2px;
-    }
-
-    .flow-item span {
+    .card .eyebrow {
       color: var(--muted);
-      font-size: 13px;
+      text-transform: uppercase;
+      letter-spacing: 0.12em;
+      font-size: 12px;
+      margin-bottom: 14px;
     }
 
-    .phases {
+    .card h2 {
+      margin: 0 0 10px;
+      font-size: 28px;
+      letter-spacing: -0.03em;
+    }
+
+    .card p {
+      margin: 0;
+      color: #cfdaee;
+      font-size: 16px;
+      line-height: 1.7;
+    }
+
+    .card ul {
+      margin: 18px 0 0;
+      padding: 0;
+      list-style: none;
       display: grid;
       gap: 10px;
     }
 
-    .phase-card {
+    .card li {
       display: flex;
-      justify-content: space-between;
       align-items: center;
-      padding: 14px 16px;
-      border-radius: 18px;
-      background: rgba(255, 255, 255, 0.04);
-      border: 1px solid rgba(255, 255, 255, 0.06);
-    }
-
-    .phase-card strong {
+      gap: 10px;
+      color: #dfe7f5;
       font-size: 15px;
     }
 
-    .phase-card span {
-      color: var(--muted);
-      font-size: 13px;
-    }
-
-    .tag {
-      padding: 7px 10px;
+    .pill {
+      display: inline-flex;
+      align-items: center;
+      padding: 6px 10px;
       border-radius: 999px;
+      background: rgba(255,255,255,0.05);
+      border: 1px solid rgba(255,255,255,0.08);
       font-size: 12px;
-      font-weight: 700;
-      background: rgba(116, 211, 174, 0.14);
-      color: #9ff0ce;
-      border: 1px solid rgba(116, 211, 174, 0.18);
-    }
-
-    .tag.gold {
-      background: rgba(244, 184, 96, 0.16);
-      color: #ffd692;
-      border-color: rgba(244, 184, 96, 0.22);
-    }
-
-    .memory {
-      display: grid;
-      gap: 14px;
-    }
-
-    .bar-row {
-      display: grid;
-      gap: 8px;
-    }
-
-    .bar-head {
-      display: flex;
-      justify-content: space-between;
-      color: #dbe5f2;
-      font-size: 14px;
-    }
-
-    .bar {
-      height: 14px;
-      border-radius: 999px;
-      background: rgba(255, 255, 255, 0.06);
-      overflow: hidden;
-      position: relative;
-    }
-
-    .bar .fill {
-      position: absolute;
-      inset: 0 auto 0 0;
-      border-radius: inherit;
-    }
-
-    .fill.before {
-      width: 100%;
-      background: linear-gradient(90deg, #ff8c6b, #f4b860);
-    }
-
-    .fill.after {
-      width: 50%;
-      background: linear-gradient(90deg, #6db3ff, #74d3ae);
-    }
-
-    .bar-note {
       color: var(--muted);
-      font-size: 13px;
-      line-height: 1.55;
+      margin-left: 8px;
+    }
+
+    .arrow {
+      display: grid;
+      place-items: center;
+      font-size: 38px;
+      font-weight: 700;
+      color: rgba(255,255,255,0.72);
+    }
+
+    .arrow span {
+      display: inline-block;
+      transform: translateY(-2px);
     }
 
     .footer {
-      border-radius: 24px;
-      padding: 18px 22px;
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-      gap: 18px;
+      margin-top: 28px;
+      display: grid;
+      grid-template-columns: 1.15fr 0.85fr;
+      gap: 20px;
+    }
+
+    .mini {
+      border-radius: 22px;
+      padding: 22px 24px;
+      background: rgba(255,255,255,0.04);
+      border: 1px solid rgba(255,255,255,0.08);
+    }
+
+    .mini h3 {
+      margin: 0 0 10px;
+      font-size: 18px;
+    }
+
+    .mini p {
+      margin: 0;
       color: var(--muted);
+      line-height: 1.65;
       font-size: 14px;
     }
 
-    .footer strong {
-      color: var(--text);
+    .flowline {
+      height: 2px;
+      background: linear-gradient(90deg, rgba(109,179,255,0.0), rgba(109,179,255,0.75), rgba(246,193,119,0.75), rgba(116,211,174,0.75), rgba(116,211,174,0.0));
+      margin: 20px 0 0;
+      border-radius: 999px;
+      opacity: 0.85;
     }
 
-    .commands {
-      display: flex;
+    .notes {
+      display: grid;
       gap: 10px;
-      flex-wrap: wrap;
-      justify-content: flex-end;
+      grid-template-columns: repeat(3, 1fr);
+      margin-top: 14px;
     }
 
-    code {
-      display: inline-flex;
-      align-items: center;
-      padding: 8px 10px;
-      border-radius: 12px;
-      background: rgba(255, 255, 255, 0.06);
-      border: 1px solid rgba(255, 255, 255, 0.08);
-      color: #eef5ff;
-      font-size: 13px;
-      white-space: nowrap;
+    .note {
+      border-radius: 18px;
+      padding: 14px 16px;
+      background: rgba(255,255,255,0.035);
+      border: 1px solid rgba(255,255,255,0.06);
+      color: #dfe7f5;
+      font-size: 14px;
+      line-height: 1.55;
+      min-height: 82px;
+    }
+
+    .note b {
+      color: var(--text);
     }
   </style>
 </head>
 <body>
   <div class="canvas">
-    <div class="noise"></div>
-    <div class="content">
-      <div class="top">
-        <section class="hero">
-          <div class="eyebrow"><span class="dot"></span> miniONNXRuntime · from graph to image</div>
-          <h1>一个最小但完整的 ONNX Runtime 教学实现</h1>
-          <div class="subtitle">
-            解析 ONNX、优化图、执行 CPU kernel、做 YOLO 后处理，再把内存演进和生命周期分析显式展示出来。
-            这个项目的重点不是“复杂”，而是把推理链路拆到每一步都能看见。
-          </div>
-          <div class="chips">
-            <div class="chip"><b>phase1</b> 纯解析</div>
-            <div class="chip"><b>phase2</b> 执行主线</div>
-            <div class="chip"><b>phase3</b> CPU 推理</div>
-            <div class="chip"><b>phase4</b> 图优化 + 内存演示</div>
-          </div>
-        </section>
-        <aside class="stats">
-          <div class="metric">
-            <div class="label">Graph</div>
-            <div class="value">459 → 244</div>
-            <div class="hint">图优化后节点数显著下降，常量折叠和死节点清理都能直观看到。</div>
-          </div>
-          <div class="metric">
-            <div class="label">Memory</div>
-            <div class="value">12.02 MiB → 12.03 MiB</div>
-            <div class="hint">initializer 保留在 graph，runtime 只 materialize 少量真正需要的张量。</div>
-          </div>
-          <div class="metric">
-            <div class="label">Runtime</div>
-            <div class="value">459 nodes</div>
-            <div class="hint">最短命令就能直接跑通整图和检测结果，不需要先理解一堆开关。</div>
-          </div>
-          <div class="metric">
-            <div class="label">Trace</div>
-            <div class="value">phase aware</div>
-            <div class="hint">inspect / run / optimize / memory trace 各自聚焦一个目标，演示更清楚。</div>
-          </div>
-        </aside>
-      </div>
+    <div class="badge"><span class="dot"></span> miniONNXRuntime · project snapshot</div>
+    <h1>把 ONNX 推理拆成一条能看懂的最小主线</h1>
+    <div class="subtitle">
+      这个项目的目的很简单：从模型解析、图优化，到 CPU 执行、YOLO 后处理，再到内存生命周期分析，
+      每一步都能直接观察，而不是只看一个黑盒结果。
+    </div>
 
-      <div class="section">
-        <section class="panel">
-          <h2>执行路径</h2>
-          <p>图从 ONNX 进入内部 Graph，再进入 Session，最后由 CPU kernels 和后处理输出结果。</p>
-          <div class="flow">
-            <div class="flow-item">
-              <div class="num">1</div>
-              <div><strong>LoadOnnxGraph</strong><span>模型解析和 graph 构建</span></div>
-            </div>
-            <div class="flow-item">
-              <div class="num">2</div>
-              <div><strong>OptimizeGraph</strong><span>常量折叠、死节点清理、形状简化</span></div>
-            </div>
-            <div class="flow-item">
-              <div class="num">3</div>
-              <div><strong>Session::Run</strong><span>执行 node，管理 context 和生命周期</span></div>
-            </div>
-            <div class="flow-item">
-              <div class="num">4</div>
-              <div><strong>YOLO Postprocess</strong><span>输出 detections、json 和可视化图片</span></div>
-            </div>
-          </div>
-        </section>
+    <div class="flow">
+      <section class="card">
+        <div class="eyebrow">1 · Parse</div>
+        <h2>LoadOnnxGraph</h2>
+        <p>把 `.onnx` 转成内部 Graph，先把图结构、initializer、value_info 看清楚。</p>
+        <ul>
+          <li>图结构</li>
+          <li>节点属性</li>
+          <li>拓扑顺序</li>
+        </ul>
+      </section>
 
-        <section class="panel">
-          <h2>阶段收敛</h2>
-          <p>默认命令已经被收短，主路径更像一个教学 demo，而不是内部调试工具。</p>
-          <div class="phases">
-            <div class="phase-card">
-              <div>
-                <strong>phase1</strong><br />
-                <span>静态看图</span>
-              </div>
-              <div class="tag">inspect</div>
-            </div>
-            <div class="phase-card">
-              <div>
-                <strong>phase3</strong><br />
-                <span>直接跑图片推理</span>
-              </div>
-              <div class="tag">run</div>
-            </div>
-            <div class="phase-card">
-              <div>
-                <strong>phase4</strong><br />
-                <span>图优化和内存演示</span>
-              </div>
-              <div class="tag gold">optimize</div>
-            </div>
-          </div>
-        </section>
+      <div class="arrow"><span>→</span></div>
 
-        <section class="panel">
-          <h2>内存演进</h2>
-          <p>从“整批加载 initializer”到“按需 materialize”，再到“释放后进入 buffer pool 复用”。</p>
-          <div class="memory">
-            <div class="bar-row">
-              <div class="bar-head"><span>优化前</span><span>24.04 MiB approx peak</span></div>
-              <div class="bar"><div class="fill before"></div></div>
-            </div>
-            <div class="bar-row">
-              <div class="bar-head"><span>现在</span><span>12.03 MiB approx peak</span></div>
-              <div class="bar"><div class="fill after"></div></div>
-            </div>
-            <div class="bar-note">
-              runtime_initializer_count 从 127 降到 2，context 里只保留当前运行路径真正用到的权重和临时值。
-            </div>
-          </div>
-        </section>
-      </div>
+      <section class="card">
+        <div class="eyebrow">2 · Optimize</div>
+        <h2>GraphOptimizer</h2>
+        <p>做常量折叠、死节点清理和形状简化，让图更短、更容易执行。</p>
+        <ul>
+          <li>ConstantFolding <span class="pill">phase4</span></li>
+          <li>DeadNodeCleanup</li>
+          <li>ShapeSimplification</li>
+        </ul>
+      </section>
 
-      <div class="footer">
-        <div>
-          <strong>miniONNXRuntime</strong> · C++ mini runtime for learning ONNX execution, graph optimization and memory planning.
+      <div class="arrow"><span>→</span></div>
+
+      <section class="card">
+        <div class="eyebrow">3 · Run</div>
+        <h2>Session + Kernels</h2>
+        <p>在 CPU 上执行节点，最后输出 detections 和可视化结果。</p>
+        <ul>
+          <li>Session::Run</li>
+          <li>CPU Kernels</li>
+          <li>YOLO Postprocess</li>
+        </ul>
+      </section>
+    </div>
+
+    <div class="flowline"></div>
+
+    <div class="footer">
+      <div class="mini">
+        <h3>Memory story</h3>
+        <p>
+          initializer 先按需 materialize，再做 dead tensor eviction 和 buffer reuse。
+          这张图的重点是：让“图在怎么变”和“内存怎么变”都能直观看到。
+        </p>
+        <div class="notes">
+          <div class="note"><b>Before:</b> 权重和中间值常驻，峰值更高。</div>
+          <div class="note"><b>Now:</b> runtime 只保留当前路径需要的少量张量。</div>
+          <div class="note"><b>Next:</b> 再往 ExecutionProvider / Mac backend 走。</div>
         </div>
-        <div class="commands">
-          <code>miniort_inspect model.onnx</code>
-          <code>miniort_run model.onnx --image pic/bus.jpg</code>
+      </div>
+      <div class="mini">
+        <h3>Quick commands</h3>
+        <p>
+          <code>miniort_inspect model.onnx</code><br />
+          <code>miniort_run model.onnx --image pic/bus.jpg</code><br />
           <code>miniort_optimize_model model.onnx --image pic/bus.jpg</code>
-        </div>
+        </p>
       </div>
     </div>
   </div>
