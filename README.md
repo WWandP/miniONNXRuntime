@@ -2,6 +2,10 @@
 
 一个围绕 `yolov8n.onnx` 的 C++ mini runtime，用来说明 ONNX 模型如何被加载、优化和执行。
 
+![miniONNXRuntime showcase](./assets/readme_showcase.png)
+
+展示页源文件在 [assets/readme_showcase.html](./assets/readme_showcase.html)。
+
 ```mermaid
 flowchart LR
   A[ONNX Model] --> B[LoadOnnxGraph]
