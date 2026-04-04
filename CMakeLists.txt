@@ -24,7 +24,10 @@ foreach(path IN ITEMS
   endif()
 endforeach()
 
-find_package(Protobuf CONFIG REQUIRED)
+find_package(Protobuf CONFIG QUIET)
+if(NOT Protobuf_FOUND)
+  find_package(Protobuf REQUIRED)
+endif()
 
 add_library(miniort_onnx_proto STATIC
   "${MINIORT_GENERATED_DIR}/onnx/onnx-ml.pb.cc"

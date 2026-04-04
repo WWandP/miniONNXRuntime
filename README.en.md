@@ -15,7 +15,13 @@ Build requirements:
 - A C++20-capable compiler
 - Protobuf
   - `protoc` is required
-  - CMake looks it up through `find_package(Protobuf CONFIG REQUIRED)`
+  - CMake first tries `find_package(Protobuf CONFIG QUIET)` and then falls back to CMake's built-in `FindProtobuf`
+  - On Ubuntu / Debian, install it with:
+
+    ```bash
+    sudo apt update
+    sudo apt install -y libprotobuf-dev protobuf-compiler
+    ```
 
 The repository already includes `third_party/onnx`, so no extra ONNX source download is needed.
 
