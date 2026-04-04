@@ -20,17 +20,11 @@ struct Options {
   std::string image_path;
   std::string save_vis_path;
   std::string dump_json_path;
-  float score_threshold{0.25f};
-  float iou_threshold{0.45f};
-  bool verbose{false};
-  bool profile{false};
 };
 
 Options ParseArgs(int argc, char* argv[]) {
   if (argc < 3) {
-    throw std::runtime_error(
-        "usage: miniort_detect_yolov8n <model.onnx> --image path [--save-vis out.png] [--dump-json out.json] "
-        "[--score-threshold 0.25] [--iou-threshold 0.45] [--verbose] [--profile]");
+    throw std::runtime_error("usage: miniort_detect_yolov8n <model.onnx> --image path");
   }
 
   Options options;
@@ -39,30 +33,6 @@ Options ParseArgs(int argc, char* argv[]) {
     const std::string arg = argv[i];
     if (arg == "--image" && i + 1 < argc) {
       options.image_path = argv[++i];
-      continue;
-    }
-    if (arg == "--save-vis" && i + 1 < argc) {
-      options.save_vis_path = argv[++i];
-      continue;
-    }
-    if (arg == "--dump-json" && i + 1 < argc) {
-      options.dump_json_path = argv[++i];
-      continue;
-    }
-    if (arg == "--score-threshold" && i + 1 < argc) {
-      options.score_threshold = std::stof(argv[++i]);
-      continue;
-    }
-    if (arg == "--iou-threshold" && i + 1 < argc) {
-      options.iou_threshold = std::stof(argv[++i]);
-      continue;
-    }
-    if (arg == "--verbose") {
-      options.verbose = true;
-      continue;
-    }
-    if (arg == "--profile") {
-      options.profile = true;
       continue;
     }
     throw std::runtime_error("unknown argument: " + arg);
@@ -88,15 +58,16 @@ Options ParseArgs(int argc, char* argv[]) {
 int main(int argc, char* argv[]) {
   try {
     const auto options = ParseArgs(argc, argv);
-    std::ostream* trace = (options.verbose || options.profile) ? &std::cout : nullptr;
-    auto graph = miniort::LoadOnnxGraph(options.model_path, trace);
+    constexpr float kScoreThreshold = 0.25f;
+    constexpr float kIouThreshold = 0.45f;
+    auto graph = miniort::LoadOnnxGraph(options.model_path, nullptr);
     if (graph.inputs.empty() || graph.outputs.empty()) {
       throw std::runtime_error("graph must have at least one input and one output");
     }
 
     miniort::YoloImage image;
     {
-      miniort::ScopedTimer original_image_timer("detect.load_original_image", trace);
+      miniort::ScopedTimer original_image_timer("detect.load_original_image", nullptr);
       image = miniort::LoadRgbImage(options.image_path);
     }
 
@@ -104,7 +75,7 @@ int main(int argc, char* argv[]) {
     const auto& input = graph.inputs.front();
     feeds.emplace(input.name,
                   miniort::LoadImageAsNchwTensor(std::filesystem::path(options.image_path), input.name, input.info,
-                                                 trace));
+                                                 nullptr));
 
     const auto output_name = graph.outputs.front().name;
     miniort::Session session(std::move(graph),
@@ -113,14 +84,14 @@ int main(int argc, char* argv[]) {
                               .auto_bind_placeholder_inputs = false,
                               .max_nodes = 0});
     miniort::ExecutionContext context;
-    const auto summary = session.Run(feeds, context, trace);
+    const auto summary = session.Run(feeds, context, nullptr);
     const auto* output = context.FindTensor(output_name);
     if (output == nullptr) {
       throw std::runtime_error("missing graph output tensor: " + output_name);
     }
 
     const auto detections = miniort::DecodeYolov8Detections(*output, image.width, image.height,
-                                                            options.score_threshold, options.iou_threshold);
+                                                            kScoreThreshold, kIouThreshold);
 
     std::cout << "yolov8n detections: " << detections.size() << "\n";
     for (const auto& det : detections) {
@@ -133,13 +104,11 @@ int main(int argc, char* argv[]) {
               << " materialized_outputs=" << summary.materialized_outputs << "\n";
 
     if (!options.dump_json_path.empty()) {
-      miniort::ScopedTimer timer("detect.dump_json", trace);
       miniort::DumpDetectionsJson(options.dump_json_path, detections);
       std::cout << "json saved to " << options.dump_json_path << "\n";
     }
 
     if (!options.save_vis_path.empty()) {
-      miniort::ScopedTimer timer("detect.save_visualization", trace);
       auto vis = image;
       for (const auto& det : detections) {
         miniort::DrawRect(vis,
@@ -158,4 +127,3 @@ int main(int argc, char* argv[]) {
     return EXIT_FAILURE;
   }
 }
-

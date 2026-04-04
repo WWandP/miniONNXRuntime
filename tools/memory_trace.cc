@@ -21,61 +21,19 @@ namespace {
 struct Options {
   std::string model_path;
   std::string image_path;
-  bool verbose{false};
-  bool profile{false};
-  bool show_plan{true};
-  bool show_live_tensors{true};
-  bool allow_missing_kernels{true};
-  std::size_t max_nodes{0};
-  std::size_t live_limit{12};
-  std::size_t context_dump_limit{20};
 };
 
 Options ParseArgs(int argc, char* argv[]) {
   if (argc < 2) {
-    throw std::runtime_error(
-        "usage: miniort_memory_trace <model.onnx> [--image path] [--verbose] [--profile] "
-        "[--strict-kernel] [--max-nodes N] [--live-limit N] [--no-plan] [--no-live-tensors]");
+    throw std::runtime_error("usage: miniort_memory_trace <model.onnx> [--image path]");
   }
 
   Options options;
   options.model_path = argv[1];
   for (int i = 2; i < argc; ++i) {
     const std::string arg = argv[i];
-    if (arg == "--verbose") {
-      options.verbose = true;
-      continue;
-    }
-    if (arg == "--profile") {
-      options.profile = true;
-      continue;
-    }
     if (arg == "--image" && i + 1 < argc) {
       options.image_path = argv[++i];
-      continue;
-    }
-    if (arg == "--strict-kernel") {
-      options.allow_missing_kernels = false;
-      continue;
-    }
-    if (arg == "--max-nodes" && i + 1 < argc) {
-      options.max_nodes = static_cast<std::size_t>(std::stoul(argv[++i]));
-      continue;
-    }
-    if (arg == "--live-limit" && i + 1 < argc) {
-      options.live_limit = static_cast<std::size_t>(std::stoul(argv[++i]));
-      continue;
-    }
-    if (arg == "--context-dump-limit" && i + 1 < argc) {
-      options.context_dump_limit = static_cast<std::size_t>(std::stoul(argv[++i]));
-      continue;
-    }
-    if (arg == "--no-plan") {
-      options.show_plan = false;
-      continue;
-    }
-    if (arg == "--no-live-tensors") {
-      options.show_live_tensors = false;
       continue;
     }
     throw std::runtime_error("unknown argument: " + arg);
@@ -245,9 +203,10 @@ void PrintNodeMemorySnapshot(const miniort::MemoryProfile& plan, const miniort::
 int main(int argc, char* argv[]) {
   try {
     const auto options = ParseArgs(argc, argv);
-    std::ostream* trace = (options.verbose || options.profile || options.show_plan || options.show_live_tensors)
-                              ? &std::cout
-                              : nullptr;
+    constexpr std::size_t kLiveLimit = 8;
+    constexpr std::size_t kContextDumpLimit = 12;
+    constexpr std::size_t kMaxNodes = 20;
+    std::ostream* trace = &std::cout;
 
     auto graph = miniort::LoadOnnxGraph(options.model_path, trace);
     if (graph.inputs.empty() || graph.outputs.empty()) {
@@ -255,9 +214,7 @@ int main(int argc, char* argv[]) {
     }
 
     const auto memory_plan = miniort::BuildMemoryProfile(graph);
-    if (options.show_plan) {
-      PrintMemoryPlan(memory_plan, std::cout, 32);
-    }
+    PrintMemoryPlan(memory_plan, std::cout, 24);
 
     std::unordered_map<std::string, miniort::Tensor> feeds;
     if (!options.image_path.empty()) {
@@ -272,16 +229,15 @@ int main(int argc, char* argv[]) {
     std::size_t peak_topo_index = 0;
 
     miniort::Session session(std::move(graph),
-                             {.verbose = options.verbose,
-                              .allow_missing_kernels = options.allow_missing_kernels,
+                             {.allow_missing_kernels = true,
                               .auto_bind_placeholder_inputs = true,
                               .evict_dead_tensors = true,
-                              .max_nodes = options.max_nodes,
+                              .max_nodes = kMaxNodes,
                               .after_node =
                                   [&](std::size_t topo_index, const miniort::Node& node,
                                       const miniort::ExecutionContext& context, std::ostream* hook_trace) {
                                     PrintNodeMemorySnapshot(memory_plan, context, topo_index, node,
-                                                            hook_trace, options.live_limit, peak_live_bytes,
+                                                            hook_trace, kLiveLimit, peak_live_bytes,
                                                             peak_live_tensors, peak_topo_index);
                                   }});
 
@@ -290,7 +246,7 @@ int main(int argc, char* argv[]) {
     const auto runtime_initializer_stats = CollectRuntimeInitializerStats(context);
 
     std::cout << "\nfinal_context\n";
-    context.Dump(std::cout, options.context_dump_limit);
+    context.Dump(std::cout, kContextDumpLimit);
     std::cout << "\nmemory_summary\n";
     std::cout << "  initializer_count=" << memory_plan.initializer_count << "\n";
     std::cout << "  initializer_bytes=" << miniort::FormatBytes(memory_plan.initializer_bytes) << "\n";

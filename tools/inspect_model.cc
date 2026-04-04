@@ -106,42 +106,22 @@ void PrintNodeAttributes(const miniort::Node& node) {
 
 struct Options {
   std::string model_path;
-  std::size_t show_topology{20};
-  std::size_t show_initializers{10};
-  std::string filter_op;
 };
 
 Options ParseArgs(int argc, char* argv[]) {
   if (argc < 2) {
-    throw std::runtime_error(
-        "usage: miniort_inspect <model.onnx> [--show-topology N] [--show-initializers N] [--filter-op OpType]");
+    throw std::runtime_error("usage: miniort_inspect <model.onnx>");
   }
 
   Options options;
   options.model_path = argv[1];
 
-  for (int i = 2; i < argc; ++i) {
-    const std::string arg = argv[i];
-    if (arg == "--show-topology" && i + 1 < argc) {
-      options.show_topology = static_cast<std::size_t>(std::stoul(argv[++i]));
-      continue;
-    }
-    if (arg == "--show-initializers" && i + 1 < argc) {
-      options.show_initializers = static_cast<std::size_t>(std::stoul(argv[++i]));
-      continue;
-    }
-    if (arg == "--filter-op" && i + 1 < argc) {
-      options.filter_op = argv[++i];
-      continue;
-    }
-    throw std::runtime_error("unknown argument: " + arg);
-  }
-
   return options;
 }
 
-void PrintGraphSummary(const miniort::Graph& graph, std::size_t show_topology,
-                       std::size_t show_initializers, const std::string& filter_op) {
+void PrintGraphSummary(const miniort::Graph& graph) {
+  constexpr std::size_t kShowTopology = 10;
+  constexpr std::size_t kShowInitializers = 5;
   std::cout << "graph: " << graph.name << "\n";
   std::cout << "model_path: " << graph.metadata.model_path << "\n";
   std::cout << "ir_version: " << graph.metadata.ir_version << "\n";
@@ -194,29 +174,22 @@ void PrintGraphSummary(const miniort::Graph& graph, std::size_t show_topology,
   }
   std::cout << "\n";
 
-  std::cout << "initializers_preview: first " << show_initializers << "\n";
+  std::cout << "initializers_preview: first " << kShowInitializers << "\n";
   std::size_t initializer_index = 0;
   for (const auto& [name, value] : graph.initializers) {
-    if (initializer_index++ >= show_initializers) {
+    if (initializer_index++ >= kShowInitializers) {
       break;
     }
     std::cout << "  - " << name << ": " << miniort::FormatTensorInfo(value.info) << "\n";
   }
   std::cout << "\n";
 
-  std::cout << "topological_order_preview: first " << show_topology;
-  if (!filter_op.empty()) {
-    std::cout << " (filtered by op_type=" << filter_op << ")";
-  }
-  std::cout << "\n";
+  std::cout << "topological_order_preview: first " << kShowTopology << "\n";
 
   std::size_t shown = 0;
-  for (std::size_t i = 0; i < graph.topological_order.size() && shown < show_topology; ++i) {
+  for (std::size_t i = 0; i < graph.topological_order.size() && shown < kShowTopology; ++i) {
     const auto node_index = graph.topological_order[i];
     const auto& node = graph.nodes[node_index];
-    if (!filter_op.empty() && node.op_type != filter_op) {
-      continue;
-    }
     std::cout << "  - [" << i << "] " << node.name << ": " << node.op_type
               << " inputs=" << node.inputs.size()
               << " outputs=" << node.outputs.size()
@@ -225,9 +198,6 @@ void PrintGraphSummary(const miniort::Graph& graph, std::size_t show_topology,
     ++shown;
   }
 
-  if (shown == 0 && !filter_op.empty()) {
-    std::cout << "  - no nodes matched the requested op type\n";
-  }
 }
 
 }  // namespace
@@ -236,7 +206,7 @@ int main(int argc, char* argv[]) {
   try {
     const Options options = ParseArgs(argc, argv);
     const auto graph = miniort::LoadOnnxGraph(options.model_path);
-    PrintGraphSummary(graph, options.show_topology, options.show_initializers, options.filter_op);
+    PrintGraphSummary(graph);
     return EXIT_SUCCESS;
   } catch (const std::exception& ex) {
     std::cerr << "error: " << ex.what() << "\n";
