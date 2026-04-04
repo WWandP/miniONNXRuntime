@@ -19,6 +19,41 @@
 
 项目自带了用于解析 ONNX 的 `third_party/onnx`，不需要额外单独下载 ONNX 代码。
 
+### Ubuntu / Debian
+
+如果你在 Linux 上，先装这些基础包：
+
+```bash
+sudo apt update
+sudo apt install -y build-essential cmake git libprotobuf-dev protobuf-compiler
+```
+
+如果你的系统里已经装过 `cmake`，只想补齐其余依赖，也可以单独执行：
+
+```bash
+sudo apt install -y build-essential git libprotobuf-dev protobuf-compiler
+```
+
+如果你还没有装 `cmake`，也可以单独先装它：
+
+```bash
+sudo apt install -y cmake
+```
+
+### macOS
+
+如果你在 macOS 上，先装 Homebrew 依赖：
+
+```bash
+brew install cmake protobuf git
+```
+
+如果你已经装过 `cmake`，也可以只补齐剩余依赖：
+
+```bash
+brew install protobuf git
+```
+
 ## 这个项目展示什么
 
 - 解析 ONNX 图
@@ -34,6 +69,8 @@
 - 真实图片输入和 YOLO 检测输出
 - 图优化入口和第一版优化 pass
 - 内存观测、initializer 按需 materialize 和 buffer reuse 演示
+
+内存优化的整理版说明在 [docs/blog_memory_optimization.md](./docs/blog_memory_optimization.md)。
 
 ## 快速开始
 

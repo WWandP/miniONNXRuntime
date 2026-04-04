@@ -19,6 +19,41 @@ Build requirements:
 
 The repository already includes `third_party/onnx`, so no extra ONNX source download is needed.
 
+### Ubuntu / Debian
+
+On Linux, install the basic packages first:
+
+```bash
+sudo apt update
+sudo apt install -y build-essential cmake git libprotobuf-dev protobuf-compiler
+```
+
+If you already have `cmake` and only want the rest of the dependencies:
+
+```bash
+sudo apt install -y build-essential git libprotobuf-dev protobuf-compiler
+```
+
+If you only need to install `cmake`:
+
+```bash
+sudo apt install -y cmake
+```
+
+### macOS
+
+On macOS, install the Homebrew dependencies:
+
+```bash
+brew install cmake protobuf git
+```
+
+If you already have `cmake`, you can install only the remaining packages:
+
+```bash
+brew install protobuf git
+```
+
 ## What It Shows
 
 - Parse ONNX graph
@@ -34,6 +69,8 @@ The repository already includes `third_party/onnx`, so no extra ONNX source down
 - Real image input and YOLO detection output
 - Graph optimization entry and first optimization passes
 - Memory observation, initializer materialization on demand, and buffer reuse demo
+
+The memory optimization write-up is in [docs/blog_memory_optimization.md](./docs/blog_memory_optimization.md).
 
 ## Quick Start
 
