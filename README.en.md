@@ -58,19 +58,25 @@ brew install protobuf git
 
 - Parse ONNX graph
 - Optimize graph structure
-- Run CPU kernels
+- Run CPU / Apple provider kernels
 - Trace tensor memory and buffer reuse
 
 ## Current Status
 
 - ONNX model parsing and internal graph construction
 - `Session` / `ExecutionContext` / `KernelRegistry`
+- Minimal `ExecutionProvider`
+- `CpuExecutionProvider`
+- Minimal `AccelerateExecutionProvider` on macOS
+- Provider assignment, allocator injection, and runtime provider tracing
 - CPU-side basic kernels
 - Real image input and YOLO detection output
 - Graph optimization entry and first optimization passes
 - Memory observation, initializer materialization on demand, and buffer reuse demo
 
 The memory optimization write-up is in [docs/blog_memory_optimization.md](./docs/blog_memory_optimization.md).
+The phase5 EP design note is in [docs/execution_provider.md](./docs/execution_provider.md).
+The phase5 summary post is in [docs/phase5_execution_provider_summary.md](./docs/phase5_execution_provider_summary.md).
 
 ## Quick Start
 
@@ -90,7 +96,11 @@ cmake --build build_phase4 -j4
 - `phase2`: see the minimal execution pipeline
 - `phase3`: run CPU inference end to end
 - `phase4`: graph optimization and memory optimization
-  - There is no separate `phase5`; memory optimization is part of `phase4`
+- `phase5`: move the runtime backend path into a minimal `ExecutionProvider`
+  - `CpuExecutionProvider` and `CpuTensorAllocator` are in place
+  - On macOS the runtime prefers the minimal `AccelerateExecutionProvider`
+  - The current `AccelerateExecutionProvider` covers part of the elementwise / matmul / conv path
+  - Multi-EP partitioning is not implemented yet
 
 ## Main Tools
 
@@ -100,3 +110,4 @@ cmake --build build_phase4 -j4
 - `miniort_memory_trace`: trace memory usage and tensor lifetime
 - `miniort_detect_yolov8n`: export detection results
 - `miniort_optimize_model`: optimize the graph before running YOLO
+- `miniort_compare_providers`: compare the default provider path against CPU-only

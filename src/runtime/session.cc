@@ -1,19 +1,66 @@
-#include "miniort/runtime/builtin_kernels.h"
+#include "miniort/runtime/accelerate_execution_provider.h"
+#include "miniort/runtime/cpu_execution_provider.h"
 #include "miniort/runtime/session.h"
 
 #include <algorithm>
 #include <iomanip>
-#include <unordered_map>
+#include <memory>
+#include <set>
+#include <sstream>
 #include <stdexcept>
+#include <unordered_map>
 #include <vector>
 
 #include "miniort/runtime/profiling.h"
 
 namespace miniort {
 
+namespace {
+
+std::vector<std::shared_ptr<const ExecutionProvider>> MakeDefaultProviders() {
+  std::vector<std::shared_ptr<const ExecutionProvider>> providers;
+#if defined(__APPLE__)
+  if (IsAccelerateAvailable()) {
+    providers.push_back(std::make_shared<AccelerateExecutionProvider>());
+  }
+#endif
+  providers.push_back(std::make_shared<CpuExecutionProvider>());
+  return providers;
+}
+
+std::string JoinProviderNames(const std::vector<std::shared_ptr<const ExecutionProvider>>& providers) {
+  std::ostringstream oss;
+  for (std::size_t i = 0; i < providers.size(); ++i) {
+    if (i != 0) {
+      oss << ",";
+    }
+    oss << providers[i]->Name();
+  }
+  return oss.str();
+}
+
+}  // namespace
+
 Session::Session(Graph graph, SessionOptions options)
-    : graph_(std::move(graph)), options_(options) {
-  RegisterBuiltinKernels(kernel_registry_);
+    : Session(std::move(graph), MakeDefaultProviders(), options) {}
+
+Session::Session(Graph graph, std::vector<std::shared_ptr<const ExecutionProvider>> providers, SessionOptions options)
+    : graph_(std::move(graph)), options_(options), providers_(std::move(providers)) {
+  providers_.erase(std::remove(providers_.begin(), providers_.end(), nullptr), providers_.end());
+  if (providers_.empty()) {
+    providers_ = MakeDefaultProviders();
+  }
+  for (const auto& provider : providers_) {
+    KernelRegistry provider_registry;
+    provider->RegisterKernels(provider_registry);
+    for (const auto& [op_type, fn] : provider_registry.Entries()) {
+      if (!kernel_registry_.Has(op_type)) {
+        kernel_registry_.Register(op_type, fn);
+      }
+    }
+  }
+  AssignExecutionProviders();
+  ValidateAssignmentSummary();
 
   for (const auto& initializer : graph_.initializers) {
     tensor_is_persistent_[initializer.first] = true;
@@ -65,6 +112,75 @@ const KernelRegistry& Session::kernel_registry() const {
   return kernel_registry_;
 }
 
+const SessionAssignmentSummary& Session::assignment_summary() const {
+  return assignment_summary_;
+}
+
+std::string Session::ResolveExecutionProviderForNode(const Node& node) const {
+  switch (options_.provider_assignment_policy) {
+    case ProviderAssignmentPolicy::kFirstMatch:
+      break;
+  }
+
+  for (const auto& provider : providers_) {
+    KernelRegistry provider_registry;
+    provider->RegisterKernels(provider_registry);
+    if (provider_registry.Has(node.op_type)) {
+      return std::string(provider->Name());
+    }
+  }
+  return "<unassigned>";
+}
+
+void Session::AssignExecutionProviders() {
+  assignment_summary_ = {};
+  assignment_summary_.total_nodes = graph_.nodes.size();
+  std::set<std::string> unassigned_op_types;
+
+  for (auto& node : graph_.nodes) {
+    node.execution_provider = ResolveExecutionProviderForNode(node);
+    if (node.execution_provider == "<unassigned>") {
+      ++assignment_summary_.unassigned_nodes;
+      unassigned_op_types.insert(node.op_type);
+    } else {
+      ++assignment_summary_.assigned_nodes;
+    }
+    ++assignment_summary_.provider_node_counts[node.execution_provider];
+  }
+
+  assignment_summary_.unassigned_op_types.assign(unassigned_op_types.begin(), unassigned_op_types.end());
+}
+
+void Session::ValidateAssignmentSummary() const {
+  if (!options_.allow_unassigned_nodes && assignment_summary_.unassigned_nodes != 0) {
+    std::ostringstream oss;
+    oss << "provider assignment left " << assignment_summary_.unassigned_nodes << " unassigned nodes";
+    if (!assignment_summary_.unassigned_op_types.empty()) {
+      oss << " (op_types=";
+      for (std::size_t i = 0; i < assignment_summary_.unassigned_op_types.size(); ++i) {
+        if (i != 0) {
+          oss << ",";
+        }
+        oss << assignment_summary_.unassigned_op_types[i];
+      }
+      oss << ")";
+    }
+    throw std::runtime_error(oss.str());
+  }
+}
+
+std::shared_ptr<TensorAllocator> Session::MakeDefaultAllocator() const {
+  for (const auto& provider : providers_) {
+    if (provider == nullptr) {
+      continue;
+    }
+    if (auto allocator = provider->CreateTensorAllocator(); allocator != nullptr) {
+      return allocator;
+    }
+  }
+  return nullptr;
+}
+
 RunSummary Session::Run(const std::unordered_map<std::string, Tensor>& feeds, ExecutionContext& context,
                         std::ostream* trace) const {
   TimingMap timings;
@@ -86,6 +202,9 @@ RunSummary Session::Run(const std::unordered_map<std::string, Tensor>& feeds, Ex
 
     {
       ScopedTimer timer("session.bind_placeholders", trace, &timings["session.bind_placeholders"]);
+      if (!context.HasAllocator()) {
+        context.SetAllocator(MakeDefaultAllocator());
+      }
       MaybeBindPlaceholderInputs(context, trace);
     }
 
@@ -93,22 +212,36 @@ RunSummary Session::Run(const std::unordered_map<std::string, Tensor>& feeds, Ex
       *trace << "session.run begin\n";
       *trace << "  graph=" << graph_.name << "\n";
       *trace << "  nodes=" << graph_.nodes.size() << "\n";
+      *trace << "  providers=" << JoinProviderNames(providers_) << "\n";
       *trace << "  registered_kernels=" << kernel_registry_.RegisteredOps().size() << "\n";
+      PrintSessionAssignmentSummary(assignment_summary_, *trace);
     }
 
-    for (std::size_t topo_index = 0; topo_index < graph_.topological_order.size(); ++topo_index) {
-      if (options_.max_nodes != 0 && topo_index >= options_.max_nodes) {
+    const std::size_t start_node = std::min(options_.start_node, graph_.topological_order.size());
+    const std::size_t end_node =
+        options_.max_nodes == 0 ? graph_.topological_order.size()
+                                : std::min(graph_.topological_order.size(), start_node + options_.max_nodes);
+
+    if (trace != nullptr && start_node != 0) {
+      *trace << "session.run start_node=" << start_node << "\n";
+    }
+
+    for (std::size_t topo_index = start_node; topo_index < graph_.topological_order.size(); ++topo_index) {
+      if (options_.max_nodes != 0 && topo_index >= end_node) {
         if (trace != nullptr) {
-          *trace << "session.run stopped early at max_nodes=" << options_.max_nodes << "\n";
+          *trace << "session.run stopped early at start_node=" << start_node
+                 << " max_nodes=" << options_.max_nodes << "\n";
         }
         break;
       }
 
       const auto node_index = graph_.topological_order[topo_index];
       const auto& node = graph_.nodes[node_index];
+      ++summary.provider_visited_node_counts[node.execution_provider];
 
       if (trace != nullptr && options_.verbose) {
-        *trace << "node[" << topo_index << "] " << node.name << " op=" << node.op_type << "\n";
+        *trace << "node[" << topo_index << "] " << node.name << " op=" << node.op_type
+               << " provider=" << node.execution_provider << "\n";
         *trace << "  inputs:";
         if (node.inputs.empty()) {
           *trace << " <none>";
@@ -136,23 +269,28 @@ RunSummary Session::Run(const std::unordered_map<std::string, Tensor>& feeds, Ex
           auto* kernel_trace = options_.verbose ? trace : nullptr;
           (*kernel)(node, context, kernel_trace);
           ++summary.executed_nodes;
+          ++summary.provider_executed_node_counts[node.execution_provider];
           AddTiming(timings, "kernel." + node.op_type, DurationMs(node_start, Clock::now()));
         } catch (const std::exception& ex) {
           if (!options_.allow_missing_kernels) {
             throw;
           }
           ++summary.skipped_nodes;
-          if (trace != nullptr) {
-            *trace << "    kernel execution failed for op=" << node.op_type
-                   << " reason=" << ex.what() << "\n";
-          }
+          ++summary.provider_skipped_node_counts[node.execution_provider];
+        if (trace != nullptr) {
+          *trace << "    kernel execution failed for op=" << node.op_type
+                 << " provider=" << node.execution_provider
+                 << " reason=" << ex.what() << "\n";
+        }
           AddTiming(timings, "kernel." + node.op_type, DurationMs(node_start, Clock::now()));
           MaterializeOutputsFromMetadata(node, context, trace, summary);
         }
       } else {
         ++summary.skipped_nodes;
+        ++summary.provider_skipped_node_counts[node.execution_provider];
         if (trace != nullptr) {
-          *trace << "    no kernel registered for op=" << node.op_type << "\n";
+          *trace << "    no kernel registered for op=" << node.op_type
+                 << " provider=" << node.execution_provider << "\n";
         }
         MaterializeOutputsFromMetadata(node, context, trace, summary);
         if (!options_.allow_missing_kernels) {
@@ -193,14 +331,39 @@ RunSummary Session::Run(const std::unordered_map<std::string, Tensor>& feeds, Ex
   }
 
   if (trace != nullptr) {
-    *trace << "session.run end executed=" << summary.executed_nodes
-           << " skipped=" << summary.skipped_nodes
-           << " materialized_outputs=" << summary.materialized_outputs
-           << " released_tensors=" << summary.released_tensors << "\n";
+    PrintRunSummary(summary, *trace);
     PrintTimingSummary(timings, *trace, "session timing summary");
   }
 
   return summary;
+}
+
+void PrintSessionAssignmentSummary(const SessionAssignmentSummary& summary, std::ostream& os) {
+  os << "provider assignment summary\n";
+  os << "  total_nodes=" << summary.total_nodes << "\n";
+  os << "  assigned_nodes=" << summary.assigned_nodes << "\n";
+  os << "  unassigned_nodes=" << summary.unassigned_nodes << "\n";
+  if (!summary.provider_node_counts.empty()) {
+    os << "  provider_counts:\n";
+    std::vector<std::pair<std::string, std::size_t>> counts(summary.provider_node_counts.begin(),
+                                                            summary.provider_node_counts.end());
+    std::sort(counts.begin(), counts.end(),
+              [](const auto& lhs, const auto& rhs) {
+                if (lhs.second != rhs.second) {
+                  return lhs.second > rhs.second;
+                }
+                return lhs.first < rhs.first;
+              });
+    for (const auto& [provider_name, count] : counts) {
+      os << "    - " << provider_name << ": " << count << "\n";
+    }
+  }
+  if (!summary.unassigned_op_types.empty()) {
+    os << "  unassigned_op_types:\n";
+    for (const auto& op_type : summary.unassigned_op_types) {
+      os << "    - " << op_type << "\n";
+    }
+  }
 }
 
 void Session::MaybeBindPlaceholderInputs(ExecutionContext& context, std::ostream* trace) const {
@@ -268,8 +431,60 @@ void Session::MaterializeOutputsFromMetadata(const Node& node, ExecutionContext&
     }
     context.BindTensor(tensor);
     ++summary.materialized_outputs;
+    ++summary.provider_materialized_output_counts[node.execution_provider];
     if (trace != nullptr) {
       *trace << "    materialized placeholder output " << FormatTensorSummary(tensor) << "\n";
+    }
+  }
+}
+
+void PrintRunSummary(const RunSummary& summary, std::ostream& os) {
+  os << "session.run end executed=" << summary.executed_nodes
+     << " skipped=" << summary.skipped_nodes
+     << " materialized_outputs=" << summary.materialized_outputs
+     << " released_tensors=" << summary.released_tensors << "\n";
+
+  std::unordered_map<std::string, bool> seen;
+  std::vector<std::string> provider_names;
+  provider_names.reserve(summary.provider_visited_node_counts.size() + summary.provider_executed_node_counts.size() +
+                         summary.provider_skipped_node_counts.size() +
+                         summary.provider_materialized_output_counts.size());
+
+  const auto collect = [&](const auto& counts) {
+    for (const auto& [provider_name, count] : counts) {
+      (void)count;
+      if (!seen.contains(provider_name)) {
+        seen[provider_name] = true;
+        provider_names.push_back(provider_name);
+      }
+    }
+  };
+  collect(summary.provider_visited_node_counts);
+  collect(summary.provider_executed_node_counts);
+  collect(summary.provider_skipped_node_counts);
+  collect(summary.provider_materialized_output_counts);
+  std::sort(provider_names.begin(), provider_names.end());
+
+  if (!provider_names.empty()) {
+    os << "provider execution summary\n";
+    for (const auto& provider_name : provider_names) {
+      const auto visited = summary.provider_visited_node_counts.contains(provider_name)
+                               ? summary.provider_visited_node_counts.at(provider_name)
+                               : 0;
+      const auto executed = summary.provider_executed_node_counts.contains(provider_name)
+                                ? summary.provider_executed_node_counts.at(provider_name)
+                                : 0;
+      const auto skipped = summary.provider_skipped_node_counts.contains(provider_name)
+                               ? summary.provider_skipped_node_counts.at(provider_name)
+                               : 0;
+      const auto materialized = summary.provider_materialized_output_counts.contains(provider_name)
+                                    ? summary.provider_materialized_output_counts.at(provider_name)
+                                    : 0;
+      os << "  - " << provider_name
+         << ": visited=" << visited
+         << " executed=" << executed
+         << " skipped=" << skipped
+         << " materialized_outputs=" << materialized << "\n";
     }
   }
 }

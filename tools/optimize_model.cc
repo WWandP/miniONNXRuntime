@@ -1,5 +1,6 @@
 #include <cstdlib>
 #include <cmath>
+#include <algorithm>
 #include <filesystem>
 #include <iostream>
 #include <stdexcept>
@@ -50,6 +51,23 @@ void PrintGraphSnapshot(const miniort::Graph& graph, const char* title) {
   std::cout << "  outputs=" << graph.outputs.size() << "\n";
 }
 
+void PrintOpTypeHistogram(const miniort::Graph& graph, const char* title) {
+  std::vector<std::pair<std::string, std::size_t>> histogram(graph.op_type_histogram.begin(),
+                                                             graph.op_type_histogram.end());
+  std::sort(histogram.begin(), histogram.end(),
+            [](const auto& lhs, const auto& rhs) {
+              if (lhs.second != rhs.second) {
+                return lhs.second > rhs.second;
+              }
+              return lhs.first < rhs.first;
+            });
+
+  std::cout << title << "\n";
+  for (const auto& [op_type, count] : histogram) {
+    std::cout << "  - " << op_type << ": " << count << "\n";
+  }
+}
+
 }  // namespace
 
 int main(int argc, char* argv[]) {
@@ -58,6 +76,7 @@ int main(int argc, char* argv[]) {
     auto graph = miniort::LoadOnnxGraph(options.model_path, nullptr);
 
     PrintGraphSnapshot(graph, "before optimization");
+    PrintOpTypeHistogram(graph, "before optimization op_type_histogram");
 
     miniort::GraphOptimizationSummary summary;
     graph = miniort::OptimizeGraph(std::move(graph),
@@ -68,6 +87,7 @@ int main(int argc, char* argv[]) {
                                    &summary);
 
     PrintGraphSnapshot(graph, "after optimization");
+    PrintOpTypeHistogram(graph, "after optimization op_type_histogram");
     miniort::PrintGraphOptimizationSummary(summary, std::cout);
 
     if (!options.image_path.empty()) {
@@ -86,7 +106,9 @@ int main(int argc, char* argv[]) {
       miniort::Session session(std::move(graph),
                                {.auto_bind_placeholder_inputs = true, .evict_dead_tensors = true});
       miniort::ExecutionContext context;
+      miniort::PrintSessionAssignmentSummary(session.assignment_summary(), std::cout);
       const auto run_summary = session.Run(feeds, context, nullptr);
+      miniort::PrintRunSummary(run_summary, std::cout);
       const auto* output = context.FindTensor(output_name);
       if (output == nullptr) {
         throw std::runtime_error("missing graph output tensor: " + output_name);

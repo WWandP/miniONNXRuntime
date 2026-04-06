@@ -1,7 +1,6 @@
 #include "miniort/runtime/execution_context.h"
 
 #include <algorithm>
-#include <limits>
 
 namespace miniort {
 
@@ -23,6 +22,9 @@ Tensor TensorFromValue(const Value& value) {
 }
 
 }  // namespace
+
+ExecutionContext::ExecutionContext(std::shared_ptr<TensorAllocator> allocator)
+    : allocator_(std::move(allocator)) {}
 
 void ExecutionContext::BindTensor(const Tensor& tensor) {
   if (auto it = tensors_.find(tensor.name); it != tensors_.end()) {
@@ -93,6 +95,14 @@ void ExecutionContext::LoadInitializers(const Graph& graph) {
   graph_ = &graph;
 }
 
+void ExecutionContext::SetAllocator(std::shared_ptr<TensorAllocator> allocator) {
+  allocator_ = std::move(allocator);
+}
+
+bool ExecutionContext::HasAllocator() const {
+  return allocator_ != nullptr;
+}
+
 const Tensor* ExecutionContext::MaterializeInitializer(const std::string& name) const {
   if (graph_ == nullptr) {
     return nullptr;
@@ -114,57 +124,26 @@ const Tensor* ExecutionContext::MaterializeInitializer(const std::string& name) 
 }
 
 std::vector<float> ExecutionContext::AcquireFloatBuffer(std::size_t element_count) {
-  auto best_it = float_buffer_pool_.end();
-  for (auto it = float_buffer_pool_.begin(); it != float_buffer_pool_.end(); ++it) {
-    if (it->capacity() < element_count) {
-      continue;
-    }
-    if (best_it == float_buffer_pool_.end() || it->capacity() < best_it->capacity()) {
-      best_it = it;
-    }
+  if (allocator_ != nullptr) {
+    return allocator_->AcquireFloatBuffer(element_count);
   }
-  if (best_it != float_buffer_pool_.end()) {
-    std::vector<float> buffer = std::move(*best_it);
-    float_buffer_pool_.erase(best_it);
-    buffer.clear();
-    buffer.reserve(element_count);
-    return buffer;
-  }
-
   std::vector<float> buffer;
   buffer.reserve(element_count);
   return buffer;
 }
 
 std::vector<std::int64_t> ExecutionContext::AcquireInt64Buffer(std::size_t element_count) {
-  auto best_it = int64_buffer_pool_.end();
-  for (auto it = int64_buffer_pool_.begin(); it != int64_buffer_pool_.end(); ++it) {
-    if (it->capacity() < element_count) {
-      continue;
-    }
-    if (best_it == int64_buffer_pool_.end() || it->capacity() < best_it->capacity()) {
-      best_it = it;
-    }
+  if (allocator_ != nullptr) {
+    return allocator_->AcquireInt64Buffer(element_count);
   }
-  if (best_it != int64_buffer_pool_.end()) {
-    std::vector<std::int64_t> buffer = std::move(*best_it);
-    int64_buffer_pool_.erase(best_it);
-    buffer.clear();
-    buffer.reserve(element_count);
-    return buffer;
-  }
-
   std::vector<std::int64_t> buffer;
   buffer.reserve(element_count);
   return buffer;
 }
 
 void ExecutionContext::RecycleTensorStorage(Tensor&& tensor) {
-  if (!tensor.float_data.empty()) {
-    float_buffer_pool_.push_back(std::move(tensor.float_data));
-  }
-  if (!tensor.int64_data.empty()) {
-    int64_buffer_pool_.push_back(std::move(tensor.int64_data));
+  if (allocator_ != nullptr) {
+    allocator_->RecycleTensorStorage(std::move(tensor));
   }
 }
 

@@ -10,6 +10,7 @@ option(MINIORT_BUILD_INSPECT "Build phase-1 inspect tool" ON)
 option(MINIORT_BUILD_RUNTIME_TOOLS "Build phase-2/3 runtime tools" ON)
 option(MINIORT_BUILD_DETECT_TOOL "Build yolov8n detect demo tool" ON)
 option(MINIORT_BUILD_OPTIMIZER_TOOLS "Build graph optimizer demo tool" OFF)
+option(MINIORT_BUILD_TESTS "Build runtime tests" ON)
 
 set(MINIORT_THIRD_PARTY_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party")
 set(MINIORT_ONNX_DIR "${MINIORT_THIRD_PARTY_DIR}/onnx")
@@ -80,10 +81,13 @@ target_link_libraries(miniort_model
     miniort_onnx_proto
 )
 
-if(MINIORT_BUILD_RUNTIME_TOOLS OR MINIORT_BUILD_DETECT_TOOL)
+if(MINIORT_BUILD_RUNTIME_TOOLS OR MINIORT_BUILD_DETECT_TOOL OR MINIORT_BUILD_TESTS)
   add_library(miniort_runtime STATIC
     src/runtime/tensor.cc
     src/runtime/execution_context.cc
+    src/runtime/accelerate_execution_provider.cc
+    src/runtime/cpu_execution_provider.cc
+    src/runtime/cpu_tensor_allocator.cc
     src/runtime/kernel_registry.cc
     src/runtime/memory_profile.cc
     src/optimizer/graph_optimizer.cc
@@ -111,6 +115,23 @@ if(MINIORT_BUILD_RUNTIME_TOOLS OR MINIORT_BUILD_DETECT_TOOL)
     PUBLIC
       miniort_model
   )
+
+  if(APPLE)
+    target_compile_definitions(miniort_runtime PUBLIC ACCELERATE_NEW_LAPACK=1)
+    target_link_libraries(miniort_runtime PUBLIC "-framework Accelerate")
+  endif()
+endif()
+
+if(MINIORT_BUILD_TESTS)
+  enable_testing()
+
+  add_executable(miniort_runtime_tests
+    tests/runtime_tests.cc
+  )
+
+  target_link_libraries(miniort_runtime_tests PRIVATE miniort_runtime)
+
+  add_test(NAME miniort_runtime_tests COMMAND miniort_runtime_tests)
 endif()
 
 if(MINIORT_BUILD_INSPECT)
@@ -118,7 +139,11 @@ if(MINIORT_BUILD_INSPECT)
     tools/inspect_model.cc
   )
 
-  target_link_libraries(miniort_inspect PRIVATE miniort_model)
+  if(TARGET miniort_runtime)
+    target_link_libraries(miniort_inspect PRIVATE miniort_runtime)
+  else()
+    target_link_libraries(miniort_inspect PRIVATE miniort_model)
+  endif()
 endif()
 
 if(MINIORT_BUILD_RUNTIME_TOOLS)
@@ -139,6 +164,12 @@ if(MINIORT_BUILD_RUNTIME_TOOLS)
   )
 
   target_link_libraries(miniort_memory_trace PRIVATE miniort_runtime)
+
+  add_executable(miniort_compare_providers
+    tools/compare_providers.cc
+  )
+
+  target_link_libraries(miniort_compare_providers PRIVATE miniort_runtime)
 endif()
 
 if(MINIORT_BUILD_OPTIMIZER_TOOLS)

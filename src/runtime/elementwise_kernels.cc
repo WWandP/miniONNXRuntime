@@ -24,6 +24,20 @@ void RegisterElementwiseKernels(KernelRegistry& registry) {
     }
   });
 
+  registry.Register("SiLU", [](const Node& node, ExecutionContext& context, std::ostream* trace) {
+    const auto& input = RequireTensor(context, node.inputs.at(0));
+    const auto& input_data = RequireFloatData(input, "SiLU");
+    auto output = MakeOutputLikeWithReusedStorage(node.outputs.at(0), input, context);
+    for (std::size_t i = 0; i < input_data.size(); ++i) {
+      const auto value = input_data[i];
+      output.float_data[i] = value * (1.0f / (1.0f + std::exp(-value)));
+    }
+    context.BindTensor(std::move(output));
+    if (trace != nullptr) {
+      *trace << "    kernel SiLU produced " << node.outputs.at(0) << "\n";
+    }
+  });
+
   const auto register_binary_numeric_kernel =
       [&registry](const std::string& op_type, const std::function<float(float, float)>& eval_float,
                   const std::function<std::int64_t(std::int64_t, std::int64_t)>& eval_int) {

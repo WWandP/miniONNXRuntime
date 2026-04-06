@@ -58,6 +58,7 @@ struct Value {
 struct Node {
   std::string name;
   std::string op_type;
+  std::string execution_provider;
   std::vector<std::string> inputs;
   std::vector<std::string> outputs;
   std::unordered_map<std::string, AttributeValue> attributes;

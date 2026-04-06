@@ -58,19 +58,25 @@ brew install protobuf git
 
 - 解析 ONNX 图
 - 优化图结构
-- 执行 CPU kernels
+- 执行 CPU / Apple provider kernels
 - 跟踪 tensor 内存和 buffer reuse
 
 ## 当前进展
 
 - ONNX 模型解析与内部图构建
 - `Session` / `ExecutionContext` / `KernelRegistry`
+- 最小 `ExecutionProvider`
+- `CpuExecutionProvider`
+- macOS 下最小 `AccelerateExecutionProvider`
+- provider assignment / allocator 注入 / 运行期 provider trace
 - CPU 侧基础 kernels
 - 真实图片输入和 YOLO 检测输出
 - 图优化入口和第一版优化 pass
-- 内存观测、initializer 按需 materialize 和 buffer reuse 演示
+- 内存观测、initializer 按需 materialize、allocator 驱动的 buffer reuse 演示
 
 内存优化的整理版说明在 [docs/blog_memory_optimization.md](./docs/blog_memory_optimization.md)。
+`phase5` 的 EP 设计说明见 [docs/execution_provider.md](./docs/execution_provider.md)。
+`phase5` 的阶段总结见 [docs/phase5_execution_provider_summary.md](./docs/phase5_execution_provider_summary.md)。
 
 ## 快速开始
 
@@ -90,7 +96,11 @@ cmake --build build_phase4 -j4
 - `phase2`: 看最小执行主线
 - `phase3`: 跑通 CPU 推理
 - `phase4`: 看图优化和内存优化
-  - 没有单独的 `phase5`，内存优化就是 `phase4` 的一部分
+- `phase5`: 把 CPU 路径收敛到最小 `ExecutionProvider`
+  - 当前已完成 `CpuExecutionProvider`、`CpuTensorAllocator`
+  - macOS 下会自动优先启用最小 `AccelerateExecutionProvider`
+  - 当前 `AccelerateExecutionProvider` 已覆盖部分 elementwise / matmul / conv 路径
+  - 还没有做多 EP partition
 
 ## 主要工具
 
@@ -100,3 +110,4 @@ cmake --build build_phase4 -j4
 - `miniort_memory_trace`: 看内存和张量生命周期
 - `miniort_detect_yolov8n`: 导出检测结果
 - `miniort_optimize_model`: 优化图后再跑 YOLO
+- `miniort_compare_providers`: 对比默认 provider 路径和纯 CPU 路径

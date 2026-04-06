@@ -13,6 +13,141 @@ namespace miniort {
 
 namespace {
 
+Tensor RunMatMul2D(const std::string& output_name, const Tensor& lhs, const Tensor& rhs, ExecutionContext& context) {
+  const auto& lhs_data = RequireFloatData(lhs, "MatMul");
+  const auto& rhs_data = RequireFloatData(rhs, "MatMul");
+  if (lhs.shape.size() != 2 || rhs.shape.size() != 2) {
+    throw std::runtime_error("MatMul currently only supports 2D float32 tensors");
+  }
+
+  const auto m = static_cast<std::size_t>(lhs.shape[0]);
+  const auto k = static_cast<std::size_t>(lhs.shape[1]);
+  const auto rhs_k = static_cast<std::size_t>(rhs.shape[0]);
+  const auto n = static_cast<std::size_t>(rhs.shape[1]);
+  if (k != rhs_k) {
+    throw std::runtime_error("MatMul inner dimensions do not match");
+  }
+
+  auto output = MakeFloatOutput(output_name, {static_cast<std::int64_t>(m), static_cast<std::int64_t>(n)}, context);
+  for (std::size_t i = 0; i < m; ++i) {
+    for (std::size_t j = 0; j < n; ++j) {
+      float sum = 0.0f;
+      for (std::size_t kk = 0; kk < k; ++kk) {
+        sum += lhs_data[i * k + kk] * rhs_data[kk * n + j];
+      }
+      output.float_data[i * n + j] = sum;
+    }
+  }
+  return output;
+}
+
+void ApplyGemmBias(Tensor& output, const Tensor* bias) {
+  if (bias == nullptr) {
+    return;
+  }
+  const auto& bias_data = RequireFloatData(*bias, "Gemm");
+  if (output.shape.size() != 2) {
+    throw std::runtime_error("Gemm output must be 2D");
+  }
+  const auto m = static_cast<std::size_t>(output.shape[0]);
+  const auto n = static_cast<std::size_t>(output.shape[1]);
+
+  if (bias->shape.empty() && bias_data.size() == 1) {
+    for (auto& value : output.float_data) {
+      value += bias_data[0];
+    }
+    return;
+  }
+
+  if (bias->shape.size() == 1 && bias_data.size() == n) {
+    for (std::size_t i = 0; i < m; ++i) {
+      for (std::size_t j = 0; j < n; ++j) {
+        output.float_data[i * n + j] += bias_data[j];
+      }
+    }
+    return;
+  }
+
+  if (bias->shape.size() == 1 && bias_data.size() == m) {
+    for (std::size_t i = 0; i < m; ++i) {
+      for (std::size_t j = 0; j < n; ++j) {
+        output.float_data[i * n + j] += bias_data[i];
+      }
+    }
+    return;
+  }
+
+  if (bias->shape.size() == 2 &&
+      static_cast<std::size_t>(bias->shape[0]) == m &&
+      static_cast<std::size_t>(bias->shape[1]) == n &&
+      bias_data.size() == m * n) {
+    for (std::size_t i = 0; i < m * n; ++i) {
+      output.float_data[i] += bias_data[i];
+    }
+    return;
+  }
+
+  throw std::runtime_error("Gemm bias shape is not supported");
+}
+
+Tensor RunGemm2D(const Node& node, const Tensor& a, const Tensor& b, const Tensor* c, ExecutionContext& context) {
+  const auto& a_data = RequireFloatData(a, "Gemm");
+  const auto& b_data = RequireFloatData(b, "Gemm");
+  if (a.shape.size() != 2 || b.shape.size() != 2) {
+    throw std::runtime_error("Gemm currently only supports 2D float32 tensors");
+  }
+
+  const auto trans_a = ReadIntAttribute(node, "transA", 0) != 0;
+  const auto trans_b = ReadIntAttribute(node, "transB", 0) != 0;
+  const auto alpha_attr = node.attributes.find("alpha");
+  const auto beta_attr = node.attributes.find("beta");
+  const float alpha = alpha_attr == node.attributes.end() ? 1.0f : alpha_attr->second.float_value;
+  const float beta = beta_attr == node.attributes.end() ? 1.0f : beta_attr->second.float_value;
+
+  const auto a_rows = static_cast<std::size_t>(a.shape[0]);
+  const auto a_cols = static_cast<std::size_t>(a.shape[1]);
+  const auto b_rows = static_cast<std::size_t>(b.shape[0]);
+  const auto b_cols = static_cast<std::size_t>(b.shape[1]);
+
+  const auto m = trans_a ? a_cols : a_rows;
+  const auto k_a = trans_a ? a_rows : a_cols;
+  const auto k_b = trans_b ? b_cols : b_rows;
+  const auto n = trans_b ? b_rows : b_cols;
+  if (k_a != k_b) {
+    throw std::runtime_error("Gemm inner dimensions do not match");
+  }
+
+  auto output = MakeFloatOutput(node.outputs.at(0), {static_cast<std::int64_t>(m), static_cast<std::int64_t>(n)}, context);
+  std::fill(output.float_data.begin(), output.float_data.end(), 0.0f);
+
+  for (std::size_t i = 0; i < m; ++i) {
+    for (std::size_t j = 0; j < n; ++j) {
+      float sum = 0.0f;
+      for (std::size_t kk = 0; kk < k_a; ++kk) {
+        const auto a_index = trans_a ? kk * a_cols + i : i * a_cols + kk;
+        const auto b_index = trans_b ? j * b_cols + kk : kk * b_cols + j;
+        sum += a_data[a_index] * b_data[b_index];
+      }
+      output.float_data[i * n + j] = alpha * sum;
+    }
+  }
+
+  if (c != nullptr) {
+    if (beta != 1.0f) {
+      Tensor scaled_bias = *c;
+      scaled_bias.float_data = c->float_data;
+      for (auto& value : scaled_bias.float_data) {
+        value *= beta;
+      }
+      ApplyGemmBias(output, &scaled_bias);
+    } else {
+      ApplyGemmBias(output, c);
+    }
+  }
+
+  return output;
+}
+
 Tensor RunConv2D(const Node& node, const Tensor& input, const Tensor& weight, const Tensor* bias,
                  ExecutionContext& context) {
   const auto& input_data = RequireFloatData(input, "Conv");
@@ -134,6 +269,30 @@ Tensor RunConv2D(const Node& node, const Tensor& input, const Tensor& weight, co
 }  // namespace
 
 void RegisterNnKernels(KernelRegistry& registry) {
+  registry.Register("MatMul", [](const Node& node, ExecutionContext& context, std::ostream* trace) {
+    const auto& lhs = RequireTensor(context, node.inputs.at(0));
+    const auto& rhs = RequireTensor(context, node.inputs.at(1));
+    auto output = RunMatMul2D(node.outputs.at(0), lhs, rhs, context);
+    context.BindTensor(std::move(output));
+    if (trace != nullptr) {
+      *trace << "    kernel MatMul produced " << node.outputs.at(0) << "\n";
+    }
+  });
+
+  registry.Register("Gemm", [](const Node& node, ExecutionContext& context, std::ostream* trace) {
+    const auto& a = RequireTensor(context, node.inputs.at(0));
+    const auto& b = RequireTensor(context, node.inputs.at(1));
+    const Tensor* c = nullptr;
+    if (node.inputs.size() > 2 && !node.inputs.at(2).empty()) {
+      c = &RequireTensor(context, node.inputs.at(2));
+    }
+    auto output = RunGemm2D(node, a, b, c, context);
+    context.BindTensor(std::move(output));
+    if (trace != nullptr) {
+      *trace << "    kernel Gemm produced " << node.outputs.at(0) << "\n";
+    }
+  });
+
   registry.Register("Conv", [](const Node& node, ExecutionContext& context, std::ostream* trace) {
     const auto& input = RequireTensor(context, node.inputs.at(0));
     const auto& weight = RequireTensor(context, node.inputs.at(1));

@@ -9,6 +9,7 @@
 
 #include "miniort/loader/onnx_loader.h"
 #include "miniort/model/graph.h"
+#include "miniort/runtime/session.h"
 
 namespace {
 
@@ -119,7 +120,7 @@ Options ParseArgs(int argc, char* argv[]) {
   return options;
 }
 
-void PrintGraphSummary(const miniort::Graph& graph) {
+void PrintGraphSummary(const miniort::Graph& graph, const miniort::SessionAssignmentSummary& assignment_summary) {
   constexpr std::size_t kShowTopology = 10;
   constexpr std::size_t kShowInitializers = 5;
   std::cout << "graph: " << graph.name << "\n";
@@ -157,6 +158,8 @@ void PrintGraphSummary(const miniort::Graph& graph) {
   // explicitly provides dtype/shape metadata via input/output/value_info.
   // This is not necessarily the full count of all intermediate tensors.
   std::cout << "value_info_count: " << graph.value_infos.size() << "\n\n";
+  miniort::PrintSessionAssignmentSummary(assignment_summary, std::cout);
+  std::cout << "\n";
 
   std::vector<std::pair<std::string, std::size_t>> histogram(graph.op_type_histogram.begin(),
                                                               graph.op_type_histogram.end());
@@ -191,6 +194,7 @@ void PrintGraphSummary(const miniort::Graph& graph) {
     const auto node_index = graph.topological_order[i];
     const auto& node = graph.nodes[node_index];
     std::cout << "  - [" << i << "] " << node.name << ": " << node.op_type
+              << " provider=" << (node.execution_provider.empty() ? "<unset>" : node.execution_provider)
               << " inputs=" << node.inputs.size()
               << " outputs=" << node.outputs.size()
               << " attrs=" << node.attributes.size() << "\n";
@@ -205,8 +209,9 @@ void PrintGraphSummary(const miniort::Graph& graph) {
 int main(int argc, char* argv[]) {
   try {
     const Options options = ParseArgs(argc, argv);
-    const auto graph = miniort::LoadOnnxGraph(options.model_path);
-    PrintGraphSummary(graph);
+    auto graph = miniort::LoadOnnxGraph(options.model_path);
+    const miniort::Session session(graph);
+    PrintGraphSummary(session.graph(), session.assignment_summary());
     return EXIT_SUCCESS;
   } catch (const std::exception& ex) {
     std::cerr << "error: " << ex.what() << "\n";
