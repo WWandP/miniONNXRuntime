@@ -6,7 +6,6 @@ It uses `yolov8n.onnx` to show how a model is parsed, optimized, executed, and m
 ![miniONNXRuntime banner](./assets/readme_banner.png)
 
 Chinese version: [README.md](./README.md)
-Learning path: [docs/phases/README.en.md](./docs/phases/README.en.md)
 
 ## Environment
 
