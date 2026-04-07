@@ -6,7 +6,6 @@
 ![miniONNXRuntime banner](./assets/readme_banner.png)
 
 英文版说明见 [README.en.md](./README.en.md)。
-教学主线见 [docs/phases/README.md](./docs/phases/README.md)。
 
 ## 环境要求
 
