@@ -9,6 +9,7 @@
 #include "miniort/runtime/execution_context.h"
 #include "miniort/runtime/session.h"
 #include "miniort/tools/image_loader.h"
+#include "miniort/tools/phase_output.h"
 
 namespace {
 
@@ -52,6 +53,9 @@ Options ParseArgs(int argc, char* argv[]) {
 int main(int argc, char* argv[]) {
   try {
     const auto options = ParseArgs(argc, argv);
+    miniort::PrintPhaseBanner(std::cout, "phase2", "Trace Minimal Execution Pipeline",
+                              "看 runtime 从加载、喂数据到逐节点执行的主线。");
+    miniort::PrintPhaseStep(std::cout, 1, 4, "Load ONNX Graph", options.model_path);
     auto graph = miniort::LoadOnnxGraph(options.model_path, &std::cout);
     std::unordered_map<std::string, miniort::Tensor> feeds;
     if (!options.image_path.empty()) {
@@ -59,17 +63,22 @@ int main(int argc, char* argv[]) {
         throw std::runtime_error("graph has no runtime inputs for --image");
       }
       const auto& input = graph.inputs.front();
+      miniort::PrintPhaseStep(std::cout, 2, 4, "Prepare Runtime Input", options.image_path);
       feeds.emplace(input.name,
                     miniort::LoadImageAsNchwTensor(std::filesystem::path(options.image_path), input.name, input.info,
                                                    &std::cout));
     }
 
+    miniort::PrintPhaseStep(std::cout, 3, 4, "Create Session",
+                            "开启 verbose trace，按拓扑顺序观察节点执行。");
     miniort::Session session(std::move(graph),
                              {.verbose = true,
                               .auto_bind_placeholder_inputs = true,
                               .start_node = options.start_node,
                               .max_nodes = options.max_nodes});
 
+    miniort::PrintPhaseStep(std::cout, 4, 4, "Run Selected Nodes",
+                            "关注每个节点的 inputs / outputs / kernel_time_ms。");
     miniort::ExecutionContext context;
     const auto summary = session.Run(feeds, context, &std::cout);
 
@@ -79,6 +88,7 @@ int main(int argc, char* argv[]) {
               << " skipped=" << summary.skipped_nodes
               << " materialized_outputs=" << summary.materialized_outputs << "\n";
     miniort::PrintRunSummary(summary, std::cout);
+    miniort::PrintPhaseResult(std::cout, "phase2 complete", "你现在看到的是最小执行主线。");
     return EXIT_SUCCESS;
   } catch (const std::exception& ex) {
     std::cerr << "error: " << ex.what() << "\n";

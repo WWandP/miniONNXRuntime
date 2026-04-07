@@ -13,6 +13,7 @@
 #include "miniort/runtime/session.h"
 #include "miniort/optimizer/graph_optimizer.h"
 #include "miniort/tools/image_loader.h"
+#include "miniort/tools/phase_output.h"
 #include "miniort/tools/yolo_detection.h"
 
 namespace {
@@ -73,11 +74,18 @@ void PrintOpTypeHistogram(const miniort::Graph& graph, const char* title) {
 int main(int argc, char* argv[]) {
   try {
     const auto options = ParseArgs(argc, argv);
+    miniort::PrintPhaseBanner(std::cout, "phase4-opt", "Optimize Graph Then Run",
+                              "看图优化前后差异，再验证优化后仍可执行。");
+    miniort::PrintPhaseStep(std::cout, 1, 5, "Load ONNX Graph", options.model_path);
     auto graph = miniort::LoadOnnxGraph(options.model_path, nullptr);
 
+    miniort::PrintPhaseStep(std::cout, 2, 5, "Inspect Original Graph",
+                            "关注节点数、initializer 数量和 op histogram。");
     PrintGraphSnapshot(graph, "before optimization");
     PrintOpTypeHistogram(graph, "before optimization op_type_histogram");
 
+    miniort::PrintPhaseStep(std::cout, 3, 5, "Run Graph Optimizer",
+                            "观察 pass summary 和优化后的图大小变化。");
     miniort::GraphOptimizationSummary summary;
     graph = miniort::OptimizeGraph(std::move(graph),
                                    {.enable_constant_folding = true,
@@ -95,6 +103,7 @@ int main(int argc, char* argv[]) {
         throw std::runtime_error("graph has no runtime inputs for --image");
       }
 
+      miniort::PrintPhaseStep(std::cout, 4, 5, "Prepare Runtime Input", options.image_path);
       const auto image = miniort::LoadRgbImage(std::filesystem::path(options.image_path));
       const auto output_name = graph.outputs.front().name;
       std::unordered_map<std::string, miniort::Tensor> feeds;
@@ -103,6 +112,8 @@ int main(int argc, char* argv[]) {
                     miniort::LoadImageAsNchwTensor(std::filesystem::path(options.image_path), input.name, input.info,
                                                    nullptr));
 
+      miniort::PrintPhaseStep(std::cout, 5, 5, "Run Optimized Graph",
+                              "确认优化后的图仍然能完成推理，并比较输出结果。");
       miniort::Session session(std::move(graph),
                                {.auto_bind_placeholder_inputs = true, .evict_dead_tensors = true});
       miniort::ExecutionContext context;
@@ -128,6 +139,9 @@ int main(int argc, char* argv[]) {
       std::cout << "  skipped=" << run_summary.skipped_nodes << "\n";
       std::cout << "  materialized_outputs=" << run_summary.materialized_outputs << "\n";
     }
+
+    miniort::PrintPhaseResult(std::cout, "phase4 optimize complete",
+                              "你现在看到的是图优化前后对比视角。");
 
     return EXIT_SUCCESS;
   } catch (const std::exception& ex) {

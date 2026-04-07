@@ -10,6 +10,7 @@
 #include "miniort/loader/onnx_loader.h"
 #include "miniort/model/graph.h"
 #include "miniort/runtime/session.h"
+#include "miniort/tools/phase_output.h"
 
 namespace {
 
@@ -209,9 +210,17 @@ void PrintGraphSummary(const miniort::Graph& graph, const miniort::SessionAssign
 int main(int argc, char* argv[]) {
   try {
     const Options options = ParseArgs(argc, argv);
+    miniort::PrintPhaseBanner(std::cout, "phase1", "Inspect Graph Structure",
+                              "只看模型图结构，不进入完整推理执行。");
+    miniort::PrintPhaseStep(std::cout, 1, 3, "Load ONNX Graph", options.model_path);
     auto graph = miniort::LoadOnnxGraph(options.model_path);
+    miniort::PrintPhaseStep(std::cout, 2, 3, "Assign Execution Providers",
+                            "构造 Session，查看节点当前会落到哪个 provider。");
     const miniort::Session session(graph);
+    miniort::PrintPhaseStep(std::cout, 3, 3, "Print Graph Summary",
+                            "重点看输入输出、op histogram 和拓扑顺序预览。");
     PrintGraphSummary(session.graph(), session.assignment_summary());
+    miniort::PrintPhaseResult(std::cout, "phase1 complete", "你现在看到的是静态图视角。");
     return EXIT_SUCCESS;
   } catch (const std::exception& ex) {
     std::cerr << "error: " << ex.what() << "\n";

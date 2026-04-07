@@ -1,10 +1,9 @@
 # gpt2_tiny
 
-用于第二阶段 transformer/attention 相关实验的目录。
+这个目录预留给 transformer / attention 方向的小型实验。
 
-这里后续计划放：
+更适合放：
 
-- 简化版 GPT-2 图描述
-- LayerNorm / Gelu / MatMul / Attention 相关实验
-- 图优化案例
-
+- 简化版 GPT-2 图或子图
+- LayerNorm / Gelu / MatMul / Attention 相关样例
+- transformer 方向的图优化案例

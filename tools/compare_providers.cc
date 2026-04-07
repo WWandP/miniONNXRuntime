@@ -13,6 +13,7 @@
 #include "miniort/runtime/execution_context.h"
 #include "miniort/runtime/session.h"
 #include "miniort/tools/image_loader.h"
+#include "miniort/tools/phase_output.h"
 
 namespace {
 
@@ -74,6 +75,9 @@ double RunAverage(miniort::Session& session, const std::unordered_map<std::strin
 int main(int argc, char* argv[]) {
   try {
     const auto options = ParseArgs(argc, argv);
+    miniort::PrintPhaseBanner(std::cout, "phase5", "Compare Execution Providers",
+                              "看默认 provider 路径和纯 CPU 路径的差异。");
+    miniort::PrintPhaseStep(std::cout, 1, 4, "Load ONNX Graph", options.model_path);
     auto graph = miniort::LoadOnnxGraph(options.model_path, nullptr);
     if (graph.inputs.empty()) {
       throw std::runtime_error("graph has no inputs");
@@ -81,6 +85,7 @@ int main(int argc, char* argv[]) {
 
     const auto& input = graph.inputs.front();
     std::unordered_map<std::string, miniort::Tensor> feeds;
+    miniort::PrintPhaseStep(std::cout, 2, 4, "Prepare Runtime Input", options.image_path);
     feeds.emplace(input.name,
                   miniort::LoadImageAsNchwTensor(std::filesystem::path(options.image_path), input.name, input.info,
                                                  nullptr));
@@ -88,12 +93,16 @@ int main(int argc, char* argv[]) {
     miniort::SessionOptions session_options;
     session_options.auto_bind_placeholder_inputs = true;
 
+    miniort::PrintPhaseStep(std::cout, 3, 4, "Create Sessions",
+                            "分别构造默认 provider 路径和 CPU-only 路径。");
     miniort::Session mixed_session(graph, session_options);
     miniort::Session cpu_only_session(
         graph, std::vector<std::shared_ptr<const miniort::ExecutionProvider>>{
                    std::make_shared<miniort::CpuExecutionProvider>()},
         session_options);
 
+    miniort::PrintPhaseStep(std::cout, 4, 4, "Run And Compare",
+                            "关注 mixed_ms、cpu_only_ms 和 speedup_pct。");
     const auto mixed_ms = RunAverage(mixed_session, feeds, options.repeat);
     const auto cpu_ms = RunAverage(cpu_only_session, feeds, options.repeat);
 
@@ -103,6 +112,7 @@ int main(int argc, char* argv[]) {
     std::cout << "  cpu_only_ms=" << cpu_ms << "\n";
     std::cout << "  delta_ms=" << (cpu_ms - mixed_ms) << "\n";
     std::cout << "  speedup_pct=" << ((cpu_ms - mixed_ms) / cpu_ms * 100.0) << "\n";
+    miniort::PrintPhaseResult(std::cout, "phase5 complete", "你现在看到的是 provider 对比视角。");
     return EXIT_SUCCESS;
   } catch (const std::exception& ex) {
     std::cerr << "error: " << ex.what() << "\n";

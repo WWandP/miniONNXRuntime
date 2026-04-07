@@ -85,7 +85,6 @@ if(MINIORT_BUILD_RUNTIME_TOOLS OR MINIORT_BUILD_DETECT_TOOL OR MINIORT_BUILD_TES
   add_library(miniort_runtime STATIC
     src/runtime/tensor.cc
     src/runtime/execution_context.cc
-    src/runtime/accelerate_execution_provider.cc
     src/runtime/cpu_execution_provider.cc
     src/runtime/cpu_tensor_allocator.cc
     src/runtime/kernel_registry.cc
@@ -100,6 +99,12 @@ if(MINIORT_BUILD_RUNTIME_TOOLS OR MINIORT_BUILD_DETECT_TOOL OR MINIORT_BUILD_TES
     src/runtime/session.cc
     src/tools/image_loader.cc
   )
+
+  if(APPLE)
+    target_sources(miniort_runtime PRIVATE
+      src/runtime/accelerate_execution_provider.cc
+    )
+  endif()
 
   target_include_directories(miniort_runtime
     PUBLIC

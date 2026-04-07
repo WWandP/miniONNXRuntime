@@ -1,3 +1,4 @@
+#include <cmath>
 #include <exception>
 #include <iostream>
 #include <memory>

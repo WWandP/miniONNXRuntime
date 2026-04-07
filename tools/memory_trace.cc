@@ -15,6 +15,7 @@
 #include "miniort/runtime/profiling.h"
 #include "miniort/runtime/session.h"
 #include "miniort/tools/image_loader.h"
+#include "miniort/tools/phase_output.h"
 
 namespace {
 
@@ -208,17 +209,23 @@ int main(int argc, char* argv[]) {
     constexpr std::size_t kMaxNodes = 20;
     std::ostream* trace = &std::cout;
 
+    miniort::PrintPhaseBanner(std::cout, "phase4-memory", "Trace Memory And Tensor Lifetime",
+                              "看内存计划、live tensor 变化和释放时机。");
+    miniort::PrintPhaseStep(std::cout, 1, 5, "Load ONNX Graph", options.model_path);
     auto graph = miniort::LoadOnnxGraph(options.model_path, trace);
     if (graph.inputs.empty() || graph.outputs.empty()) {
       throw std::runtime_error("graph must have at least one input and one output");
     }
 
+    miniort::PrintPhaseStep(std::cout, 2, 5, "Build Memory Profile",
+                            "先看静态生命周期计划，再进入实际运行。");
     const auto memory_plan = miniort::BuildMemoryProfile(graph);
     PrintMemoryPlan(memory_plan, std::cout, 24);
 
     std::unordered_map<std::string, miniort::Tensor> feeds;
     if (!options.image_path.empty()) {
       const auto& input = graph.inputs.front();
+      miniort::PrintPhaseStep(std::cout, 3, 5, "Prepare Runtime Input", options.image_path);
       feeds.emplace(input.name,
                     miniort::LoadImageAsNchwTensor(std::filesystem::path(options.image_path), input.name, input.info,
                                                    trace));
@@ -228,6 +235,8 @@ int main(int argc, char* argv[]) {
     std::size_t peak_live_tensors = 0;
     std::size_t peak_topo_index = 0;
 
+    miniort::PrintPhaseStep(std::cout, 4, 5, "Create Session",
+                            "打开 dead tensor eviction，观察回收时机。");
     miniort::Session session(std::move(graph),
                              {.allow_missing_kernels = true,
                               .auto_bind_placeholder_inputs = true,
@@ -241,6 +250,8 @@ int main(int argc, char* argv[]) {
                                                             peak_live_tensors, peak_topo_index);
                                   }});
 
+    miniort::PrintPhaseStep(std::cout, 5, 5, "Run Memory Trace",
+                            "重点关注 [mem] 行、peak bytes 和 final_context。");
     miniort::ExecutionContext context;
     const auto summary = session.Run(feeds, context, trace);
     const auto runtime_initializer_stats = CollectRuntimeInitializerStats(context);
@@ -262,6 +273,8 @@ int main(int argc, char* argv[]) {
               << " skipped=" << summary.skipped_nodes
               << " materialized_outputs=" << summary.materialized_outputs
               << " released_tensors=" << summary.released_tensors << "\n";
+    miniort::PrintPhaseResult(std::cout, "phase4 memory trace complete",
+                              "你现在看到的是内存与生命周期视角。");
     return EXIT_SUCCESS;
   } catch (const std::exception& ex) {
     std::cerr << "error: " << ex.what() << "\n";

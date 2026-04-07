@@ -3,9 +3,10 @@
 A teaching-oriented mini implementation of ONNX Runtime.
 It uses `yolov8n.onnx` to show how a model is parsed, optimized, executed, and memory-optimized.
 
-![miniONNXRuntime showcase](./assets/readme_showcase.png)
+![miniONNXRuntime banner](./assets/readme_banner.png)
 
 Chinese version: [README.md](./README.md)
+Learning path: [docs/phases/README.en.md](./docs/phases/README.en.md)
 
 ## Environment
 
@@ -19,25 +20,27 @@ Build requirements:
 
 The repository already includes `third_party/onnx`, so no extra ONNX source download is needed.
 
-### Ubuntu / Debian
+## Install Dependencies
 
-On Linux, install the basic packages first:
+### Linux
+
+If you want to use the repository's setup script to prepare dependencies, run:
+
+```bash
+# Automatically checks and installs cmake / protobuf / protoc
+./scripts/setup_linux_env.sh
+```
+
+The script tries the following in order:
+
+- `conda-forge`
+- falls back to `apt-get` when `conda` is not available
+
+If you prefer manual install on Ubuntu / Debian:
 
 ```bash
 sudo apt update
 sudo apt install -y build-essential cmake git libprotobuf-dev protobuf-compiler
-```
-
-If you already have `cmake` and only want the rest of the dependencies:
-
-```bash
-sudo apt install -y build-essential git libprotobuf-dev protobuf-compiler
-```
-
-If you only need to install `cmake`:
-
-```bash
-sudo apt install -y cmake
 ```
 
 ### macOS
@@ -48,12 +51,6 @@ On macOS, install the Homebrew dependencies:
 brew install cmake protobuf git
 ```
 
-If you already have `cmake`, you can install only the remaining packages:
-
-```bash
-brew install protobuf git
-```
-
 ## What It Shows
 
 - Parse ONNX graph
@@ -61,53 +58,78 @@ brew install protobuf git
 - Run CPU / Apple provider kernels
 - Trace tensor memory and buffer reuse
 
-## Current Status
+## Documentation
 
-- ONNX model parsing and internal graph construction
-- `Session` / `ExecutionContext` / `KernelRegistry`
-- Minimal `ExecutionProvider`
-- `CpuExecutionProvider`
-- Minimal `AccelerateExecutionProvider` on macOS
-- Provider assignment, allocator injection, and runtime provider tracing
-- CPU-side basic kernels
-- Real image input and YOLO detection output
-- Graph optimization entry and first optimization passes
-- Memory observation, initializer materialization on demand, and buffer reuse demo
-
-The memory optimization write-up is in [docs/blog_memory_optimization.md](./docs/blog_memory_optimization.md).
-The phase5 EP design note is in [docs/execution_provider.md](./docs/execution_provider.md).
-The phase5 summary post is in [docs/phase5_execution_provider_summary.md](./docs/phase5_execution_provider_summary.md).
+- Chinese phase guide: [docs/phases/README.md](./docs/phases/README.md)
+- English phase guide: [docs/phases/README.en.md](./docs/phases/README.en.md)
 
 ## Quick Start
 
-```bash
-cmake -S . -B build_phase3 -DMINIORT_BUILD_OPTIMIZER_TOOLS=OFF
-cmake --build build_phase3 -j4
-./build_phase3/miniort_run models/yolov8n.onnx --image pic/bus.jpg
+After dependencies are installed, the build/run flow is the same on Linux and macOS:
 
-cmake -S . -B build_phase4 -DMINIORT_BUILD_OPTIMIZER_TOOLS=ON
-cmake --build build_phase4 -j4
-./build_phase4/miniort_optimize_model models/yolov8n.onnx --image pic/bus.jpg
+```bash
+# enable optimizer tools so phase4 is available
+cmake -S . -B build_local -DMINIORT_BUILD_OPTIMIZER_TOOLS=ON
+
+# build all tools
+cmake --build build_local -j4
+
+# phase1: inspect the static graph first
+./scripts/run_phase.sh phase1
+
+# phase3: run end-to-end CPU inference
+./scripts/run_phase.sh phase3
+
+# phase4: compare the graph before and after optimization
+./scripts/run_phase.sh phase4-opt
+
+# phase5: compare provider paths
+./scripts/run_phase.sh phase5
 ```
 
-## Phases
+If you only want to build and test first:
 
-- `phase1`: inspect graph structure only
-- `phase2`: see the minimal execution pipeline
-- `phase3`: run CPU inference end to end
-- `phase4`: graph optimization and memory optimization
-- `phase5`: move the runtime backend path into a minimal `ExecutionProvider`
-  - `CpuExecutionProvider` and `CpuTensorAllocator` are in place
-  - On macOS the runtime prefers the minimal `AccelerateExecutionProvider`
-  - The current `AccelerateExecutionProvider` covers part of the elementwise / matmul / conv path
-  - Multi-EP partitioning is not implemented yet
+```bash
+./scripts/run_phase.sh build
+./scripts/run_phase.sh test
+```
 
-## Main Tools
+If you want to go through the whole teaching flow in order:
 
-- `miniort_inspect`: inspect graph structure only
-- `miniort_session_trace`: trace execution and value flow
-- `miniort_run`: run end-to-end inference
-- `miniort_memory_trace`: trace memory usage and tensor lifetime
-- `miniort_detect_yolov8n`: export detection results
-- `miniort_optimize_model`: optimize the graph before running YOLO
-- `miniort_compare_providers`: compare the default provider path against CPU-only
+```bash
+./scripts/run_phase.sh all
+```
+
+## Learning Path
+
+| Phase | Focus | Command | Read more |
+| --- | --- | --- | --- |
+| `phase1` | static graph structure | `./scripts/run_phase.sh phase1` | [ZH](/home/weiwei.pan/code/miniONNXRuntime/docs/phases/phase1.md) / [EN](/home/weiwei.pan/code/miniONNXRuntime/docs/phases/phase1.en.md) |
+| `phase2` | minimal execution pipeline | `./scripts/run_phase.sh phase2` | [ZH](/home/weiwei.pan/code/miniONNXRuntime/docs/phases/phase2.md) / [EN](/home/weiwei.pan/code/miniONNXRuntime/docs/phases/phase2.en.md) |
+| `phase3` | end-to-end CPU inference | `./scripts/run_phase.sh phase3` | [ZH](/home/weiwei.pan/code/miniONNXRuntime/docs/phases/phase3.md) / [EN](/home/weiwei.pan/code/miniONNXRuntime/docs/phases/phase3.en.md) |
+| `phase4` | graph optimization and memory tracing | `./scripts/run_phase.sh phase4-opt` / `phase4-memory` | [ZH](/home/weiwei.pan/code/miniONNXRuntime/docs/phases/phase4.md) / [EN](/home/weiwei.pan/code/miniONNXRuntime/docs/phases/phase4.en.md) |
+| `phase5` | `ExecutionProvider` abstraction and provider comparison | `./scripts/run_phase.sh phase5` | [ZH](/home/weiwei.pan/code/miniONNXRuntime/docs/phases/phase5.md) / [EN](/home/weiwei.pan/code/miniONNXRuntime/docs/phases/phase5.en.md) |
+
+## Main Entry Points
+
+| Tool | Best for | Typical use |
+| --- | --- | --- |
+| `miniort_inspect` | graph structure, inputs/outputs, op histogram | first look at a model |
+| `miniort_session_trace` | how the first nodes execute and how values flow | learning the minimal execution pipeline |
+| `miniort_run` | full inference timing and summary | validating end-to-end execution |
+| `miniort_memory_trace` | live tensors, peak bytes, release timing | understanding memory and lifetime |
+| `miniort_optimize_model` | graph before/after optimization | phase4 walkthrough |
+| `miniort_compare_providers` | default provider vs CPU-only | phase5 walkthrough |
+| `miniort_detect_yolov8n` | final detections and output files | demo output |
+
+## Repository Layout
+
+```text
+miniONNXRuntime
+├── include/ / src/   # core runtime, loader, optimizer, and tool implementation
+├── tools/            # command-line entrypoints
+├── models/ / pic/    # local demo model and image assets
+├── docs/             # user-facing documentation
+├── notes/            # drafts, experiment logs, internal notes
+└── scripts/          # environment setup and unified build/run entrypoints
+```
