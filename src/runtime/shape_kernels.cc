@@ -48,35 +48,62 @@ void RegisterShapeKernels(KernelRegistry& registry) {
   registry.Register("Gather", [](const Node& node, ExecutionContext& context, std::ostream* trace) {
     const auto& data = RequireTensor(context, node.inputs.at(0));
     const auto& indices = RequireTensor(context, node.inputs.at(1));
-    const auto axis_it = node.attributes.find("axis");
-    const auto axis = axis_it == node.attributes.end() ? 0 : axis_it->second.int_value;
-
-    if (axis != 0 || data.shape.size() > 1) {
-      throw std::runtime_error("Gather currently only supports axis=0 on scalar/1D tensors");
+    const auto axis = NormalizeAxis(ReadIntAttribute(node, "axis", 0), data.shape.size(), "Gather");
+    const auto& index_data = RequireInt64Data(indices, "Gather");
+    std::vector<std::int64_t> output_shape;
+    output_shape.reserve(data.shape.size() + indices.shape.size());
+    for (std::size_t i = 0; i < static_cast<std::size_t>(axis); ++i) {
+      output_shape.push_back(data.shape[i]);
+    }
+    output_shape.insert(output_shape.end(), indices.shape.begin(), indices.shape.end());
+    for (std::size_t i = static_cast<std::size_t>(axis) + 1; i < data.shape.size(); ++i) {
+      output_shape.push_back(data.shape[i]);
     }
 
-    const auto& index_data = RequireInt64Data(indices, "Gather");
-    const std::vector<std::int64_t> output_shape = indices.shape.empty() ? std::vector<std::int64_t>{} : indices.shape;
+    std::size_t outer = 1;
+    for (std::size_t i = 0; i < static_cast<std::size_t>(axis); ++i) {
+      outer *= static_cast<std::size_t>(data.shape[i]);
+    }
+    const auto axis_dim = static_cast<std::size_t>(data.shape[static_cast<std::size_t>(axis)]);
+    std::size_t inner = 1;
+    for (std::size_t i = static_cast<std::size_t>(axis) + 1; i < data.shape.size(); ++i) {
+      inner *= static_cast<std::size_t>(data.shape[i]);
+    }
+
+    const auto normalize_index = [&](std::int64_t index) -> std::size_t {
+      if (index < 0) {
+        index += static_cast<std::int64_t>(axis_dim);
+      }
+      if (index < 0 || index >= static_cast<std::int64_t>(axis_dim)) {
+        throw std::runtime_error("Gather index is out of range");
+      }
+      return static_cast<std::size_t>(index);
+    };
+
     if (data.dtype == "int64") {
       const auto& data_values = RequireInt64Data(data, "Gather");
       auto output = MakeInt64Output(node.outputs.at(0), output_shape, context);
-      for (std::size_t i = 0; i < index_data.size(); ++i) {
-        const auto index = index_data[i];
-        if (data.shape.empty() && index != 0) {
-          throw std::runtime_error("Gather scalar data only supports index 0");
+      for (std::size_t outer_index = 0; outer_index < outer; ++outer_index) {
+        for (std::size_t index_pos = 0; index_pos < index_data.size(); ++index_pos) {
+          const auto gather_index = normalize_index(index_data[index_pos]);
+          const auto input_offset = (outer_index * axis_dim + gather_index) * inner;
+          const auto output_offset = (outer_index * index_data.size() + index_pos) * inner;
+          std::copy_n(data_values.begin() + static_cast<std::ptrdiff_t>(input_offset), static_cast<std::ptrdiff_t>(inner),
+                      output.int64_data.begin() + static_cast<std::ptrdiff_t>(output_offset));
         }
-        output.int64_data[i] = data_values.at(static_cast<std::size_t>(index));
       }
       context.BindTensor(std::move(output));
     } else if (data.dtype == "float32") {
       const auto& data_values = RequireFloatData(data, "Gather");
       auto output = MakeFloatOutput(node.outputs.at(0), output_shape, context);
-      for (std::size_t i = 0; i < index_data.size(); ++i) {
-        const auto index = index_data[i];
-        if (data.shape.empty() && index != 0) {
-          throw std::runtime_error("Gather scalar data only supports index 0");
+      for (std::size_t outer_index = 0; outer_index < outer; ++outer_index) {
+        for (std::size_t index_pos = 0; index_pos < index_data.size(); ++index_pos) {
+          const auto gather_index = normalize_index(index_data[index_pos]);
+          const auto input_offset = (outer_index * axis_dim + gather_index) * inner;
+          const auto output_offset = (outer_index * index_data.size() + index_pos) * inner;
+          std::copy_n(data_values.begin() + static_cast<std::ptrdiff_t>(input_offset), static_cast<std::ptrdiff_t>(inner),
+                      output.float_data.begin() + static_cast<std::ptrdiff_t>(output_offset));
         }
-        output.float_data[i] = data_values.at(static_cast<std::size_t>(index));
       }
       context.BindTensor(std::move(output));
     } else {
@@ -119,6 +146,50 @@ void RegisterShapeKernels(KernelRegistry& registry) {
     context.BindTensor(std::move(output));
     if (trace != nullptr) {
       *trace << "    kernel Unsqueeze produced " << node.outputs.at(0) << "\n";
+    }
+  });
+
+  registry.Register("Squeeze", [](const Node& node, ExecutionContext& context, std::ostream* trace) {
+    const auto& data = RequireTensor(context, node.inputs.at(0));
+    std::vector<std::int64_t> axes;
+    if (node.inputs.size() > 1 && !node.inputs.at(1).empty()) {
+      axes = RequireInt64Data(RequireTensor(context, node.inputs.at(1)), "Squeeze");
+    } else {
+      const auto axes_it = node.attributes.find("axes");
+      if (axes_it != node.attributes.end()) {
+        axes = axes_it->second.ints;
+      }
+    }
+
+    std::vector<std::int64_t> output_shape;
+    if (axes.empty()) {
+      for (const auto dim : data.shape) {
+        if (dim != 1) {
+          output_shape.push_back(dim);
+        }
+      }
+    } else {
+      const auto normalized = NormalizeAxes(axes, data.shape.size());
+      std::size_t axis_index = 0;
+      for (std::size_t i = 0; i < data.shape.size(); ++i) {
+        const bool should_squeeze =
+            axis_index < normalized.size() && normalized[axis_index] == static_cast<std::int64_t>(i);
+        if (should_squeeze) {
+          if (data.shape[i] != 1) {
+            throw std::runtime_error("Squeeze can only remove dimensions of size 1");
+          }
+          ++axis_index;
+          continue;
+        }
+        output_shape.push_back(data.shape[i]);
+      }
+    }
+
+    auto output = MakeCopiedTensorWithReusedStorage(node.outputs.at(0), data, output_shape, context);
+    output.shape = output_shape;
+    context.BindTensor(std::move(output));
+    if (trace != nullptr) {
+      *trace << "    kernel Squeeze produced " << node.outputs.at(0) << "\n";
     }
   });
 

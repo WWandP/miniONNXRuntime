@@ -38,6 +38,18 @@ void RegisterElementwiseKernels(KernelRegistry& registry) {
     }
   });
 
+  registry.Register("Tanh", [](const Node& node, ExecutionContext& context, std::ostream* trace) {
+    const auto& input = RequireTensor(context, node.inputs.at(0));
+    const auto& input_data = RequireFloatData(input, "Tanh");
+    auto output = MakeOutputLikeWithReusedStorage(node.outputs.at(0), input, context);
+    std::transform(input_data.begin(), input_data.end(), output.float_data.begin(),
+                   [](float value) { return std::tanh(value); });
+    context.BindTensor(std::move(output));
+    if (trace != nullptr) {
+      *trace << "    kernel Tanh produced " << node.outputs.at(0) << "\n";
+    }
+  });
+
   const auto register_binary_numeric_kernel =
       [&registry](const std::string& op_type, const std::function<float(float, float)>& eval_float,
                   const std::function<std::int64_t(std::int64_t, std::int64_t)>& eval_int) {
@@ -108,6 +120,105 @@ void RegisterElementwiseKernels(KernelRegistry& registry) {
 
   register_binary_numeric_kernel("Sub", [](float lhs, float rhs) { return lhs - rhs; },
                                  [](std::int64_t lhs, std::int64_t rhs) { return lhs - rhs; });
+
+  registry.Register("Pow", [](const Node& node, ExecutionContext& context, std::ostream* trace) {
+    const auto& lhs = RequireTensor(context, node.inputs.at(0));
+    const auto& rhs = RequireTensor(context, node.inputs.at(1));
+    const auto output_shape = ComputeBroadcastShape(lhs.shape, rhs.shape, "Pow");
+    const auto output_strides = ComputeStrides(output_shape);
+    const auto lhs_strides = ComputeStrides(lhs.shape);
+    const auto rhs_strides = ComputeStrides(rhs.shape);
+    const auto element_count = GetElementCount(output_shape);
+
+    if (lhs.dtype == "int64" && rhs.dtype == "int64") {
+      auto output = MakeInt64Output(node.outputs.at(0), output_shape, context);
+      const auto& lhs_data = RequireInt64Data(lhs, "Pow");
+      const auto& rhs_data = RequireInt64Data(rhs, "Pow");
+      for (std::size_t i = 0; i < element_count; ++i) {
+        const auto output_index = UnravelIndex(i, output_shape, output_strides);
+        const auto lhs_offset = ComputeBroadcastOffset(output_index, lhs.shape, lhs_strides);
+        const auto rhs_offset = ComputeBroadcastOffset(output_index, rhs.shape, rhs_strides);
+        output.int64_data[i] =
+            static_cast<std::int64_t>(std::pow(static_cast<double>(lhs_data[lhs_offset]),
+                                               static_cast<double>(rhs_data[rhs_offset])));
+      }
+      context.BindTensor(std::move(output));
+    } else {
+      auto output = MakeFloatOutput(node.outputs.at(0), output_shape, context);
+      for (std::size_t i = 0; i < element_count; ++i) {
+        const auto output_index = UnravelIndex(i, output_shape, output_strides);
+        const auto lhs_offset = ComputeBroadcastOffset(output_index, lhs.shape, lhs_strides);
+        const auto rhs_offset = ComputeBroadcastOffset(output_index, rhs.shape, rhs_strides);
+        const auto lhs_value =
+            lhs.dtype == "float32" ? RequireFloatData(lhs, "Pow")[lhs_offset]
+                                   : static_cast<float>(RequireInt64Data(lhs, "Pow")[lhs_offset]);
+        const auto rhs_value =
+            rhs.dtype == "float32" ? RequireFloatData(rhs, "Pow")[rhs_offset]
+                                   : static_cast<float>(RequireInt64Data(rhs, "Pow")[rhs_offset]);
+        output.float_data[i] = std::pow(lhs_value, rhs_value);
+      }
+      context.BindTensor(std::move(output));
+    }
+
+    if (trace != nullptr) {
+      *trace << "    kernel Pow produced " << node.outputs.at(0) << "\n";
+    }
+  });
+
+  registry.Register("Where", [](const Node& node, ExecutionContext& context, std::ostream* trace) {
+    const auto& condition = RequireTensor(context, node.inputs.at(0));
+    const auto& x = RequireTensor(context, node.inputs.at(1));
+    const auto& y = RequireTensor(context, node.inputs.at(2));
+    const auto output_shape = ComputeBroadcastShape(ComputeBroadcastShape(condition.shape, x.shape, "Where"),
+                                                    y.shape, "Where");
+    const auto output_strides = ComputeStrides(output_shape);
+    const auto condition_strides = ComputeStrides(condition.shape);
+    const auto x_strides = ComputeStrides(x.shape);
+    const auto y_strides = ComputeStrides(y.shape);
+    const auto element_count = GetElementCount(output_shape);
+
+    const auto read_condition = [&](std::size_t offset) {
+      if (condition.dtype == "int64") {
+        return RequireInt64Data(condition, "Where")[offset] != 0;
+      }
+      if (condition.dtype == "float32") {
+        return RequireFloatData(condition, "Where")[offset] != 0.0f;
+      }
+      throw std::runtime_error("Where condition currently supports int64/float32 only");
+    };
+
+    if (x.dtype == "int64" && y.dtype == "int64") {
+      auto output = MakeInt64Output(node.outputs.at(0), output_shape, context);
+      const auto& x_data = RequireInt64Data(x, "Where");
+      const auto& y_data = RequireInt64Data(y, "Where");
+      for (std::size_t i = 0; i < element_count; ++i) {
+        const auto output_index = UnravelIndex(i, output_shape, output_strides);
+        const auto cond_offset = ComputeBroadcastOffset(output_index, condition.shape, condition_strides);
+        const auto x_offset = ComputeBroadcastOffset(output_index, x.shape, x_strides);
+        const auto y_offset = ComputeBroadcastOffset(output_index, y.shape, y_strides);
+        output.int64_data[i] = read_condition(cond_offset) ? x_data[x_offset] : y_data[y_offset];
+      }
+      context.BindTensor(std::move(output));
+    } else {
+      auto output = MakeFloatOutput(node.outputs.at(0), output_shape, context);
+      for (std::size_t i = 0; i < element_count; ++i) {
+        const auto output_index = UnravelIndex(i, output_shape, output_strides);
+        const auto cond_offset = ComputeBroadcastOffset(output_index, condition.shape, condition_strides);
+        const auto x_offset = ComputeBroadcastOffset(output_index, x.shape, x_strides);
+        const auto y_offset = ComputeBroadcastOffset(output_index, y.shape, y_strides);
+        const auto x_value = x.dtype == "float32" ? RequireFloatData(x, "Where")[x_offset]
+                                                  : static_cast<float>(RequireInt64Data(x, "Where")[x_offset]);
+        const auto y_value = y.dtype == "float32" ? RequireFloatData(y, "Where")[y_offset]
+                                                  : static_cast<float>(RequireInt64Data(y, "Where")[y_offset]);
+        output.float_data[i] = read_condition(cond_offset) ? x_value : y_value;
+      }
+      context.BindTensor(std::move(output));
+    }
+
+    if (trace != nullptr) {
+      *trace << "    kernel Where produced " << node.outputs.at(0) << "\n";
+    }
+  });
 
   registry.Register("Cast", [](const Node& node, ExecutionContext& context, std::ostream* trace) {
     const auto& input = RequireTensor(context, node.inputs.at(0));

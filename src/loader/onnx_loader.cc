@@ -115,6 +115,16 @@ TensorData ParseTensorData(const onnx::TensorProto& tensor_proto) {
       data.int64_data.resize(count);
       std::memcpy(data.int64_data.data(), data.raw_data.data(), data.raw_data.size());
     }
+    if (data.dtype == "bool" && data.int64_data.empty()) {
+      data.int64_data.resize(data.raw_data.size());
+      for (std::size_t i = 0; i < data.raw_data.size(); ++i) {
+        data.int64_data[i] = data.raw_data[i] == 0 ? 0 : 1;
+      }
+      // The minimal runtime has no dedicated bool tensor storage today.
+      // Materialize ONNX bool constants as int64 masks so shape/mask kernels
+      // can still operate on them.
+      data.dtype = "int64";
+    }
   }
 
   return data;

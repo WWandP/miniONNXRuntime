@@ -1,29 +1,59 @@
 #include <cstdlib>
 #include <filesystem>
 #include <iostream>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
+#include <vector>
 
 #include "miniort/loader/onnx_loader.h"
+#include "miniort/runtime/cpu_execution_provider.h"
 #include "miniort/runtime/execution_context.h"
 #include "miniort/runtime/session.h"
 #include "miniort/tools/image_loader.h"
-#include "miniort/tools/phase_output.h"
 
 namespace {
 
 struct Options {
   std::string model_path;
   std::string image_path;
+  std::string tokens;
   std::size_t start_node{0};
   std::size_t max_nodes{16};
+  bool strict{false};
+  bool cpu_only{false};
 };
+
+miniort::Tensor MakeTokenTensor(const miniort::Value& input, const std::string& tokens_arg) {
+  if (tokens_arg.empty()) {
+    throw std::runtime_error("--tokens requires a comma-separated token list");
+  }
+
+  miniort::Tensor tensor;
+  tensor.name = input.name;
+  tensor.dtype = "int64";
+  std::stringstream ss(tokens_arg);
+  std::string token;
+  while (std::getline(ss, token, ',')) {
+    if (token.empty()) {
+      continue;
+    }
+    tensor.int64_data.push_back(std::stoll(token));
+  }
+
+  if (tensor.int64_data.empty()) {
+    throw std::runtime_error("--tokens did not contain any token ids");
+  }
+
+  tensor.shape = {1, static_cast<std::int64_t>(tensor.int64_data.size())};
+  return tensor;
+}
 
 Options ParseArgs(int argc, char* argv[]) {
   if (argc < 2) {
     throw std::runtime_error(
-        "usage: miniort_session_trace <model.onnx> [--image path] [--start-node N] [--max-nodes N]");
+        "usage: miniort_session_trace <model.onnx> [--image path] [--tokens 1,2,3] [--start-node N] [--max-nodes N] [--strict] [--cpu-only]");
   }
 
   Options options;
@@ -34,12 +64,24 @@ Options ParseArgs(int argc, char* argv[]) {
       options.image_path = argv[++i];
       continue;
     }
+    if (arg == "--tokens" && i + 1 < argc) {
+      options.tokens = argv[++i];
+      continue;
+    }
     if (arg == "--start-node" && i + 1 < argc) {
       options.start_node = static_cast<std::size_t>(std::stoull(argv[++i]));
       continue;
     }
     if (arg == "--max-nodes" && i + 1 < argc) {
       options.max_nodes = static_cast<std::size_t>(std::stoull(argv[++i]));
+      continue;
+    }
+    if (arg == "--strict") {
+      options.strict = true;
+      continue;
+    }
+    if (arg == "--cpu-only") {
+      options.cpu_only = true;
       continue;
     }
     throw std::runtime_error("unknown argument: " + arg);
@@ -53,9 +95,6 @@ Options ParseArgs(int argc, char* argv[]) {
 int main(int argc, char* argv[]) {
   try {
     const auto options = ParseArgs(argc, argv);
-    miniort::PrintPhaseBanner(std::cout, "phase2", "Trace Minimal Execution Pipeline",
-                              "看 runtime 从加载、喂数据到逐节点执行的主线。");
-    miniort::PrintPhaseStep(std::cout, 1, 4, "Load ONNX Graph", options.model_path);
     auto graph = miniort::LoadOnnxGraph(options.model_path, &std::cout);
     std::unordered_map<std::string, miniort::Tensor> feeds;
     if (!options.image_path.empty()) {
@@ -63,22 +102,35 @@ int main(int argc, char* argv[]) {
         throw std::runtime_error("graph has no runtime inputs for --image");
       }
       const auto& input = graph.inputs.front();
-      miniort::PrintPhaseStep(std::cout, 2, 4, "Prepare Runtime Input", options.image_path);
       feeds.emplace(input.name,
                     miniort::LoadImageAsNchwTensor(std::filesystem::path(options.image_path), input.name, input.info,
                                                    &std::cout));
     }
+    if (!options.tokens.empty()) {
+      if (graph.inputs.empty()) {
+        throw std::runtime_error("graph has no runtime inputs for --tokens");
+      }
+      const auto& input = graph.inputs.front();
+      feeds.emplace(input.name, MakeTokenTensor(input, options.tokens));
+    }
 
-    miniort::PrintPhaseStep(std::cout, 3, 4, "Create Session",
-                            "开启 verbose trace，按拓扑顺序观察节点执行。");
-    miniort::Session session(std::move(graph),
-                             {.verbose = true,
-                              .auto_bind_placeholder_inputs = true,
-                              .start_node = options.start_node,
-                              .max_nodes = options.max_nodes});
+    miniort::SessionOptions session_options;
+    session_options.verbose = true;
+    session_options.allow_missing_kernels = !options.strict;
+    session_options.allow_unassigned_nodes = !options.strict;
+    session_options.auto_bind_placeholder_inputs = true;
+    session_options.start_node = options.start_node;
+    session_options.max_nodes = options.max_nodes;
 
-    miniort::PrintPhaseStep(std::cout, 4, 4, "Run Selected Nodes",
-                            "关注每个节点的 inputs / outputs / kernel_time_ms。");
+    std::vector<std::shared_ptr<const miniort::ExecutionProvider>> providers;
+    if (options.cpu_only) {
+      providers.push_back(std::make_shared<miniort::CpuExecutionProvider>());
+    }
+
+    miniort::Session session =
+        providers.empty() ? miniort::Session(std::move(graph), session_options)
+                          : miniort::Session(std::move(graph), std::move(providers), session_options);
+
     miniort::ExecutionContext context;
     const auto summary = session.Run(feeds, context, &std::cout);
 
@@ -88,7 +140,6 @@ int main(int argc, char* argv[]) {
               << " skipped=" << summary.skipped_nodes
               << " materialized_outputs=" << summary.materialized_outputs << "\n";
     miniort::PrintRunSummary(summary, std::cout);
-    miniort::PrintPhaseResult(std::cout, "phase2 complete", "你现在看到的是最小执行主线。");
     return EXIT_SUCCESS;
   } catch (const std::exception& ex) {
     std::cerr << "error: " << ex.what() << "\n";

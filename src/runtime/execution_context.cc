@@ -10,6 +10,9 @@ Tensor TensorFromValue(const Value& value) {
   Tensor tensor = MakePlaceholderTensor(value.name, value.info);
   tensor.is_initializer = value.info.is_initializer;
   tensor.is_placeholder = !value.data.has_value();
+  if (value.data.has_value() && !value.data->dtype.empty()) {
+    tensor.dtype = value.data->dtype;
+  }
   if (value.data.has_value() && value.data->dtype == "float32" && !value.data->float_data.empty()) {
     tensor.float_data = value.data->float_data;
     tensor.is_placeholder = false;

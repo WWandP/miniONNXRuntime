@@ -108,6 +108,7 @@ cmake --build build_local -j4
 | `phase3` | 完整 CPU 推理 | `./scripts/run_phase.sh phase3` | [phase3](/home/weiwei.pan/code/miniONNXRuntime/docs/phases/phase3.md) / [EN](/home/weiwei.pan/code/miniONNXRuntime/docs/phases/phase3.en.md) |
 | `phase4` | 图优化与内存观察 | `./scripts/run_phase.sh phase4-opt` / `phase4-memory` | [phase4](/home/weiwei.pan/code/miniONNXRuntime/docs/phases/phase4.md) / [EN](/home/weiwei.pan/code/miniONNXRuntime/docs/phases/phase4.en.md) |
 | `phase5` | `ExecutionProvider` 抽象与 provider 对比 | `./scripts/run_phase.sh phase5` | [phase5](/home/weiwei.pan/code/miniONNXRuntime/docs/phases/phase5.md) / [EN](/home/weiwei.pan/code/miniONNXRuntime/docs/phases/phase5.en.md) |
+| `phase6` | GPT 文本输入输出最小闭环 | 暂无统一脚本，直接用 `miniort_run_gpt` / `tools/run_gpt_text.py` | [phase6](/Volumes/ww/code/onnxruntime/minionnxruntime/docs/phase6_gpt_text_pipeline.md) |
 
 ## 主要入口
 
@@ -116,6 +117,8 @@ cmake --build build_local -j4
 | `miniort_inspect` | 图结构、输入输出、op histogram | 第一次看模型 |
 | `miniort_session_trace` | 前几个节点如何执行、value 怎么流转 | 学最小执行主线 |
 | `miniort_run` | 一次完整推理的 timing 和 summary | 验证整图执行 |
+| `miniort_run_gpt` | token 输入、多步贪心生成、top-k 调试 | 看 GPT / 文本模型主线 |
+| `tools/run_gpt_text.py` | 文本 prompt 编码、调用 GPT 入口、文本解码 | 跑第一版语义化输入输出 |
 | `miniort_memory_trace` | live tensor、peak bytes、释放时机 | 看内存与生命周期 |
 | `miniort_optimize_model` | 优化前后图差异、优化后再运行 | 看 phase4 |
 | `miniort_compare_providers` | 默认 provider 和 CPU-only 的差异 | 看 phase5 |

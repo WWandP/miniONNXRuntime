@@ -27,6 +27,8 @@ cmake_install.cmake
 Makefile
 outputs/
 resume/
+models/gpt2/
+models/tiny-gpt2/
 
 # IDE / editor
 .DS_Store
@@ -37,3 +39,6 @@ docs/
 docs/*
 !docs/blog_graph_optimization.md
 !docs/memory_optimization.md
+!docs/gpt2_onnx_gap_analysis.md
+!docs/phase5_gpt2_cpu_bringup.md
+!docs/phase6_gpt_text_pipeline.md

@@ -13,29 +13,55 @@ namespace miniort {
 
 namespace {
 
-Tensor RunMatMul2D(const std::string& output_name, const Tensor& lhs, const Tensor& rhs, ExecutionContext& context) {
+Tensor RunMatMul(const std::string& output_name, const Tensor& lhs, const Tensor& rhs, ExecutionContext& context) {
   const auto& lhs_data = RequireFloatData(lhs, "MatMul");
   const auto& rhs_data = RequireFloatData(rhs, "MatMul");
-  if (lhs.shape.size() != 2 || rhs.shape.size() != 2) {
-    throw std::runtime_error("MatMul currently only supports 2D float32 tensors");
+  if (lhs.shape.size() < 2 || rhs.shape.size() < 2) {
+    throw std::runtime_error("MatMul currently requires rank >= 2 float32 tensors");
   }
 
-  const auto m = static_cast<std::size_t>(lhs.shape[0]);
-  const auto k = static_cast<std::size_t>(lhs.shape[1]);
-  const auto rhs_k = static_cast<std::size_t>(rhs.shape[0]);
-  const auto n = static_cast<std::size_t>(rhs.shape[1]);
+  const auto m = static_cast<std::size_t>(lhs.shape[lhs.shape.size() - 2]);
+  const auto k = static_cast<std::size_t>(lhs.shape[lhs.shape.size() - 1]);
+  const auto rhs_k = static_cast<std::size_t>(rhs.shape[rhs.shape.size() - 2]);
+  const auto n = static_cast<std::size_t>(rhs.shape[rhs.shape.size() - 1]);
   if (k != rhs_k) {
     throw std::runtime_error("MatMul inner dimensions do not match");
   }
 
-  auto output = MakeFloatOutput(output_name, {static_cast<std::int64_t>(m), static_cast<std::int64_t>(n)}, context);
-  for (std::size_t i = 0; i < m; ++i) {
-    for (std::size_t j = 0; j < n; ++j) {
-      float sum = 0.0f;
-      for (std::size_t kk = 0; kk < k; ++kk) {
-        sum += lhs_data[i * k + kk] * rhs_data[kk * n + j];
+  const std::vector<std::int64_t> lhs_batch_shape(lhs.shape.begin(), lhs.shape.end() - 2);
+  const std::vector<std::int64_t> rhs_batch_shape(rhs.shape.begin(), rhs.shape.end() - 2);
+  const auto output_batch_shape = ComputeBroadcastShape(lhs_batch_shape, rhs_batch_shape, "MatMul");
+
+  std::vector<std::int64_t> output_shape = output_batch_shape;
+  output_shape.push_back(static_cast<std::int64_t>(m));
+  output_shape.push_back(static_cast<std::int64_t>(n));
+
+  auto output = MakeFloatOutput(output_name, output_shape, context);
+  const auto output_batch_strides = ComputeStrides(output_batch_shape);
+  const auto lhs_full_strides = ComputeStrides(lhs.shape);
+  const auto rhs_full_strides = ComputeStrides(rhs.shape);
+  const std::size_t lhs_matrix_stride = k * m;
+  const std::size_t rhs_matrix_stride = rhs_k * n;
+
+  const auto batch_count = GetElementCount(output_batch_shape);
+  for (std::size_t batch = 0; batch < batch_count; ++batch) {
+    const auto batch_index = UnravelIndex(batch, output_batch_shape, output_batch_strides);
+    const auto lhs_batch_offset = lhs_batch_shape.empty() ? 0 : ComputeBroadcastOffset(batch_index, lhs_batch_shape, lhs_full_strides);
+    const auto rhs_batch_offset = rhs_batch_shape.empty() ? 0 : ComputeBroadcastOffset(batch_index, rhs_batch_shape, rhs_full_strides);
+    const auto lhs_base = lhs_batch_shape.empty() ? 0 : lhs_batch_offset;
+    const auto rhs_base = rhs_batch_shape.empty() ? 0 : rhs_batch_offset;
+    const auto output_base = batch * m * n;
+
+    for (std::size_t i = 0; i < m; ++i) {
+      for (std::size_t j = 0; j < n; ++j) {
+        float sum = 0.0f;
+        for (std::size_t kk = 0; kk < k; ++kk) {
+          const auto lhs_index = lhs_base + i * k + kk;
+          const auto rhs_index = rhs_base + kk * n + j;
+          sum += lhs_data[lhs_index] * rhs_data[rhs_index];
+        }
+        output.float_data[output_base + i * n + j] = sum;
       }
-      output.float_data[i * n + j] = sum;
     }
   }
   return output;
@@ -266,13 +292,62 @@ Tensor RunConv2D(const Node& node, const Tensor& input, const Tensor& weight, co
   return output;
 }
 
+Tensor RunLayerNormalization(const Node& node, const Tensor& input, const Tensor& scale, const Tensor& bias,
+                             ExecutionContext& context) {
+  const auto& input_data = RequireFloatData(input, "LayerNormalization");
+  const auto& scale_data = RequireFloatData(scale, "LayerNormalization");
+  const auto& bias_data = RequireFloatData(bias, "LayerNormalization");
+  const auto axis = static_cast<std::size_t>(
+      NormalizeAxis(ReadIntAttribute(node, "axis", -1), input.shape.size(), "LayerNormalization"));
+  const auto epsilon_it = node.attributes.find("epsilon");
+  const float epsilon = epsilon_it == node.attributes.end() ? 1e-5f : epsilon_it->second.float_value;
+
+  std::size_t outer = 1;
+  for (std::size_t i = 0; i < axis; ++i) {
+    outer *= static_cast<std::size_t>(input.shape[i]);
+  }
+  std::size_t normalized_size = 1;
+  for (std::size_t i = axis; i < input.shape.size(); ++i) {
+    normalized_size *= static_cast<std::size_t>(input.shape[i]);
+  }
+
+  if (scale_data.size() != normalized_size || bias_data.size() != normalized_size) {
+    throw std::runtime_error("LayerNormalization scale/bias shape mismatch");
+  }
+
+  auto output = MakeOutputLikeWithReusedStorage(node.outputs.at(0), input, context);
+  for (std::size_t outer_index = 0; outer_index < outer; ++outer_index) {
+    const auto base = outer_index * normalized_size;
+    float mean = 0.0f;
+    for (std::size_t i = 0; i < normalized_size; ++i) {
+      mean += input_data[base + i];
+    }
+    mean /= static_cast<float>(normalized_size);
+
+    float variance = 0.0f;
+    for (std::size_t i = 0; i < normalized_size; ++i) {
+      const auto diff = input_data[base + i] - mean;
+      variance += diff * diff;
+    }
+    variance /= static_cast<float>(normalized_size);
+    const auto inv_stddev = 1.0f / std::sqrt(variance + epsilon);
+
+    for (std::size_t i = 0; i < normalized_size; ++i) {
+      output.float_data[base + i] =
+          ((input_data[base + i] - mean) * inv_stddev) * scale_data[i] + bias_data[i];
+    }
+  }
+
+  return output;
+}
+
 }  // namespace
 
 void RegisterNnKernels(KernelRegistry& registry) {
   registry.Register("MatMul", [](const Node& node, ExecutionContext& context, std::ostream* trace) {
     const auto& lhs = RequireTensor(context, node.inputs.at(0));
     const auto& rhs = RequireTensor(context, node.inputs.at(1));
-    auto output = RunMatMul2D(node.outputs.at(0), lhs, rhs, context);
+    auto output = RunMatMul(node.outputs.at(0), lhs, rhs, context);
     context.BindTensor(std::move(output));
     if (trace != nullptr) {
       *trace << "    kernel MatMul produced " << node.outputs.at(0) << "\n";
@@ -525,6 +600,17 @@ void RegisterNnKernels(KernelRegistry& registry) {
     context.BindTensor(std::move(output));
     if (trace != nullptr) {
       *trace << "    kernel Softmax produced " << node.outputs.at(0) << "\n";
+    }
+  });
+
+  registry.Register("LayerNormalization", [](const Node& node, ExecutionContext& context, std::ostream* trace) {
+    const auto& input = RequireTensor(context, node.inputs.at(0));
+    const auto& scale = RequireTensor(context, node.inputs.at(1));
+    const auto& bias = RequireTensor(context, node.inputs.at(2));
+    auto output = RunLayerNormalization(node, input, scale, bias, context);
+    context.BindTensor(std::move(output));
+    if (trace != nullptr) {
+      *trace << "    kernel LayerNormalization produced " << node.outputs.at(0) << "\n";
     }
   });
 }

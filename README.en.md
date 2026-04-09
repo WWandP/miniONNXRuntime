@@ -108,6 +108,7 @@ If you want to go through the whole teaching flow in order:
 | `phase3` | end-to-end CPU inference | `./scripts/run_phase.sh phase3` | [ZH](/home/weiwei.pan/code/miniONNXRuntime/docs/phases/phase3.md) / [EN](/home/weiwei.pan/code/miniONNXRuntime/docs/phases/phase3.en.md) |
 | `phase4` | graph optimization and memory tracing | `./scripts/run_phase.sh phase4-opt` / `phase4-memory` | [ZH](/home/weiwei.pan/code/miniONNXRuntime/docs/phases/phase4.md) / [EN](/home/weiwei.pan/code/miniONNXRuntime/docs/phases/phase4.en.md) |
 | `phase5` | `ExecutionProvider` abstraction and provider comparison | `./scripts/run_phase.sh phase5` | [ZH](/home/weiwei.pan/code/miniONNXRuntime/docs/phases/phase5.md) / [EN](/home/weiwei.pan/code/miniONNXRuntime/docs/phases/phase5.en.md) |
+| `phase6` | minimal GPT text I/O loop | no unified script yet, use `miniort_run_gpt` / `tools/run_gpt_text.py` directly | [phase6](/Volumes/ww/code/onnxruntime/minionnxruntime/docs/phase6_gpt_text_pipeline.md) |
 
 ## Main Entry Points
 
@@ -116,6 +117,8 @@ If you want to go through the whole teaching flow in order:
 | `miniort_inspect` | graph structure, inputs/outputs, op histogram | first look at a model |
 | `miniort_session_trace` | how the first nodes execute and how values flow | learning the minimal execution pipeline |
 | `miniort_run` | full inference timing and summary | validating end-to-end execution |
+| `miniort_run_gpt` | token input, multi-step greedy generation, top-k debugging | GPT / text model path |
+| `tools/run_gpt_text.py` | prompt encoding, GPT invocation, text decoding | first semantic text I/O loop |
 | `miniort_memory_trace` | live tensors, peak bytes, release timing | understanding memory and lifetime |
 | `miniort_optimize_model` | graph before/after optimization | phase4 walkthrough |
 | `miniort_compare_providers` | default provider vs CPU-only | phase5 walkthrough |
