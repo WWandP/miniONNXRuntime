@@ -99,6 +99,7 @@ if(MINIORT_BUILD_RUNTIME_TOOLS OR MINIORT_BUILD_DETECT_TOOL OR MINIORT_BUILD_TES
     src/runtime/shape_kernels.cc
     src/runtime/session.cc
     src/tools/image_loader.cc
+    src/tools/gpt2_cache_binding.cc
   )
 
   if(APPLE)

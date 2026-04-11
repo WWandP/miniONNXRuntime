@@ -11,6 +11,7 @@
 #include "miniort/runtime/execution_context.h"
 #include "miniort/runtime/tensor.h"
 #include "miniort/runtime/session.h"
+#include "miniort/tools/gpt2_cache_binding.h"
 
 namespace {
 
@@ -48,6 +49,25 @@ Graph MakeGraphWithOps(std::initializer_list<std::string> op_types) {
     ++graph.op_type_histogram[op_type];
     graph.nodes.push_back(std::move(node));
     ++index;
+  }
+
+  return graph;
+}
+
+Graph MakeCacheGraph(std::initializer_list<std::string> output_names,
+                     std::initializer_list<std::string> input_names = {"input_ids"}) {
+  Graph graph;
+  graph.name = "cache_graph";
+
+  for (const auto& name : input_names) {
+    miniort::Value value;
+    value.name = name;
+    graph.inputs.push_back(std::move(value));
+  }
+  for (const auto& name : output_names) {
+    miniort::Value value;
+    value.name = name;
+    graph.outputs.push_back(std::move(value));
   }
 
   return graph;
@@ -151,6 +171,111 @@ void TestEmptyInt64ConstantSurvivesAndFeedsConstantOfShape() {
   Expect(output->shape.empty(), "expected ConstantOfShape([]) to produce a scalar");
   Expect(output->float_data.size() == 1, "expected ConstantOfShape scalar payload");
   Expect(output->float_data.front() == 0.0f, "expected ConstantOfShape default fill value");
+}
+
+void TestGptCacheBindingMatchesExpectedSchema() {
+  auto prefill_graph = MakeCacheGraph({
+      "logits",
+      "present.0.key",
+      "present.0.value",
+      "present.1.key",
+      "present.1.value",
+  });
+  auto decode_graph = MakeCacheGraph({
+      "logits",
+      "present.0.key",
+      "present.0.value",
+      "present.1.key",
+      "present.1.value",
+  }, {
+      "input_ids",
+      "past_key_values.0.key",
+      "past_key_values.0.value",
+      "past_key_values.1.key",
+      "past_key_values.1.value",
+  });
+
+  const auto binding = miniort::BuildCacheBinding(prefill_graph, decode_graph);
+  Expect(binding.tensors.size() == 4, "expected four cache tensor bindings");
+  Expect(binding.tensors[0].prefill_output_name == "present.0.key", "unexpected first prefill output");
+  Expect(binding.tensors[0].decode_input_name == "past_key_values.0.key", "unexpected first decode input");
+  Expect(binding.tensors[1].prefill_output_name == "present.0.value", "unexpected second prefill output");
+  Expect(binding.tensors[2].prefill_output_name == "present.1.key", "unexpected third prefill output");
+  Expect(binding.tensors[3].decode_output_name == "present.1.value", "unexpected fourth decode output");
+
+  miniort::ExecutionContext context;
+  miniort::Tensor tensor;
+  tensor.dtype = "float32";
+  tensor.shape = {1};
+
+  tensor.name = "present.0.key";
+  tensor.float_data = {1.f};
+  context.BindTensor(tensor);
+
+  tensor.name = "present.0.value";
+  tensor.float_data = {2.f};
+  context.BindTensor(tensor);
+
+  tensor.name = "present.1.key";
+  tensor.float_data = {3.f};
+  context.BindTensor(tensor);
+
+  tensor.name = "present.1.value";
+  tensor.float_data = {4.f};
+  context.BindTensor(tensor);
+
+  std::unordered_map<std::string, miniort::Tensor> cache_state;
+  miniort::CollectCacheState(context, binding, miniort::GptCacheStateSource::kPrefill, cache_state);
+  Expect(cache_state.size() == 4, "expected four cache state tensors after prefill collection");
+  Expect(cache_state.contains("past_key_values.0.key"), "expected mapped cache key");
+  Expect(cache_state.at("past_key_values.0.key").float_data.front() == 1.f, "unexpected mapped key payload");
+  Expect(cache_state.at("past_key_values.1.value").float_data.front() == 4.f, "unexpected mapped value payload");
+
+  tensor.name = "present.0.key";
+  tensor.float_data = {11.f};
+  context.BindTensor(tensor);
+  tensor.name = "present.0.value";
+  tensor.float_data = {12.f};
+  context.BindTensor(tensor);
+  tensor.name = "present.1.key";
+  tensor.float_data = {13.f};
+  context.BindTensor(tensor);
+  tensor.name = "present.1.value";
+  tensor.float_data = {14.f};
+  context.BindTensor(tensor);
+
+  miniort::CollectCacheState(context, binding, miniort::GptCacheStateSource::kDecode, cache_state);
+  Expect(cache_state.at("past_key_values.0.key").float_data.front() == 11.f,
+         "expected decode collection to refresh key payload");
+  Expect(cache_state.at("past_key_values.1.value").float_data.front() == 14.f,
+         "expected decode collection to refresh value payload");
+}
+
+void TestGptCacheBindingRejectsMalformedSchemas() {
+  auto prefill_graph = MakeCacheGraph({
+      "logits",
+      "present.0.query",
+      "present.0.value",
+  });
+  auto decode_graph = MakeCacheGraph({
+      "logits",
+      "present.0.key",
+      "present.0.value",
+  }, {
+      "input_ids",
+      "past_key_values.0.key",
+      "past_key_values.0.value",
+  });
+
+  bool threw = false;
+  try {
+    (void)miniort::BuildCacheBinding(prefill_graph, decode_graph);
+  } catch (const std::exception& ex) {
+    threw = true;
+    Expect(std::string(ex.what()).find("mismatch") != std::string::npos,
+           "expected cache binding schema validation failure");
+  }
+  Expect(threw, "expected malformed cache schema to be rejected");
 }
 
 void TestMatMulExecutionProducesExpectedOutput() {
@@ -873,6 +998,8 @@ int main() {
   TestAssignmentSummaryMarksSupportedAndUnsupportedOps();
   TestSessionRejectsUnassignedNodesWhenConfigured();
   TestRunInjectsAllocatorIntoExecutionContext();
+  TestGptCacheBindingMatchesExpectedSchema();
+  TestGptCacheBindingRejectsMalformedSchemas();
   TestEmptyInt64ConstantSurvivesAndFeedsConstantOfShape();
   TestMatMulExecutionProducesExpectedOutput();
     TestConvExecutionProducesExpectedOutput();

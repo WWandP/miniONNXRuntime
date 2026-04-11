@@ -15,6 +15,7 @@
 #include "miniort/runtime/cpu_execution_provider.h"
 #include "miniort/runtime/execution_context.h"
 #include "miniort/runtime/session.h"
+#include "miniort/tools/gpt2_cache_binding.h"
 #include "miniort/tools/gpt2_tokenizer.h"
 
 namespace {
@@ -293,42 +294,6 @@ Options ParseArgs(int argc, char* argv[]) {
   return options;
 }
 
-struct GptCacheBinding {
-  std::vector<std::string> prefill_output_names;
-  std::vector<std::string> decode_input_names;
-  std::vector<std::string> decode_output_names;
-};
-
-GptCacheBinding BuildCacheBinding(const miniort::Graph& prefill_graph, const miniort::Graph& decode_graph) {
-  if (prefill_graph.inputs.empty() || decode_graph.inputs.empty()) {
-    throw std::runtime_error("KV cache models must expose at least one input");
-  }
-  if (prefill_graph.outputs.size() < 2 || decode_graph.inputs.size() < 2 || decode_graph.outputs.size() < 2) {
-    throw std::runtime_error("KV cache models must expose logits plus cache tensors");
-  }
-
-  GptCacheBinding binding;
-  binding.prefill_output_names.reserve(prefill_graph.outputs.size() - 1);
-  binding.decode_input_names.reserve(decode_graph.inputs.size() - 1);
-  binding.decode_output_names.reserve(decode_graph.outputs.size() - 1);
-
-  for (std::size_t i = 1; i < prefill_graph.outputs.size(); ++i) {
-    binding.prefill_output_names.push_back(prefill_graph.outputs[i].name);
-  }
-  for (std::size_t i = 1; i < decode_graph.inputs.size(); ++i) {
-    binding.decode_input_names.push_back(decode_graph.inputs[i].name);
-  }
-  for (std::size_t i = 1; i < decode_graph.outputs.size(); ++i) {
-    binding.decode_output_names.push_back(decode_graph.outputs[i].name);
-  }
-
-  if (binding.prefill_output_names.size() != binding.decode_input_names.size() ||
-      binding.decode_input_names.size() != binding.decode_output_names.size()) {
-    throw std::runtime_error("KV cache input/output counts do not match");
-  }
-  return binding;
-}
-
 std::vector<std::pair<float, std::size_t>> RankLastTokenLogits(const miniort::Tensor& logits) {
   if (logits.dtype != "float32" || logits.float_data.empty() || logits.shape.size() != 3) {
     return {};
@@ -453,7 +418,7 @@ int main(int argc, char* argv[]) {
     auto prefill_session = make_session(std::move(prefill_graph));
 
     std::unique_ptr<miniort::Session> decode_session;
-    GptCacheBinding cache_binding;
+    miniort::GptCacheBinding cache_binding;
     if (options.kv_cache) {
       if (decode_model_path.empty()) {
         throw std::runtime_error("kv-cache mode requires --kv-cache-decode-model");
@@ -504,23 +469,8 @@ int main(int argc, char* argv[]) {
       }
     } else {
       miniort::ExecutionContext context;
-      const auto collect_cache_state = [&](const miniort::ExecutionContext& cache_context,
-                                           const std::vector<std::string>& output_names,
-                                           const std::vector<std::string>& input_names) {
-        cache_state.clear();
-        for (std::size_t i = 0; i < output_names.size(); ++i) {
-          const auto* tensor = cache_context.FindTensor(output_names[i]);
-          if (tensor == nullptr) {
-            throw std::runtime_error("KV cache output was not produced: " + output_names[i]);
-          }
-          auto mapped = *tensor;
-          mapped.name = input_names[i];
-          cache_state[input_names[i]] = std::move(mapped);
-        }
-      };
-
       const auto prefill_logits = run_step(*prefill_session, prefill_session->graph(), step_tokens, {}, context);
-      collect_cache_state(context, cache_binding.prefill_output_names, cache_binding.decode_input_names);
+      miniort::CollectCacheState(context, cache_binding, miniort::GptCacheStateSource::kPrefill, cache_state);
 
       if (options.generate == 0) {
         if (!options.quiet) {
@@ -541,7 +491,7 @@ int main(int argc, char* argv[]) {
           context = miniort::ExecutionContext();
           std::vector<std::int64_t> decode_tokens = step_tokens;
           const auto* logits = run_step(*decode_session, decode_session->graph(), decode_tokens, cache_state, context);
-          collect_cache_state(context, cache_binding.decode_output_names, cache_binding.decode_input_names);
+          miniort::CollectCacheState(context, cache_binding, miniort::GptCacheStateSource::kDecode, cache_state);
 
           if (step == options.generate) {
             if (!options.quiet) {
