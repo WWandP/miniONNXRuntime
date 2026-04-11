@@ -109,6 +109,9 @@ cmake --build build_local -j4
 | `phase4` | 图优化与内存观察 | `./scripts/run_phase.sh phase4-opt` / `phase4-memory` | [phase4](/home/weiwei.pan/code/miniONNXRuntime/docs/phases/phase4.md) / [EN](/home/weiwei.pan/code/miniONNXRuntime/docs/phases/phase4.en.md) |
 | `phase5` | `ExecutionProvider` 抽象与 provider 对比 | `./scripts/run_phase.sh phase5` | [phase5](/home/weiwei.pan/code/miniONNXRuntime/docs/phases/phase5.md) / [EN](/home/weiwei.pan/code/miniONNXRuntime/docs/phases/phase5.en.md) |
 | `phase6` | GPT 文本输入输出最小闭环 | 暂无统一脚本，直接用 `miniort_run_gpt` / `tools/run_gpt_text.py` | [phase6](/Volumes/ww/code/onnxruntime/minionnxruntime/docs/phase6_gpt_text_pipeline.md) |
+| `phase5-gpt2-mac` | GPT-2 macOS EP baseline 和算子优化记录 | `./build_phase4/miniort_run_gpt ...` | [baseline](/Volumes/ww/code/onnxruntime/minionnxruntime/docs/phase5_gpt2_mac_accelerate_baseline.md) |
+| `phase5-gpt2-kv-cache` | GPT-2 KV cache 接口和对比路径 | `./build_phase4/miniort_run_gpt --kv-cache ...` | [kv cache](/Volumes/ww/code/onnxruntime/minionnxruntime/docs/phase5_gpt2_kv_cache_bringup.md) |
+| `phase5-gpt2-dev-journal` | GPT-2 从 baseline、EP 优化到 KV cache 的完整开发过程与对比记录 | `./build_phase4/miniort_run_gpt ...` | [dev journal](/Volumes/ww/code/onnxruntime/minionnxruntime/docs/phase5_gpt2_development_journal.md) |
 
 ## 主要入口
 
@@ -117,11 +120,12 @@ cmake --build build_local -j4
 | `miniort_inspect` | 图结构、输入输出、op histogram | 第一次看模型 |
 | `miniort_session_trace` | 前几个节点如何执行、value 怎么流转 | 学最小执行主线 |
 | `miniort_run` | 一次完整推理的 timing 和 summary | 验证整图执行 |
-| `miniort_run_gpt` | token 输入、多步贪心生成、top-k 调试 | 看 GPT / 文本模型主线 |
-| `tools/run_gpt_text.py` | 文本 prompt 编码、调用 GPT 入口、文本解码 | 跑第一版语义化输入输出 |
+| `miniort_run_gpt` | token 输入、文本 prompt 输入、多步贪心生成、top-k 调试 | 看 GPT / 文本模型主线 |
+| `tools/run_gpt_text.py` | Python 文本包装入口 | 对照旧版文本链路 |
 | `miniort_memory_trace` | live tensor、peak bytes、释放时机 | 看内存与生命周期 |
 | `miniort_optimize_model` | 优化前后图差异、优化后再运行 | 看 phase4 |
 | `miniort_compare_providers` | 默认 provider 和 CPU-only 的差异 | 看 phase5 |
+| `tools/plot_gpt2_timing_svg.py` | 从 `miniort_run_gpt` 日志生成折线图 SVG | 画 KV cache / baseline 趋势图 |
 | `miniort_detect_yolov8n` | 最终检测结果和输出文件 | 看 demo 效果 |
 
 ## 仓库结构

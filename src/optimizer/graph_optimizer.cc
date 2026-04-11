@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <deque>
+#include <cstring>
 #include <functional>
 #include <limits>
 #include <onnx/onnx_pb.h>
@@ -28,6 +29,43 @@ Tensor MakeRuntimeTensorFromTensorData(std::string name, const TensorData& data)
   tensor.int64_data = data.int64_data;
   tensor.is_placeholder = false;
   tensor.is_initializer = true;
+
+  if (tensor.dtype == "int32" && tensor.int64_data.empty()) {
+    if (!data.int32_data.empty()) {
+      tensor.int64_data.reserve(data.int32_data.size());
+      for (const auto value : data.int32_data) {
+        tensor.int64_data.push_back(static_cast<std::int64_t>(value));
+      }
+    } else if (!data.raw_data.empty() && data.raw_data.size() % sizeof(std::int32_t) == 0) {
+      const auto count = data.raw_data.size() / sizeof(std::int32_t);
+      tensor.int64_data.reserve(count);
+      for (std::size_t i = 0; i < count; ++i) {
+        std::int32_t value = 0;
+        std::memcpy(&value, data.raw_data.data() + i * sizeof(std::int32_t), sizeof(std::int32_t));
+        tensor.int64_data.push_back(static_cast<std::int64_t>(value));
+      }
+    }
+    tensor.dtype = "int64";
+  }
+
+  if (!data.raw_data.empty()) {
+    if (tensor.dtype == "float32" && tensor.float_data.empty() &&
+        data.raw_data.size() % sizeof(float) == 0) {
+      tensor.float_data.resize(data.raw_data.size() / sizeof(float));
+      std::memcpy(tensor.float_data.data(), data.raw_data.data(), data.raw_data.size());
+    } else if (tensor.dtype == "int64" && tensor.int64_data.empty() &&
+               data.raw_data.size() % sizeof(std::int64_t) == 0) {
+      tensor.int64_data.resize(data.raw_data.size() / sizeof(std::int64_t));
+      std::memcpy(tensor.int64_data.data(), data.raw_data.data(), data.raw_data.size());
+    } else if (tensor.dtype == "bool" && tensor.int64_data.empty()) {
+      tensor.int64_data.resize(data.raw_data.size());
+      for (std::size_t i = 0; i < data.raw_data.size(); ++i) {
+        tensor.int64_data[i] = data.raw_data[i] == 0 ? 0 : 1;
+      }
+      tensor.dtype = "int64";
+    }
+  }
+
   return tensor;
 }
 

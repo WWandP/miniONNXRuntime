@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <functional>
 #include <stdexcept>
 #include <string>
@@ -120,6 +121,33 @@ inline Tensor MakeTensorFromDataWithReusedStorage(const std::string& name, const
   tensor.dtype = source.dtype.empty() ? "unknown" : source.dtype;
   tensor.shape = source.shape;
   tensor.is_placeholder = false;
+  const auto element_count = GetElementCount(source.shape);
+
+  if (tensor.dtype == "int32") {
+    tensor.dtype = "int64";
+    if (!source.int32_data.empty()) {
+      tensor.int64_data = context.AcquireInt64Buffer(source.int32_data.size());
+      tensor.int64_data.resize(source.int32_data.size());
+      std::transform(source.int32_data.begin(), source.int32_data.end(), tensor.int64_data.begin(),
+                     [](std::int32_t value) { return static_cast<std::int64_t>(value); });
+      return tensor;
+    }
+    if (!source.raw_data.empty() && source.raw_data.size() % sizeof(std::int32_t) == 0) {
+      const auto count = source.raw_data.size() / sizeof(std::int32_t);
+      tensor.int64_data = context.AcquireInt64Buffer(count);
+      tensor.int64_data.resize(count);
+      for (std::size_t i = 0; i < count; ++i) {
+        std::int32_t value = 0;
+        std::memcpy(&value, source.raw_data.data() + i * sizeof(std::int32_t), sizeof(std::int32_t));
+        tensor.int64_data[i] = static_cast<std::int64_t>(value);
+      }
+      return tensor;
+    }
+    if (element_count == 0) {
+      tensor.int64_data.clear();
+      return tensor;
+    }
+  }
 
   if (source.dtype == "float32" && !source.float_data.empty()) {
     tensor.float_data = context.AcquireFloatBuffer(source.float_data.size());
@@ -129,6 +157,16 @@ inline Tensor MakeTensorFromDataWithReusedStorage(const std::string& name, const
     tensor.int64_data = context.AcquireInt64Buffer(source.int64_data.size());
     tensor.int64_data.resize(source.int64_data.size());
     std::copy(source.int64_data.begin(), source.int64_data.end(), tensor.int64_data.begin());
+  } else if (source.dtype == "int32" && !source.int32_data.empty()) {
+    tensor.int64_data = context.AcquireInt64Buffer(source.int32_data.size());
+    tensor.int64_data.resize(source.int32_data.size());
+    std::transform(source.int32_data.begin(), source.int32_data.end(), tensor.int64_data.begin(),
+                   [](std::int32_t value) { return static_cast<std::int64_t>(value); });
+  } else if ((source.dtype == "float32" || source.dtype == "int64" || source.dtype == "int32") &&
+             element_count == 0) {
+    if (source.dtype == "int32") {
+      tensor.dtype = "int64";
+    }
   } else {
     tensor.is_placeholder = true;
   }
@@ -156,14 +194,20 @@ inline void EnsureSameShape(const Tensor& lhs, const Tensor& rhs, const std::str
 }
 
 inline const std::vector<float>& RequireFloatData(const Tensor& tensor, const std::string& op_type) {
-  if (tensor.dtype != "float32" || tensor.float_data.empty()) {
+  if (tensor.dtype != "float32") {
+    throw std::runtime_error(op_type + " requires float32 tensor data: " + tensor.name);
+  }
+  if (tensor.float_data.empty() && GetElementCount(tensor.shape) != 0) {
     throw std::runtime_error(op_type + " requires float32 tensor data: " + tensor.name);
   }
   return tensor.float_data;
 }
 
 inline const std::vector<std::int64_t>& RequireInt64Data(const Tensor& tensor, const std::string& op_type) {
-  if (tensor.dtype != "int64" || tensor.int64_data.empty()) {
+  if (tensor.dtype != "int64") {
+    throw std::runtime_error(op_type + " requires int64 tensor data: " + tensor.name);
+  }
+  if (tensor.int64_data.empty() && GetElementCount(tensor.shape) != 0) {
     throw std::runtime_error(op_type + " requires int64 tensor data: " + tensor.name);
   }
   return tensor.int64_data;
@@ -335,9 +379,15 @@ inline std::int64_t ReadScalarAsInt64(const Tensor& tensor, const std::string& o
 
 inline std::vector<std::int64_t> ReadVectorAsInt64(const Tensor& tensor, const std::string& op_type) {
   if (tensor.dtype == "int64") {
+    if (tensor.int64_data.empty() && GetElementCount(tensor.shape) == 0) {
+      return {};
+    }
     return RequireInt64Data(tensor, op_type);
   }
   if (tensor.dtype == "float32") {
+    if (tensor.float_data.empty() && GetElementCount(tensor.shape) == 0) {
+      return {};
+    }
     const auto& data = RequireFloatData(tensor, op_type);
     std::vector<std::int64_t> converted;
     converted.reserve(data.size());
@@ -380,6 +430,8 @@ inline Tensor ConcatTensors(const Node& node, ExecutionContext* context, std::os
     for (std::size_t i = 0; i < input.shape.size(); ++i) {
       if (i == static_cast<std::size_t>(axis)) {
         output_shape[i] += input.shape[i];
+      } else if (input.shape[i] < 0 || output_shape[i] < 0) {
+        output_shape[i] = std::max(output_shape[i], input.shape[i]);
       } else if (input.shape[i] != output_shape[i]) {
         throw std::runtime_error("Concat currently requires matching non-axis dimensions");
       }

@@ -91,6 +91,7 @@ if(MINIORT_BUILD_RUNTIME_TOOLS OR MINIORT_BUILD_DETECT_TOOL OR MINIORT_BUILD_TES
     src/runtime/memory_profile.cc
     src/optimizer/graph_optimizer.cc
     src/tools/yolo_detection.cc
+    src/tools/gpt2_tokenizer.cc
     src/runtime/basic_kernels.cc
     src/runtime/builtin_kernels.cc
     src/runtime/elementwise_kernels.cc

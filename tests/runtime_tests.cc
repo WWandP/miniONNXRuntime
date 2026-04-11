@@ -106,6 +106,53 @@ void TestRunInjectsAllocatorIntoExecutionContext() {
   Expect(context.HasAllocator(), "expected session to inject allocator during run");
 }
 
+void TestEmptyInt64ConstantSurvivesAndFeedsConstantOfShape() {
+  Graph graph;
+  graph.name = "empty_constant_graph";
+
+  Node constant;
+  constant.name = "empty_shape";
+  constant.op_type = "Constant";
+  constant.outputs = {"empty_shape"};
+  miniort::TensorData shape_attr;
+  shape_attr.dtype = "int64";
+  shape_attr.shape = {0};
+  constant.attributes["value"].tensor = shape_attr;
+
+  Node cos;
+  cos.name = "filled";
+  cos.op_type = "ConstantOfShape";
+  cos.inputs = {"empty_shape"};
+  cos.outputs = {"filled"};
+
+  graph.node_name_to_index[constant.name] = 0;
+  graph.node_name_to_index[cos.name] = 1;
+  graph.topological_order = {0, 1};
+  graph.nodes.push_back(std::move(constant));
+  graph.nodes.push_back(std::move(cos));
+
+  Session session = MakeCpuSession(std::move(graph), SessionOptions{});
+  miniort::ExecutionContext context;
+  const auto summary = session.Run({}, context, nullptr);
+
+  Expect(summary.executed_nodes == 2, "expected constant and ConstantOfShape to execute");
+
+  const auto* shape_tensor = context.FindTensor("empty_shape");
+  Expect(shape_tensor != nullptr, "expected empty_shape tensor to exist");
+  Expect(shape_tensor->dtype == "int64", "expected empty_shape dtype=int64");
+  Expect(shape_tensor->shape.size() == 1 && shape_tensor->shape.front() == 0,
+         "expected empty_shape to keep its zero-length shape");
+  Expect(!shape_tensor->is_placeholder, "expected empty_shape to be materialized");
+  Expect(shape_tensor->int64_data.empty(), "expected empty_shape to have no int64 payload");
+
+  const auto* output = context.FindTensor("filled");
+  Expect(output != nullptr, "expected ConstantOfShape output to exist");
+  Expect(output->dtype == "float32", "expected ConstantOfShape output dtype=float32");
+  Expect(output->shape.empty(), "expected ConstantOfShape([]) to produce a scalar");
+  Expect(output->float_data.size() == 1, "expected ConstantOfShape scalar payload");
+  Expect(output->float_data.front() == 0.0f, "expected ConstantOfShape default fill value");
+}
+
 void TestMatMulExecutionProducesExpectedOutput() {
   auto graph = MakeGraphWithOps({"MatMul"});
   graph.nodes[0].inputs = {"a", "b"};
@@ -574,16 +621,260 @@ void TestAppleDefaultProvidersPreferAccelerateForSupportedOps() {
   Expect(session.assignment_summary().provider_node_counts.at("Accelerate") == 10,
          "expected Accelerate to own ten nodes");
 }
+
+void TestAppleAccelerateSupportsGpt2HotPathOps() {
+  auto graph = MakeGraphWithOps({"Add", "Tanh", "Softmax", "Where", "Gather", "Pow", "LayerNormalization", "MatMul"});
+  graph.nodes[0].inputs = {"lhs", "rhs"};
+  graph.nodes[1].inputs = {"tanh_x"};
+  graph.nodes[2].inputs = {"softmax_x"};
+  graph.nodes[3].inputs = {"cond", "where_x", "where_y"};
+  graph.nodes[4].inputs = {"table", "indices"};
+  graph.nodes[5].inputs = {"pow_x", "pow_y"};
+  graph.nodes[6].inputs = {"ln_x", "ln_scale", "ln_bias"};
+  graph.nodes[7].inputs = {"a", "b"};
+
+  miniort::Tensor lhs;
+  lhs.name = "lhs";
+  lhs.dtype = "float32";
+  lhs.shape = {2, 3};
+  lhs.float_data = {1.f, 2.f, 3.f,
+                    4.f, 5.f, 6.f};
+
+  miniort::Tensor rhs;
+  rhs.name = "rhs";
+  rhs.dtype = "float32";
+  rhs.shape = {3};
+  rhs.float_data = {10.f, 20.f, 30.f};
+
+  miniort::Tensor tanh_x;
+  tanh_x.name = "tanh_x";
+  tanh_x.dtype = "float32";
+  tanh_x.shape = {3};
+  tanh_x.float_data = {-1.f, 0.f, 1.f};
+
+  miniort::Tensor softmax_x;
+  softmax_x.name = "softmax_x";
+  softmax_x.dtype = "float32";
+  softmax_x.shape = {2, 2};
+  softmax_x.float_data = {1.f, 2.f, 3.f, 4.f};
+
+  miniort::Tensor cond;
+  cond.name = "cond";
+  cond.dtype = "int64";
+  cond.shape = {2, 2};
+  cond.int64_data = {1, 0, 0, 1};
+
+  miniort::Tensor where_x;
+  where_x.name = "where_x";
+  where_x.dtype = "float32";
+  where_x.shape = {2, 2};
+  where_x.float_data = {1.f, 2.f, 3.f, 4.f};
+
+  miniort::Tensor where_y;
+  where_y.name = "where_y";
+  where_y.dtype = "float32";
+  where_y.shape = {2, 2};
+  where_y.float_data = {5.f, 6.f, 7.f, 8.f};
+
+  miniort::Tensor table;
+  table.name = "table";
+  table.dtype = "float32";
+  table.shape = {4, 3};
+  table.float_data = {
+      1.f, 2.f, 3.f,
+      4.f, 5.f, 6.f,
+      7.f, 8.f, 9.f,
+      10.f, 11.f, 12.f,
+  };
+
+  miniort::Tensor indices;
+  indices.name = "indices";
+  indices.dtype = "int64";
+  indices.shape = {2};
+  indices.int64_data = {2, 0};
+
+  miniort::Tensor pow_x;
+  pow_x.name = "pow_x";
+  pow_x.dtype = "float32";
+  pow_x.shape = {3};
+  pow_x.float_data = {2.f, 3.f, 4.f};
+
+  miniort::Tensor pow_y;
+  pow_y.name = "pow_y";
+  pow_y.dtype = "float32";
+  pow_y.shape = {3};
+  pow_y.float_data = {3.f, 2.f, 1.f};
+
+  miniort::Tensor ln_x;
+  ln_x.name = "ln_x";
+  ln_x.dtype = "float32";
+  ln_x.shape = {2, 2};
+  ln_x.float_data = {1.f, 3.f, 2.f, 4.f};
+
+  miniort::Tensor ln_scale;
+  ln_scale.name = "ln_scale";
+  ln_scale.dtype = "float32";
+  ln_scale.shape = {2};
+  ln_scale.float_data = {1.f, 1.f};
+
+  miniort::Tensor ln_bias;
+  ln_bias.name = "ln_bias";
+  ln_bias.dtype = "float32";
+  ln_bias.shape = {2};
+  ln_bias.float_data = {0.f, 0.f};
+
+  miniort::Tensor x;
+  x.name = "x";
+  x.dtype = "float32";
+  x.shape = {2, 2};
+  x.float_data = {1.f, 3.f,
+                  2.f, 4.f};
+
+  miniort::Tensor scale;
+  scale.name = "scale";
+  scale.dtype = "float32";
+  scale.shape = {2};
+  scale.float_data = {1.f, 1.f};
+
+  miniort::Tensor bias;
+  bias.name = "bias";
+  bias.dtype = "float32";
+  bias.shape = {2};
+  bias.float_data = {0.f, 0.f};
+
+  miniort::Tensor a;
+  a.name = "a";
+  a.dtype = "float32";
+  a.shape = {1, 2, 2, 3};
+  a.float_data = {
+      1.f, 2.f, 3.f,
+      4.f, 5.f, 6.f,
+      7.f, 8.f, 9.f,
+      10.f, 11.f, 12.f,
+  };
+
+  miniort::Tensor b;
+  b.name = "b";
+  b.dtype = "float32";
+  b.shape = {1, 2, 3, 2};
+  b.float_data = {
+      1.f, 2.f,
+      3.f, 4.f,
+      5.f, 6.f,
+      7.f, 8.f,
+      9.f, 10.f,
+      11.f, 12.f,
+  };
+
+  Session session(std::move(graph), SessionOptions{});
+  for (const auto& node : session.graph().nodes) {
+    Expect(node.execution_provider == "Accelerate", "expected GPT-2 hot path ops to prefer Accelerate");
+  }
+
+  miniort::ExecutionContext context;
+  std::unordered_map<std::string, miniort::Tensor> feeds;
+  feeds.emplace(lhs.name, lhs);
+  feeds.emplace(rhs.name, rhs);
+  feeds.emplace(tanh_x.name, tanh_x);
+  feeds.emplace(softmax_x.name, softmax_x);
+  feeds.emplace(cond.name, cond);
+  feeds.emplace(where_x.name, where_x);
+  feeds.emplace(where_y.name, where_y);
+  feeds.emplace(table.name, table);
+  feeds.emplace(indices.name, indices);
+  feeds.emplace(pow_x.name, pow_x);
+  feeds.emplace(pow_y.name, pow_y);
+  feeds.emplace(ln_x.name, ln_x);
+  feeds.emplace(ln_scale.name, ln_scale);
+  feeds.emplace(ln_bias.name, ln_bias);
+  feeds.emplace(a.name, a);
+  feeds.emplace(b.name, b);
+
+  const auto summary = session.Run(feeds, context, nullptr);
+  Expect(summary.executed_nodes == 8, "expected GPT-2 hot path graph to execute eight nodes");
+
+  const auto* add_output = context.FindTensor("out_0");
+  Expect(add_output != nullptr, "expected broadcast Add output tensor");
+  const std::vector<float> expected_add = {11.f, 22.f, 33.f, 14.f, 25.f, 36.f};
+  Expect(add_output->float_data == expected_add, "unexpected broadcast Add output");
+
+  const auto* tanh_output = context.FindTensor("out_1");
+  Expect(tanh_output != nullptr, "expected Tanh output tensor");
+  for (std::size_t i = 0; i < tanh_x.float_data.size(); ++i) {
+    Expect(std::fabs(tanh_output->float_data[i] - std::tanh(tanh_x.float_data[i])) < 1e-5f,
+           "unexpected Accelerate Tanh output");
+  }
+
+  const auto* softmax_output = context.FindTensor("out_2");
+  Expect(softmax_output != nullptr, "expected Softmax output tensor");
+  const float e1 = std::exp(1.f);
+  const float e2 = std::exp(2.f);
+  const float e3 = std::exp(3.f);
+  const float e4 = std::exp(4.f);
+  const std::vector<float> expected_softmax = {
+      e1 / (e1 + e2), e2 / (e1 + e2),
+      e3 / (e3 + e4), e4 / (e3 + e4),
+  };
+  for (std::size_t i = 0; i < expected_softmax.size(); ++i) {
+    Expect(std::fabs(softmax_output->float_data[i] - expected_softmax[i]) < 1e-5f,
+           "unexpected Accelerate Softmax output");
+  }
+
+  const auto* where_output = context.FindTensor("out_3");
+  Expect(where_output != nullptr, "expected Where output tensor");
+  const std::vector<float> expected_where = {1.f, 6.f, 7.f, 4.f};
+  Expect(where_output->float_data == expected_where, "unexpected Accelerate Where output");
+
+  const auto* gather_output = context.FindTensor("out_4");
+  Expect(gather_output != nullptr, "expected Gather output tensor");
+  const std::vector<float> expected_gather = {
+      7.f, 8.f, 9.f,
+      1.f, 2.f, 3.f,
+  };
+  Expect(gather_output->float_data == expected_gather, "unexpected Accelerate Gather output");
+
+  const auto* pow_output = context.FindTensor("out_5");
+  Expect(pow_output != nullptr, "expected Pow output tensor");
+  const std::vector<float> expected_pow = {8.f, 9.f, 4.f};
+  for (std::size_t i = 0; i < expected_pow.size(); ++i) {
+    Expect(std::fabs(pow_output->float_data[i] - expected_pow[i]) < 1e-5f,
+           "unexpected Accelerate Pow output");
+  }
+
+  const auto* ln_output = context.FindTensor("out_6");
+  Expect(ln_output != nullptr, "expected LayerNormalization output tensor");
+  const float inv_stddev = 1.0f / std::sqrt(1.0f + 1e-5f);
+  const std::vector<float> expected_ln = {-inv_stddev, inv_stddev, -inv_stddev, inv_stddev};
+  for (std::size_t i = 0; i < expected_ln.size(); ++i) {
+    Expect(std::fabs(ln_output->float_data[i] - expected_ln[i]) < 1e-4f,
+           "unexpected Accelerate LayerNormalization output");
+  }
+
+  const auto* mm_output = context.FindTensor("out_7");
+  Expect(mm_output != nullptr, "expected batched MatMul output tensor");
+  Expect(mm_output->shape == std::vector<std::int64_t>({1, 2, 2, 2}), "expected batched MatMul output shape");
+  const std::vector<float> expected_mm = {
+      22.f, 28.f,
+      49.f, 64.f,
+      220.f, 244.f,
+      301.f, 334.f,
+  };
+  for (std::size_t i = 0; i < expected_mm.size(); ++i) {
+    Expect(std::fabs(mm_output->float_data[i] - expected_mm[i]) < 1e-5f,
+           "unexpected Accelerate batched MatMul output");
+  }
+}
 #endif
 
 }  // namespace
 
 int main() {
   try {
-    TestAssignmentSummaryMarksSupportedAndUnsupportedOps();
-    TestSessionRejectsUnassignedNodesWhenConfigured();
-    TestRunInjectsAllocatorIntoExecutionContext();
-    TestMatMulExecutionProducesExpectedOutput();
+  TestAssignmentSummaryMarksSupportedAndUnsupportedOps();
+  TestSessionRejectsUnassignedNodesWhenConfigured();
+  TestRunInjectsAllocatorIntoExecutionContext();
+  TestEmptyInt64ConstantSurvivesAndFeedsConstantOfShape();
+  TestMatMulExecutionProducesExpectedOutput();
     TestConvExecutionProducesExpectedOutput();
     TestGemmExecutionProducesExpectedOutput();
     TestSiLUExecutionProducesExpectedOutput();
@@ -597,6 +888,7 @@ int main() {
     TestGatherExecutionSupportsNonZeroAxis();
 #if defined(__APPLE__)
     TestAppleDefaultProvidersPreferAccelerateForSupportedOps();
+    TestAppleAccelerateSupportsGpt2HotPathOps();
 #endif
     std::cout << "runtime_tests: ok\n";
     return 0;

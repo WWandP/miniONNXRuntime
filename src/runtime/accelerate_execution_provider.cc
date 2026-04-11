@@ -2,7 +2,11 @@
 
 #include <Accelerate/Accelerate.h>
 
+#include <algorithm>
+#include <cmath>
+#include <cstring>
 #include <cstdint>
+#include <limits>
 #include <stdexcept>
 #include <vector>
 
@@ -147,6 +151,506 @@ void ApplySiLUInPlaceAccelerate(Tensor& output) {
   vDSP_vadd(ones.data(), 1, exp_values.data(), 1, denom.data(), 1, output.float_data.size());
   vvrecf(sigmoid.data(), denom.data(), &element_count);
   vDSP_vmul(output.float_data.data(), 1, sigmoid.data(), 1, output.float_data.data(), 1, output.float_data.size());
+}
+
+template <typename FloatOp>
+void ApplyFloatBroadcastOp(Tensor& output, const Tensor& lhs, const Tensor& rhs, FloatOp&& op) {
+  if (lhs.dtype != "float32" || rhs.dtype != "float32") {
+    throw std::runtime_error("Accelerate broadcast op currently supports float32 only");
+  }
+
+  const auto lhs_data = RequireFloatData(lhs, "Accelerate");
+  const auto rhs_data = RequireFloatData(rhs, "Accelerate");
+  const auto output_shape = ComputeBroadcastShape(lhs.shape, rhs.shape, "Accelerate");
+  if (output_shape != output.shape) {
+    throw std::runtime_error("broadcast output shape mismatch");
+  }
+  if (output.shape.empty()) {
+    output.float_data[0] = op(lhs_data[0], rhs_data[0]);
+    return;
+  }
+
+  const auto output_inner = static_cast<std::size_t>(output.shape.back());
+  std::size_t output_outer = 1;
+  for (std::size_t i = 0; i + 1 < output.shape.size(); ++i) {
+    output_outer *= static_cast<std::size_t>(output.shape[i]);
+  }
+
+  const bool lhs_scalar = lhs.shape.empty();
+  const bool rhs_scalar = rhs.shape.empty();
+  const bool lhs_vector = lhs.shape.size() == 1 && static_cast<std::size_t>(lhs.shape[0]) == output_inner;
+  const bool rhs_vector = rhs.shape.size() == 1 && static_cast<std::size_t>(rhs.shape[0]) == output_inner;
+
+  if (lhs_scalar && rhs_scalar) {
+    output.float_data[0] = op(lhs_data[0], rhs_data[0]);
+    return;
+  }
+
+  if (lhs_scalar) {
+    const float scalar = lhs_data[0];
+    for (std::size_t i = 0; i < output.float_data.size(); ++i) {
+      output.float_data[i] = op(scalar, rhs_data[i]);
+    }
+    return;
+  }
+
+  if (rhs_scalar) {
+    const float scalar = rhs_data[0];
+    for (std::size_t i = 0; i < output.float_data.size(); ++i) {
+      output.float_data[i] = op(lhs_data[i], scalar);
+    }
+    return;
+  }
+
+  if (lhs.shape == rhs.shape && lhs.shape == output.shape) {
+    for (std::size_t i = 0; i < output.float_data.size(); ++i) {
+      output.float_data[i] = op(lhs_data[i], rhs_data[i]);
+    }
+    return;
+  }
+
+  if (lhs_vector && rhs.shape == output.shape) {
+    for (std::size_t outer = 0; outer < output_outer; ++outer) {
+      const auto base = outer * output_inner;
+      for (std::size_t i = 0; i < output_inner; ++i) {
+        output.float_data[base + i] = op(lhs_data[i], rhs_data[base + i]);
+      }
+    }
+    return;
+  }
+
+  if (rhs_vector && lhs.shape == output.shape) {
+    for (std::size_t outer = 0; outer < output_outer; ++outer) {
+      const auto base = outer * output_inner;
+      for (std::size_t i = 0; i < output_inner; ++i) {
+        output.float_data[base + i] = op(lhs_data[base + i], rhs_data[i]);
+      }
+    }
+    return;
+  }
+
+  const auto output_strides = ComputeStrides(output.shape);
+  const auto lhs_strides = ComputeStrides(lhs.shape);
+  const auto rhs_strides = ComputeStrides(rhs.shape);
+  for (std::size_t i = 0; i < output.float_data.size(); ++i) {
+    const auto output_index = UnravelIndex(i, output.shape, output_strides);
+    const auto lhs_offset = ComputeBroadcastOffset(output_index, lhs.shape, lhs_strides);
+    const auto rhs_offset = ComputeBroadcastOffset(output_index, rhs.shape, rhs_strides);
+    output.float_data[i] = op(lhs_data[lhs_offset], rhs_data[rhs_offset]);
+  }
+}
+
+Tensor RunLayerNormalizationAccelerate(const Node& node, const Tensor& input, const Tensor& scale, const Tensor& bias,
+                                       ExecutionContext& context) {
+  const auto& input_data = RequireFloatData(input, "LayerNormalization");
+  const auto& scale_data = RequireFloatData(scale, "LayerNormalization");
+  const auto& bias_data = RequireFloatData(bias, "LayerNormalization");
+  const auto axis =
+      static_cast<std::size_t>(NormalizeAxis(ReadIntAttribute(node, "axis", -1), input.shape.size(), "LayerNormalization"));
+  const auto epsilon_it = node.attributes.find("epsilon");
+  const float epsilon = epsilon_it == node.attributes.end() ? 1e-5f : epsilon_it->second.float_value;
+
+  std::size_t outer = 1;
+  for (std::size_t i = 0; i < axis; ++i) {
+    outer *= static_cast<std::size_t>(input.shape[i]);
+  }
+  std::size_t normalized_size = 1;
+  for (std::size_t i = axis; i < input.shape.size(); ++i) {
+    normalized_size *= static_cast<std::size_t>(input.shape[i]);
+  }
+
+  if (scale_data.size() != normalized_size || bias_data.size() != normalized_size) {
+    throw std::runtime_error("LayerNormalization scale/bias shape mismatch");
+  }
+
+  auto output = MakeOutputLikeWithReusedStorage(node.outputs.at(0), input, context);
+  for (std::size_t outer_index = 0; outer_index < outer; ++outer_index) {
+    const auto base = outer_index * normalized_size;
+    float mean = 0.0f;
+    for (std::size_t i = 0; i < normalized_size; ++i) {
+      mean += input_data[base + i];
+    }
+    mean /= static_cast<float>(normalized_size);
+
+    float variance = 0.0f;
+    for (std::size_t i = 0; i < normalized_size; ++i) {
+      const auto diff = input_data[base + i] - mean;
+      variance += diff * diff;
+    }
+    variance /= static_cast<float>(normalized_size);
+    const float inv_stddev = 1.0f / std::sqrt(variance + epsilon);
+
+    for (std::size_t i = 0; i < normalized_size; ++i) {
+      output.float_data[base + i] =
+          ((input_data[base + i] - mean) * inv_stddev) * scale_data[i] + bias_data[i];
+    }
+  }
+
+  return output;
+}
+
+Tensor RunMatMulAccelerate(const Node& node, const Tensor& lhs, const Tensor& rhs, ExecutionContext& context) {
+  const auto& lhs_data = RequireFloatData(lhs, "MatMul");
+  const auto& rhs_data = RequireFloatData(rhs, "MatMul");
+  if (lhs.shape.size() < 2 || rhs.shape.size() < 2) {
+    throw std::runtime_error("MatMul currently requires rank >= 2 float32 tensors");
+  }
+
+  const auto m = static_cast<std::size_t>(lhs.shape[lhs.shape.size() - 2]);
+  const auto k = static_cast<std::size_t>(lhs.shape[lhs.shape.size() - 1]);
+  const auto rhs_k = static_cast<std::size_t>(rhs.shape[rhs.shape.size() - 2]);
+  const auto n = static_cast<std::size_t>(rhs.shape[rhs.shape.size() - 1]);
+  if (k != rhs_k) {
+    throw std::runtime_error("MatMul inner dimensions do not match");
+  }
+
+  const std::vector<std::int64_t> lhs_batch_shape(lhs.shape.begin(), lhs.shape.end() - 2);
+  const std::vector<std::int64_t> rhs_batch_shape(rhs.shape.begin(), rhs.shape.end() - 2);
+  const auto output_batch_shape = ComputeBroadcastShape(lhs_batch_shape, rhs_batch_shape, "MatMul");
+
+  std::vector<std::int64_t> output_shape = output_batch_shape;
+  output_shape.push_back(static_cast<std::int64_t>(m));
+  output_shape.push_back(static_cast<std::int64_t>(n));
+  auto output = MakeFloatOutput(node.outputs.at(0), output_shape, context);
+
+  const auto output_batch_strides = ComputeStrides(output_batch_shape);
+  const auto lhs_full_strides = ComputeStrides(lhs.shape);
+  const auto rhs_full_strides = ComputeStrides(rhs.shape);
+  const auto batch_count = GetElementCount(output_batch_shape);
+
+  for (std::size_t batch = 0; batch < batch_count; ++batch) {
+    const auto batch_index = UnravelIndex(batch, output_batch_shape, output_batch_strides);
+    const auto lhs_batch_offset =
+        lhs_batch_shape.empty() ? 0 : ComputeBroadcastOffset(batch_index, lhs_batch_shape, lhs_full_strides);
+    const auto rhs_batch_offset =
+        rhs_batch_shape.empty() ? 0 : ComputeBroadcastOffset(batch_index, rhs_batch_shape, rhs_full_strides);
+
+    const auto lhs_base = lhs_batch_shape.empty() ? 0 : lhs_batch_offset;
+    const auto rhs_base = rhs_batch_shape.empty() ? 0 : rhs_batch_offset;
+    const auto out_base = batch * m * n;
+
+    cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
+                static_cast<int>(m), static_cast<int>(n), static_cast<int>(k),
+                1.0f,
+                lhs_data.data() + lhs_base, static_cast<int>(k),
+                rhs_data.data() + rhs_base, static_cast<int>(n),
+                0.0f,
+                output.float_data.data() + out_base, static_cast<int>(n));
+  }
+
+  return output;
+}
+
+Tensor RunGatherAccelerate(const Node& node, const Tensor& data, const Tensor& indices, ExecutionContext& context) {
+  const auto axis = NormalizeAxis(ReadIntAttribute(node, "axis", 0), data.shape.size(), "Gather");
+  const auto& index_data = RequireInt64Data(indices, "Gather");
+  std::vector<std::int64_t> output_shape;
+  output_shape.reserve(data.shape.size() + indices.shape.size());
+  for (std::size_t i = 0; i < static_cast<std::size_t>(axis); ++i) {
+    output_shape.push_back(data.shape[i]);
+  }
+  output_shape.insert(output_shape.end(), indices.shape.begin(), indices.shape.end());
+  for (std::size_t i = static_cast<std::size_t>(axis) + 1; i < data.shape.size(); ++i) {
+    output_shape.push_back(data.shape[i]);
+  }
+
+  std::size_t outer = 1;
+  for (std::size_t i = 0; i < static_cast<std::size_t>(axis); ++i) {
+    outer *= static_cast<std::size_t>(data.shape[i]);
+  }
+  const auto axis_dim = static_cast<std::size_t>(data.shape[static_cast<std::size_t>(axis)]);
+  std::size_t inner = 1;
+  for (std::size_t i = static_cast<std::size_t>(axis) + 1; i < data.shape.size(); ++i) {
+    inner *= static_cast<std::size_t>(data.shape[i]);
+  }
+
+  const auto normalize_index = [&](std::int64_t index) -> std::size_t {
+    if (index < 0) {
+      index += static_cast<std::int64_t>(axis_dim);
+    }
+    if (index < 0 || index >= static_cast<std::int64_t>(axis_dim)) {
+      throw std::runtime_error("Gather index is out of range");
+    }
+    return static_cast<std::size_t>(index);
+  };
+
+  Tensor output;
+  output.name = node.outputs.at(0);
+  output.dtype = data.dtype;
+  output.shape = std::move(output_shape);
+  output.is_placeholder = false;
+
+  const auto output_size = GetElementCount(output.shape);
+  if (data.dtype == "int64") {
+    const auto& data_values = RequireInt64Data(data, "Gather");
+    output.int64_data = context.AcquireInt64Buffer(output_size);
+    output.int64_data.resize(output_size);
+    for (std::size_t outer_index = 0; outer_index < outer; ++outer_index) {
+      for (std::size_t index_pos = 0; index_pos < index_data.size(); ++index_pos) {
+        const auto gather_index = normalize_index(index_data[index_pos]);
+        const auto input_offset = (outer_index * axis_dim + gather_index) * inner;
+        const auto output_offset = (outer_index * index_data.size() + index_pos) * inner;
+        std::copy_n(data_values.begin() + static_cast<std::ptrdiff_t>(input_offset), static_cast<std::ptrdiff_t>(inner),
+                    output.int64_data.begin() + static_cast<std::ptrdiff_t>(output_offset));
+      }
+    }
+  } else if (data.dtype == "float32") {
+    const auto& data_values = RequireFloatData(data, "Gather");
+    output.float_data = context.AcquireFloatBuffer(output_size);
+    output.float_data.resize(output_size);
+    for (std::size_t outer_index = 0; outer_index < outer; ++outer_index) {
+      for (std::size_t index_pos = 0; index_pos < index_data.size(); ++index_pos) {
+        const auto gather_index = normalize_index(index_data[index_pos]);
+        const auto input_offset = (outer_index * axis_dim + gather_index) * inner;
+        const auto output_offset = (outer_index * index_data.size() + index_pos) * inner;
+        std::copy_n(data_values.begin() + static_cast<std::ptrdiff_t>(input_offset), static_cast<std::ptrdiff_t>(inner),
+                    output.float_data.begin() + static_cast<std::ptrdiff_t>(output_offset));
+      }
+    }
+  } else {
+    throw std::runtime_error("Gather currently supports float32/int64 data only");
+  }
+
+  return output;
+}
+
+Tensor RunTransposeAccelerate(const Node& node, const Tensor& input, ExecutionContext& context) {
+  std::vector<std::int64_t> perm;
+  const auto perm_it = node.attributes.find("perm");
+  if (perm_it == node.attributes.end() || perm_it->second.ints.empty()) {
+    perm.resize(input.shape.size());
+    for (std::size_t i = 0; i < perm.size(); ++i) {
+      perm[i] = static_cast<std::int64_t>(perm.size() - 1 - i);
+    }
+  } else {
+    perm = perm_it->second.ints;
+  }
+  if (perm.size() != input.shape.size()) {
+    throw std::runtime_error("Transpose perm rank mismatch");
+  }
+
+  Tensor output;
+  output.name = node.outputs.at(0);
+  output.dtype = input.dtype;
+  output.shape.resize(input.shape.size());
+  for (std::size_t i = 0; i < perm.size(); ++i) {
+    output.shape[i] = input.shape[static_cast<std::size_t>(perm[i])];
+  }
+  output.is_placeholder = false;
+
+  const auto element_count = GetElementCount(output.shape);
+  const auto rank = input.shape.size();
+  const bool is_float = input.dtype == "float32";
+  const bool is_int64 = input.dtype == "int64";
+  if (!is_float && !is_int64) {
+    throw std::runtime_error("Transpose currently supports float32/int64 only");
+  }
+
+  if (is_float) {
+    const auto& input_data = RequireFloatData(input, "Transpose");
+    output.float_data = context.AcquireFloatBuffer(element_count);
+    output.float_data.resize(element_count);
+  } else {
+    const auto& input_data = RequireInt64Data(input, "Transpose");
+    output.int64_data = context.AcquireInt64Buffer(element_count);
+    output.int64_data.resize(element_count);
+  }
+
+  const auto perm_matches = [&](std::initializer_list<std::int64_t> expected) {
+    if (perm.size() != expected.size()) {
+      return false;
+    }
+    std::size_t i = 0;
+    for (const auto value : expected) {
+      if (perm[i++] != value) {
+        return false;
+      }
+    }
+    return true;
+  };
+
+  if (rank == 4 && perm_matches({0, 2, 1, 3})) {
+    const auto n_dim = static_cast<std::size_t>(input.shape[0]);
+    const auto h_dim = static_cast<std::size_t>(input.shape[1]);
+    const auto c_dim = static_cast<std::size_t>(input.shape[2]);
+    const auto w_dim = static_cast<std::size_t>(input.shape[3]);
+    if (is_float) {
+      const auto& input_data = RequireFloatData(input, "Transpose");
+      for (std::size_t n = 0; n < n_dim; ++n) {
+        for (std::size_t h = 0; h < h_dim; ++h) {
+          for (std::size_t c = 0; c < c_dim; ++c) {
+            const auto src = (((n * h_dim + h) * c_dim + c) * w_dim);
+            const auto dst = (((n * c_dim + c) * h_dim + h) * w_dim);
+            std::memcpy(output.float_data.data() + dst, input_data.data() + src, w_dim * sizeof(float));
+          }
+        }
+      }
+    } else {
+      const auto& input_data = RequireInt64Data(input, "Transpose");
+      for (std::size_t n = 0; n < n_dim; ++n) {
+        for (std::size_t h = 0; h < h_dim; ++h) {
+          for (std::size_t c = 0; c < c_dim; ++c) {
+            const auto src = (((n * h_dim + h) * c_dim + c) * w_dim);
+            const auto dst = (((n * c_dim + c) * h_dim + h) * w_dim);
+            std::copy_n(input_data.begin() + static_cast<std::ptrdiff_t>(src), static_cast<std::ptrdiff_t>(w_dim),
+                        output.int64_data.begin() + static_cast<std::ptrdiff_t>(dst));
+          }
+        }
+      }
+    }
+    return output;
+  }
+
+  const auto input_strides = ComputeStrides(input.shape);
+  const auto output_strides = ComputeStrides(output.shape);
+  if (is_float) {
+    const auto& input_data = RequireFloatData(input, "Transpose");
+    for (std::size_t i = 0; i < output.float_data.size(); ++i) {
+      const auto output_index = UnravelIndex(i, output.shape, output_strides);
+      std::size_t input_offset = 0;
+      for (std::size_t j = 0; j < perm.size(); ++j) {
+        input_offset += static_cast<std::size_t>(output_index[j]) *
+                        input_strides[static_cast<std::size_t>(perm[j])];
+      }
+      output.float_data[i] = input_data[input_offset];
+    }
+  } else {
+    const auto& input_data = RequireInt64Data(input, "Transpose");
+    for (std::size_t i = 0; i < output.int64_data.size(); ++i) {
+      const auto output_index = UnravelIndex(i, output.shape, output_strides);
+      std::size_t input_offset = 0;
+      for (std::size_t j = 0; j < perm.size(); ++j) {
+        input_offset += static_cast<std::size_t>(output_index[j]) *
+                        input_strides[static_cast<std::size_t>(perm[j])];
+      }
+      output.int64_data[i] = input_data[input_offset];
+    }
+  }
+
+  return output;
+}
+
+Tensor RunWhereAccelerate(const Node& node, const Tensor& condition, const Tensor& x, const Tensor& y,
+                          ExecutionContext& context) {
+  const auto output_shape = ComputeBroadcastShape(ComputeBroadcastShape(condition.shape, x.shape, "Where"), y.shape,
+                                                  "Where");
+  const auto output_strides = ComputeStrides(output_shape);
+  const auto condition_strides = ComputeStrides(condition.shape);
+  const auto x_strides = ComputeStrides(x.shape);
+  const auto y_strides = ComputeStrides(y.shape);
+  const auto element_count = GetElementCount(output_shape);
+
+  const auto read_condition = [&](std::size_t offset) {
+    if (condition.dtype == "int64") {
+      return RequireInt64Data(condition, "Where")[offset] != 0;
+    }
+    if (condition.dtype == "float32") {
+      return RequireFloatData(condition, "Where")[offset] != 0.0f;
+    }
+    throw std::runtime_error("Where condition currently supports int64/float32 only");
+  };
+
+  Tensor output;
+  output.name = node.outputs.at(0);
+  output.dtype = x.dtype == "int64" && y.dtype == "int64" ? "int64" : "float32";
+  output.shape = output_shape;
+  output.is_placeholder = false;
+
+  if (output.dtype == "int64") {
+    const auto& x_data = RequireInt64Data(x, "Where");
+    const auto& y_data = RequireInt64Data(y, "Where");
+    output.int64_data = context.AcquireInt64Buffer(element_count);
+    output.int64_data.resize(element_count);
+    for (std::size_t i = 0; i < element_count; ++i) {
+      const auto output_index = UnravelIndex(i, output_shape, output_strides);
+      const auto cond_offset = ComputeBroadcastOffset(output_index, condition.shape, condition_strides);
+      const auto x_offset = ComputeBroadcastOffset(output_index, x.shape, x_strides);
+      const auto y_offset = ComputeBroadcastOffset(output_index, y.shape, y_strides);
+      output.int64_data[i] = read_condition(cond_offset) ? x_data[x_offset] : y_data[y_offset];
+    }
+  } else {
+    output.float_data = context.AcquireFloatBuffer(element_count);
+    output.float_data.resize(element_count);
+    for (std::size_t i = 0; i < element_count; ++i) {
+      const auto output_index = UnravelIndex(i, output_shape, output_strides);
+      const auto cond_offset = ComputeBroadcastOffset(output_index, condition.shape, condition_strides);
+      const auto x_offset = ComputeBroadcastOffset(output_index, x.shape, x_strides);
+      const auto y_offset = ComputeBroadcastOffset(output_index, y.shape, y_strides);
+      const auto x_value = x.dtype == "float32" ? RequireFloatData(x, "Where")[x_offset]
+                                                : static_cast<float>(RequireInt64Data(x, "Where")[x_offset]);
+      const auto y_value = y.dtype == "float32" ? RequireFloatData(y, "Where")[y_offset]
+                                                : static_cast<float>(RequireInt64Data(y, "Where")[y_offset]);
+      output.float_data[i] = read_condition(cond_offset) ? x_value : y_value;
+    }
+  }
+
+  return output;
+}
+
+Tensor RunSoftmaxAccelerate(const Node& node, const Tensor& input, ExecutionContext& context) {
+  const auto& input_data = RequireFloatData(input, "Softmax");
+  const auto axis = static_cast<std::size_t>(NormalizeAxis(ReadIntAttribute(node, "axis", 1), input.shape.size(),
+                                                           "Softmax"));
+  std::size_t outer = 1;
+  for (std::size_t i = 0; i < axis; ++i) {
+    outer *= static_cast<std::size_t>(input.shape[i]);
+  }
+  const std::size_t axis_dim = static_cast<std::size_t>(input.shape[axis]);
+  std::size_t inner = 1;
+  for (std::size_t i = axis + 1; i < input.shape.size(); ++i) {
+    inner *= static_cast<std::size_t>(input.shape[i]);
+  }
+
+  auto output = MakeOutputLikeWithReusedStorage(node.outputs.at(0), input, context);
+  if (axis == input.shape.size() - 1) {
+    const int axis_count = static_cast<int>(axis_dim);
+    std::vector<float> exp_values(axis_dim);
+    std::vector<float> shifted(axis_dim);
+    for (std::size_t outer_index = 0; outer_index < outer; ++outer_index) {
+      const auto* row = input_data.data() + outer_index * axis_dim;
+      auto* out_row = output.float_data.data() + outer_index * axis_dim;
+      float max_value = -std::numeric_limits<float>::infinity();
+      for (std::size_t i = 0; i < axis_dim; ++i) {
+        max_value = std::max(max_value, row[i]);
+      }
+      for (std::size_t i = 0; i < axis_dim; ++i) {
+        shifted[i] = row[i] - max_value;
+      }
+      vvexpf(exp_values.data(), shifted.data(), &axis_count);
+      float denom_sum = 0.0f;
+      for (std::size_t i = 0; i < axis_dim; ++i) {
+        denom_sum += exp_values[i];
+      }
+      const float inv_sum = 1.0f / denom_sum;
+      vDSP_vsmul(exp_values.data(), 1, &inv_sum, out_row, 1, axis_dim);
+    }
+    return output;
+  }
+
+  for (std::size_t outer_index = 0; outer_index < outer; ++outer_index) {
+    for (std::size_t inner_index = 0; inner_index < inner; ++inner_index) {
+      float max_value = -std::numeric_limits<float>::infinity();
+      for (std::size_t axis_index = 0; axis_index < axis_dim; ++axis_index) {
+        const auto offset = (outer_index * axis_dim + axis_index) * inner + inner_index;
+        max_value = std::max(max_value, input_data[offset]);
+      }
+
+      float sum = 0.0f;
+      for (std::size_t axis_index = 0; axis_index < axis_dim; ++axis_index) {
+        const auto offset = (outer_index * axis_dim + axis_index) * inner + inner_index;
+        const auto value = std::exp(input_data[offset] - max_value);
+        output.float_data[offset] = value;
+        sum += value;
+      }
+
+      for (std::size_t axis_index = 0; axis_index < axis_dim; ++axis_index) {
+        const auto offset = (outer_index * axis_dim + axis_index) * inner + inner_index;
+        output.float_data[offset] /= sum;
+      }
+    }
+  }
+
+  return output;
 }
 
 void FillIm2ColBuffer(const float* batch_input, const Conv2DParams& params, std::vector<float>& columns) {
@@ -348,6 +852,16 @@ void RegisterAccelerateElementwiseKernels(KernelRegistry& registry) {
       return;
     }
 
+    if (lhs.dtype == "float32" && rhs.dtype == "float32") {
+      auto output = MakeFloatOutput(node.outputs.at(0), output_shape, context);
+      ApplyFloatBroadcastOp(output, lhs, rhs, [](float a, float b) { return a + b; });
+      context.BindTensor(std::move(output));
+      if (trace != nullptr) {
+        *trace << "    kernel Add produced " << node.outputs.at(0) << " via Accelerate\n";
+      }
+      return;
+    }
+
     RunBinaryNumericFallback(
         "Add", node, context, trace, [](std::int64_t lhs, std::int64_t rhs) { return lhs + rhs; },
         [](float lhs, float rhs) { return lhs + rhs; });
@@ -363,6 +877,16 @@ void RegisterAccelerateElementwiseKernels(KernelRegistry& registry) {
       const auto& rhs_data = RequireFloatData(rhs, "Mul");
       auto output = MakeFloatOutput(node.outputs.at(0), output_shape, context);
       vDSP_vmul(lhs_data.data(), 1, rhs_data.data(), 1, output.float_data.data(), 1, lhs_data.size());
+      context.BindTensor(std::move(output));
+      if (trace != nullptr) {
+        *trace << "    kernel Mul produced " << node.outputs.at(0) << " via Accelerate\n";
+      }
+      return;
+    }
+
+    if (lhs.dtype == "float32" && rhs.dtype == "float32") {
+      auto output = MakeFloatOutput(node.outputs.at(0), output_shape, context);
+      ApplyFloatBroadcastOp(output, lhs, rhs, [](float a, float b) { return a * b; });
       context.BindTensor(std::move(output));
       if (trace != nullptr) {
         *trace << "    kernel Mul produced " << node.outputs.at(0) << " via Accelerate\n";
@@ -392,6 +916,16 @@ void RegisterAccelerateElementwiseKernels(KernelRegistry& registry) {
       return;
     }
 
+    if (lhs.dtype == "float32" && rhs.dtype == "float32") {
+      auto output = MakeFloatOutput(node.outputs.at(0), output_shape, context);
+      ApplyFloatBroadcastOp(output, lhs, rhs, [](float a, float b) { return a - b; });
+      context.BindTensor(std::move(output));
+      if (trace != nullptr) {
+        *trace << "    kernel Sub produced " << node.outputs.at(0) << " via Accelerate\n";
+      }
+      return;
+    }
+
     RunBinaryNumericFallback(
         "Sub", node, context, trace, [](std::int64_t lhs, std::int64_t rhs) { return lhs - rhs; },
         [](float lhs, float rhs) { return lhs - rhs; });
@@ -407,6 +941,21 @@ void RegisterAccelerateElementwiseKernels(KernelRegistry& registry) {
       const auto& rhs_data = RequireFloatData(rhs, "Div");
       auto output = MakeFloatOutput(node.outputs.at(0), output_shape, context);
       vDSP_vdiv(rhs_data.data(), 1, lhs_data.data(), 1, output.float_data.data(), 1, lhs_data.size());
+      context.BindTensor(std::move(output));
+      if (trace != nullptr) {
+        *trace << "    kernel Div produced " << node.outputs.at(0) << " via Accelerate\n";
+      }
+      return;
+    }
+
+    if (lhs.dtype == "float32" && rhs.dtype == "float32") {
+      auto output = MakeFloatOutput(node.outputs.at(0), output_shape, context);
+      ApplyFloatBroadcastOp(output, lhs, rhs, [](float a, float b) {
+        if (b == 0.0f) {
+          throw std::runtime_error("Div divisor must not be zero");
+        }
+        return a / b;
+      });
       context.BindTensor(std::move(output));
       if (trace != nullptr) {
         *trace << "    kernel Div produced " << node.outputs.at(0) << " via Accelerate\n";
@@ -430,32 +979,87 @@ void RegisterAccelerateElementwiseKernels(KernelRegistry& registry) {
         });
   });
 
+  registry.Register("Gather", [](const Node& node, ExecutionContext& context, std::ostream* trace) {
+    const auto& data = RequireTensor(context, node.inputs.at(0));
+    const auto& indices = RequireTensor(context, node.inputs.at(1));
+    auto output = RunGatherAccelerate(node, data, indices, context);
+    context.BindTensor(std::move(output));
+    if (trace != nullptr) {
+      *trace << "    kernel Gather produced " << node.outputs.at(0) << " via Accelerate\n";
+    }
+  });
+
+  registry.Register("Transpose", [](const Node& node, ExecutionContext& context, std::ostream* trace) {
+    const auto& input = RequireTensor(context, node.inputs.at(0));
+    auto output = RunTransposeAccelerate(node, input, context);
+    context.BindTensor(std::move(output));
+    if (trace != nullptr) {
+      *trace << "    kernel Transpose produced " << node.outputs.at(0) << " via Accelerate\n";
+    }
+  });
+
   registry.Register("MatMul", [](const Node& node, ExecutionContext& context, std::ostream* trace) {
     const auto& lhs = RequireTensor(context, node.inputs.at(0));
     const auto& rhs = RequireTensor(context, node.inputs.at(1));
-    const auto& lhs_data = RequireFloatData(lhs, "MatMul");
-    const auto& rhs_data = RequireFloatData(rhs, "MatMul");
-    if (lhs.shape.size() != 2 || rhs.shape.size() != 2) {
-      throw std::runtime_error("MatMul currently only supports 2D float32 tensors");
-    }
-
-    const auto m = static_cast<std::size_t>(lhs.shape[0]);
-    const auto k = static_cast<std::size_t>(lhs.shape[1]);
-    const auto rhs_k = static_cast<std::size_t>(rhs.shape[0]);
-    const auto n = static_cast<std::size_t>(rhs.shape[1]);
-    if (k != rhs_k) {
-      throw std::runtime_error("MatMul inner dimensions do not match");
-    }
-
-    auto output = MakeFloatOutput(node.outputs.at(0), {static_cast<std::int64_t>(m), static_cast<std::int64_t>(n)}, context);
-    cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
-                static_cast<int>(m), static_cast<int>(n), static_cast<int>(k),
-                1.0f, lhs_data.data(), static_cast<int>(k),
-                rhs_data.data(), static_cast<int>(n),
-                0.0f, output.float_data.data(), static_cast<int>(n));
+    auto output = RunMatMulAccelerate(node, lhs, rhs, context);
     context.BindTensor(std::move(output));
     if (trace != nullptr) {
       *trace << "    kernel MatMul produced " << node.outputs.at(0) << " via Accelerate\n";
+    }
+  });
+
+  registry.Register("Tanh", [](const Node& node, ExecutionContext& context, std::ostream* trace) {
+    const auto& input = RequireTensor(context, node.inputs.at(0));
+    const auto& input_data = RequireFloatData(input, "Tanh");
+    auto output = MakeOutputLikeWithReusedStorage(node.outputs.at(0), input, context);
+    const int element_count = static_cast<int>(input_data.size());
+    vvtanhf(output.float_data.data(), input_data.data(), &element_count);
+    context.BindTensor(std::move(output));
+    if (trace != nullptr) {
+      *trace << "    kernel Tanh produced " << node.outputs.at(0) << " via Accelerate\n";
+    }
+  });
+
+  registry.Register("Pow", [](const Node& node, ExecutionContext& context, std::ostream* trace) {
+    const auto& lhs = RequireTensor(context, node.inputs.at(0));
+    const auto& rhs = RequireTensor(context, node.inputs.at(1));
+    const auto output_shape = ComputeBroadcastShape(lhs.shape, rhs.shape, "Pow");
+    auto output = MakeFloatOutput(node.outputs.at(0), output_shape, context);
+
+    if (lhs.dtype != "float32" || rhs.dtype != "float32") {
+      RunBinaryNumericFallback(
+          "Pow", node, context, trace, [](std::int64_t lhs_value, std::int64_t rhs_value) {
+            return static_cast<std::int64_t>(
+                std::pow(static_cast<double>(lhs_value), static_cast<double>(rhs_value)));
+          },
+          [](float lhs_value, float rhs_value) { return std::pow(lhs_value, rhs_value); });
+      return;
+    }
+
+    ApplyFloatBroadcastOp(output, lhs, rhs, [](float a, float b) { return std::pow(a, b); });
+    context.BindTensor(std::move(output));
+    if (trace != nullptr) {
+      *trace << "    kernel Pow produced " << node.outputs.at(0) << " via Accelerate\n";
+    }
+  });
+
+  registry.Register("Where", [](const Node& node, ExecutionContext& context, std::ostream* trace) {
+    const auto& condition = RequireTensor(context, node.inputs.at(0));
+    const auto& x = RequireTensor(context, node.inputs.at(1));
+    const auto& y = RequireTensor(context, node.inputs.at(2));
+    auto output = RunWhereAccelerate(node, condition, x, y, context);
+    context.BindTensor(std::move(output));
+    if (trace != nullptr) {
+      *trace << "    kernel Where produced " << node.outputs.at(0) << " via Accelerate\n";
+    }
+  });
+
+  registry.Register("Softmax", [](const Node& node, ExecutionContext& context, std::ostream* trace) {
+    const auto& input = RequireTensor(context, node.inputs.at(0));
+    auto output = RunSoftmaxAccelerate(node, input, context);
+    context.BindTensor(std::move(output));
+    if (trace != nullptr) {
+      *trace << "    kernel Softmax produced " << node.outputs.at(0) << " via Accelerate\n";
     }
   });
 
@@ -519,6 +1123,17 @@ void RegisterAccelerateElementwiseKernels(KernelRegistry& registry) {
     context.BindTensor(std::move(output));
     if (trace != nullptr) {
       *trace << "    kernel Gemm produced " << node.outputs.at(0) << " via Accelerate\n";
+    }
+  });
+
+  registry.Register("LayerNormalization", [](const Node& node, ExecutionContext& context, std::ostream* trace) {
+    const auto& input = RequireTensor(context, node.inputs.at(0));
+    const auto& scale = RequireTensor(context, node.inputs.at(1));
+    const auto& bias = RequireTensor(context, node.inputs.at(2));
+    auto output = RunLayerNormalizationAccelerate(node, input, scale, bias, context);
+    context.BindTensor(std::move(output));
+    if (trace != nullptr) {
+      *trace << "    kernel LayerNormalization produced " << node.outputs.at(0) << " via Accelerate\n";
     }
   });
 }

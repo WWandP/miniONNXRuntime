@@ -31,6 +31,8 @@
 用途：
 
 - 直接喂 token ids
+- 也支持直接喂文本 prompt
+- 也支持从配置文件读取 prompt、生成长度和运行选项
 - 支持 `--generate N` 做单进程内多步贪心生成
 - 支持 `--cpu-only`、`--strict`、`--quiet`
 - 适合做模型执行、top-k、节点范围调试
@@ -40,11 +42,31 @@
 ```bash
 ./build_phase4/miniort_run_gpt \
   models/gpt2/model.sim.onnx \
+  --prompt "The meaning of life is" \
+  --model-dir models/gpt2 \
+  --generate 2 \
+  --top-k 5 \
+  --cpu-only \
+  --strict
+```
+
+也可以继续直接传 token ids：
+
+```bash
+./build_phase4/miniort_run_gpt \
+  models/gpt2/model.sim.onnx \
   --tokens 464,3616,286,1204,318 \
   --generate 1 \
   --top-k 5 \
   --cpu-only \
   --strict
+```
+
+也可以把参数写到配置文件里：
+
+```bash
+./build_phase4/miniort_run_gpt \
+  --config examples/gpt2_tiny/story_generate.cfg
 ```
 
 ### 2. `run_gpt_text.py`
@@ -59,6 +81,8 @@
 - 把文本 prompt 转成 token ids
 - 调用 `miniort_run_gpt`
 - 再把生成结果解码回文本
+
+这条脚本路径现在更多是对照和兼容入口。
 
 示例：
 
@@ -81,6 +105,7 @@
 - 语义化文本输出
 - 单进程内多步贪心生成
 - 与现有 CPU runtime 的直接联通
+- 单二进制 C++ 文本续写入口
 
 一个最小示例输出是：
 
@@ -104,11 +129,11 @@ The meaning of life is not the
 
 `phase6` 这版仍然是“先跑通、再整理”的版本，还没有做到这些能力：
 
-- KV cache / 增量解码
 - sampling 策略
 - C++ 内嵌 tokenizer
 - 更稳定的文本生成接口抽象
 - 更严格的逐元素 logits dump 与对齐
+- cache 模型的自动导出和统一调度
 
 所以它现在更像是：
 
@@ -121,4 +146,4 @@ The meaning of life is not the
 
 1. 把 `run_gpt_text.py` 中的 tokenizer 能力逐步向 C++ 内收
 2. 给 `miniort_run_gpt` 增加 logits dump 之类的对齐辅助能力
-3. 如果继续推进性能，再做 KV cache 和增量解码
+3. 如果继续推进性能，再把 KV cache 和增量解码继续打磨成一条完整对比链路
