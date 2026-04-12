@@ -7,6 +7,10 @@
 #include <stdexcept>
 #include <vector>
 
+#if defined(__APPLE__)
+#include <Accelerate/Accelerate.h>
+#endif
+
 #include "kernel_utils.h"
 
 namespace miniort {
@@ -40,8 +44,6 @@ Tensor RunMatMul(const std::string& output_name, const Tensor& lhs, const Tensor
   const auto output_batch_strides = ComputeStrides(output_batch_shape);
   const auto lhs_full_strides = ComputeStrides(lhs.shape);
   const auto rhs_full_strides = ComputeStrides(rhs.shape);
-  const std::size_t lhs_matrix_stride = k * m;
-  const std::size_t rhs_matrix_stride = rhs_k * n;
 
   const auto batch_count = GetElementCount(output_batch_shape);
   for (std::size_t batch = 0; batch < batch_count; ++batch) {
@@ -52,17 +54,30 @@ Tensor RunMatMul(const std::string& output_name, const Tensor& lhs, const Tensor
     const auto rhs_base = rhs_batch_shape.empty() ? 0 : rhs_batch_offset;
     const auto output_base = batch * m * n;
 
+#if defined(__APPLE__)
+    cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
+                static_cast<int>(m), static_cast<int>(n), static_cast<int>(k),
+                1.0f,
+                lhs_data.data() + lhs_base, static_cast<int>(k),
+                rhs_data.data() + rhs_base, static_cast<int>(n),
+                0.0f,
+                output.float_data.data() + output_base, static_cast<int>(n));
+#else
+    std::fill(output.float_data.begin() + static_cast<std::ptrdiff_t>(output_base),
+              output.float_data.begin() + static_cast<std::ptrdiff_t>(output_base + m * n), 0.0f);
+
     for (std::size_t i = 0; i < m; ++i) {
-      for (std::size_t j = 0; j < n; ++j) {
-        float sum = 0.0f;
-        for (std::size_t kk = 0; kk < k; ++kk) {
-          const auto lhs_index = lhs_base + i * k + kk;
-          const auto rhs_index = rhs_base + kk * n + j;
-          sum += lhs_data[lhs_index] * rhs_data[rhs_index];
+      const auto* lhs_row_ptr = lhs_data.data() + lhs_base + i * k;
+      auto* out_row_ptr = output.float_data.data() + output_base + i * n;
+      for (std::size_t kk = 0; kk < k; ++kk) {
+        const float lhs_value = lhs_row_ptr[kk];
+        const auto* rhs_row_ptr = rhs_data.data() + rhs_base + kk * n;
+        for (std::size_t j = 0; j < n; ++j) {
+          out_row_ptr[j] += lhs_value * rhs_row_ptr[j];
         }
-        output.float_data[output_base + i * n + j] = sum;
       }
     }
+#endif
   }
   return output;
 }
@@ -146,17 +161,30 @@ Tensor RunGemm2D(const Node& node, const Tensor& a, const Tensor& b, const Tenso
   auto output = MakeFloatOutput(node.outputs.at(0), {static_cast<std::int64_t>(m), static_cast<std::int64_t>(n)}, context);
   std::fill(output.float_data.begin(), output.float_data.end(), 0.0f);
 
+#if defined(__APPLE__)
+  cblas_sgemm(CblasRowMajor,
+              trans_a ? CblasTrans : CblasNoTrans,
+              trans_b ? CblasTrans : CblasNoTrans,
+              static_cast<int>(m), static_cast<int>(n), static_cast<int>(k_a),
+              alpha,
+              a_data.data(), static_cast<int>(a_cols),
+              b_data.data(), static_cast<int>(b_cols),
+              0.0f,
+              output.float_data.data(), static_cast<int>(n));
+#else
   for (std::size_t i = 0; i < m; ++i) {
-    for (std::size_t j = 0; j < n; ++j) {
-      float sum = 0.0f;
-      for (std::size_t kk = 0; kk < k_a; ++kk) {
-        const auto a_index = trans_a ? kk * a_cols + i : i * a_cols + kk;
-        const auto b_index = trans_b ? j * b_cols + kk : kk * b_cols + j;
-        sum += a_data[a_index] * b_data[b_index];
+    auto* out_row_ptr = output.float_data.data() + i * n;
+    const auto* a_row_ptr = trans_a ? nullptr : a_data.data() + i * a_cols;
+    for (std::size_t kk = 0; kk < k_a; ++kk) {
+      const auto a_value = trans_a ? a_data[kk * a_cols + i] : a_row_ptr[kk];
+      const auto* b_row_ptr = trans_b ? nullptr : b_data.data() + kk * b_cols;
+      for (std::size_t j = 0; j < n; ++j) {
+        const auto b_value = trans_b ? b_data[j * b_cols + kk] : b_row_ptr[j];
+        out_row_ptr[j] += alpha * a_value * b_value;
       }
-      output.float_data[i * n + j] = alpha * sum;
     }
   }
+#endif
 
   if (c != nullptr) {
     if (beta != 1.0f) {
@@ -310,6 +338,7 @@ Tensor RunLayerNormalization(const Node& node, const Tensor& input, const Tensor
   for (std::size_t i = axis; i < input.shape.size(); ++i) {
     normalized_size *= static_cast<std::size_t>(input.shape[i]);
   }
+  const float inv_normalized_size = 1.0f / static_cast<float>(normalized_size);
 
   if (scale_data.size() != normalized_size || bias_data.size() != normalized_size) {
     throw std::runtime_error("LayerNormalization scale/bias shape mismatch");
@@ -318,23 +347,25 @@ Tensor RunLayerNormalization(const Node& node, const Tensor& input, const Tensor
   auto output = MakeOutputLikeWithReusedStorage(node.outputs.at(0), input, context);
   for (std::size_t outer_index = 0; outer_index < outer; ++outer_index) {
     const auto base = outer_index * normalized_size;
+    const auto* input_row = input_data.data() + base;
+    const auto* scale_row = scale_data.data();
+    const auto* bias_row = bias_data.data();
     float mean = 0.0f;
     for (std::size_t i = 0; i < normalized_size; ++i) {
-      mean += input_data[base + i];
+      mean += input_row[i];
     }
-    mean /= static_cast<float>(normalized_size);
+    mean *= inv_normalized_size;
 
     float variance = 0.0f;
     for (std::size_t i = 0; i < normalized_size; ++i) {
-      const auto diff = input_data[base + i] - mean;
+      const auto diff = input_row[i] - mean;
       variance += diff * diff;
     }
-    variance /= static_cast<float>(normalized_size);
+    variance *= inv_normalized_size;
     const auto inv_stddev = 1.0f / std::sqrt(variance + epsilon);
 
     for (std::size_t i = 0; i < normalized_size; ++i) {
-      output.float_data[base + i] =
-          ((input_data[base + i] - mean) * inv_stddev) * scale_data[i] + bias_data[i];
+      output.float_data[base + i] = ((input_row[i] - mean) * inv_stddev) * scale_row[i] + bias_row[i];
     }
   }
 
@@ -573,29 +604,62 @@ void RegisterNnKernels(KernelRegistry& registry) {
       inner *= static_cast<std::size_t>(input.shape[i]);
     }
 
-    auto output = MakeOutputLikeWithReusedStorage(node.outputs.at(0), input, context);
+  auto output = MakeOutputLikeWithReusedStorage(node.outputs.at(0), input, context);
+  if (inner == 1) {
+    std::vector<float> exp_values(axis_dim);
+    std::vector<float> shifted(axis_dim);
     for (std::size_t outer_index = 0; outer_index < outer; ++outer_index) {
-      for (std::size_t inner_index = 0; inner_index < inner; ++inner_index) {
-        float max_value = -std::numeric_limits<float>::infinity();
-        for (std::size_t axis_index = 0; axis_index < axis_dim; ++axis_index) {
-          const auto offset = (outer_index * axis_dim + axis_index) * inner + inner_index;
-          max_value = std::max(max_value, input_data[offset]);
-        }
-
-        float sum = 0.0f;
-        for (std::size_t axis_index = 0; axis_index < axis_dim; ++axis_index) {
-          const auto offset = (outer_index * axis_dim + axis_index) * inner + inner_index;
-          const auto value = std::exp(input_data[offset] - max_value);
-          output.float_data[offset] = value;
-          sum += value;
-        }
-
-        for (std::size_t axis_index = 0; axis_index < axis_dim; ++axis_index) {
-          const auto offset = (outer_index * axis_dim + axis_index) * inner + inner_index;
-          output.float_data[offset] /= sum;
-        }
+      const auto* row = input_data.data() + outer_index * axis_dim;
+      auto* out_row = output.float_data.data() + outer_index * axis_dim;
+      float max_value = -std::numeric_limits<float>::infinity();
+      for (std::size_t i = 0; i < axis_dim; ++i) {
+        max_value = std::max(max_value, row[i]);
+      }
+      for (std::size_t i = 0; i < axis_dim; ++i) {
+        shifted[i] = row[i] - max_value;
+      }
+      for (std::size_t i = 0; i < axis_dim; ++i) {
+        exp_values[i] = std::exp(shifted[i]);
+      }
+      float denom_sum = 0.0f;
+      for (std::size_t i = 0; i < axis_dim; ++i) {
+        denom_sum += exp_values[i];
+      }
+      const float inv_sum = 1.0f / denom_sum;
+      for (std::size_t i = 0; i < axis_dim; ++i) {
+        out_row[i] = exp_values[i] * inv_sum;
       }
     }
+    context.BindTensor(std::move(output));
+    if (trace != nullptr) {
+      *trace << "    kernel Softmax produced " << node.outputs.at(0) << "\n";
+    }
+    return;
+  }
+
+  for (std::size_t outer_index = 0; outer_index < outer; ++outer_index) {
+    for (std::size_t inner_index = 0; inner_index < inner; ++inner_index) {
+      const auto row_base = (outer_index * axis_dim) * inner + inner_index;
+      float max_value = -std::numeric_limits<float>::infinity();
+      for (std::size_t axis_index = 0; axis_index < axis_dim; ++axis_index) {
+        const auto offset = row_base + axis_index * inner;
+        max_value = std::max(max_value, input_data[offset]);
+      }
+
+      float sum = 0.0f;
+      for (std::size_t axis_index = 0; axis_index < axis_dim; ++axis_index) {
+        const auto offset = row_base + axis_index * inner;
+        const auto value = std::exp(input_data[offset] - max_value);
+        output.float_data[offset] = value;
+        sum += value;
+      }
+
+      for (std::size_t axis_index = 0; axis_index < axis_dim; ++axis_index) {
+        const auto offset = row_base + axis_index * inner;
+        output.float_data[offset] /= sum;
+      }
+    }
+  }
 
     context.BindTensor(std::move(output));
     if (trace != nullptr) {

@@ -7,7 +7,12 @@ import re
 import subprocess
 from typing import List
 
-from transformers import AutoTokenizer
+try:
+    from transformers import AutoTokenizer
+except ModuleNotFoundError as exc:
+    raise RuntimeError(
+        "run_gpt_text.py requires the `transformers` package. Use a Python env with tokenizer support."
+    ) from exc
 
 
 def parse_args() -> argparse.Namespace:
@@ -26,7 +31,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--binary",
-        default="./build_phase4/miniort_run_gpt",
+        default="./build/miniort_run_gpt",
         help="mini runtime GPT binary.",
     )
     parser.add_argument(
@@ -39,11 +44,6 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=16,
         help="Number of greedy-decoded tokens to append in one binary invocation.",
-    )
-    parser.add_argument(
-        "--cpu-only",
-        action="store_true",
-        help="Force the mini runtime to use the CPU provider only.",
     )
     parser.add_argument(
         "--strict",
@@ -66,22 +66,35 @@ def extract_full_token_ids(output: str) -> List[int]:
 def run_generation(
     binary: str,
     model: str,
+    model_dir: str,
     token_ids: List[int],
     max_new_tokens: int,
-    cpu_only: bool,
     strict: bool,
 ) -> List[int]:
+    kv_prefill_model = pathlib.Path(model_dir) / "model.kv_prefill.onnx"
+    kv_decode_model = pathlib.Path(model_dir) / "model.kv_decode.onnx"
+    use_kv_cache = kv_prefill_model.exists() and kv_decode_model.exists()
+
     cmd = [
         binary,
-        model,
         "--tokens",
         ",".join(str(token_id) for token_id in token_ids),
         "--generate",
         str(max_new_tokens),
         "--quiet",
     ]
-    if cpu_only:
-        cmd.append("--cpu-only")
+    if use_kv_cache:
+        cmd.extend(
+            [
+                "--kv-cache",
+                "--kv-cache-prefill-model",
+                kv_prefill_model.as_posix(),
+                "--kv-cache-decode-model",
+                kv_decode_model.as_posix(),
+            ]
+        )
+    else:
+        cmd.insert(1, model)
     if strict:
         cmd.append("--strict")
 
@@ -105,9 +118,9 @@ def main() -> None:
     token_ids = run_generation(
         args.binary,
         args.model,
+        pathlib.Path(args.model_dir).resolve().as_posix(),
         token_ids,
         args.max_new_tokens,
-        args.cpu_only,
         args.strict,
     )
 

@@ -12,11 +12,11 @@
 #include <vector>
 
 #include "miniort/loader/onnx_loader.h"
-#include "miniort/runtime/cpu_execution_provider.h"
 #include "miniort/runtime/execution_context.h"
 #include "miniort/runtime/session.h"
 #include "miniort/tools/gpt2_cache_binding.h"
 #include "miniort/tools/gpt2_tokenizer.h"
+#include "miniort/tools/phase_output.h"
 
 namespace {
 
@@ -26,14 +26,13 @@ struct Options {
   std::string kv_cache_decode_model_path;
   std::string tokens;
   std::string prompt;
-  std::string model_dir;
+  std::string model_dir{"models/gpt2"};
   std::size_t start_node{0};
   std::size_t max_nodes{0};
   std::size_t top_k{5};
   std::size_t generate{0};
   bool kv_cache{false};
   bool strict{false};
-  bool cpu_only{false};
   bool verbose{false};
   bool quiet{false};
 };
@@ -66,6 +65,14 @@ std::string Unquote(std::string value) {
     return value.substr(1, value.size() - 2);
   }
   return value;
+}
+
+std::filesystem::path ResolveRelativePath(const std::filesystem::path& base_dir, const std::string& value) {
+  const std::filesystem::path path(value);
+  if (path.is_absolute()) {
+    return path;
+  }
+  return base_dir / path;
 }
 
 bool ParseBool(const std::string& value) {
@@ -105,7 +112,7 @@ void ApplyConfigEntry(Options& options, const std::string& key, const std::strin
     return;
   }
   if (key == "prompt_file") {
-    const auto prompt_path = base_dir / value;
+    const auto prompt_path = ResolveRelativePath(base_dir, value);
     options.prompt = ReadTextFile(prompt_path);
     return;
   }
@@ -131,10 +138,6 @@ void ApplyConfigEntry(Options& options, const std::string& key, const std::strin
   }
   if (key == "strict") {
     options.strict = ParseBool(value);
-    return;
-  }
-  if (key == "cpu_only") {
-    options.cpu_only = ParseBool(value);
     return;
   }
   if (key == "verbose") {
@@ -206,7 +209,7 @@ miniort::Tensor MakeTokenTensor(const miniort::Value& input, const std::vector<s
 Options ParseArgs(int argc, char* argv[]) {
   if (argc < 2) {
     throw std::runtime_error(
-        "usage: miniort_run_gpt [model.onnx] [--config path] (--tokens 1,2,3 | --prompt \"text\") [--model-dir path] [--start-node N] [--max-nodes N] [--top-k N] [--generate N] [--kv-cache] [--kv-cache-prefill-model path] [--kv-cache-decode-model path] [--strict] [--cpu-only] [--verbose] [--quiet]");
+        "usage: miniort_run_gpt [model.onnx] [--config path] (--tokens 1,2,3 | --prompt \"text\" | --prompt-file path) [--model-dir path] [--start-node N] [--max-nodes N] [--top-k N] [--generate N] [--kv-cache] [--kv-cache-prefill-model path] [--kv-cache-decode-model path] [--strict] [--verbose] [--quiet]");
   }
 
   Options options;
@@ -229,6 +232,10 @@ Options ParseArgs(int argc, char* argv[]) {
     }
     if (arg == "--prompt" && i + 1 < argc) {
       options.prompt = argv[++i];
+      continue;
+    }
+    if (arg == "--prompt-file" && i + 1 < argc) {
+      options.prompt = ReadTextFile(argv[++i]);
       continue;
     }
     if (arg == "--model-dir" && i + 1 < argc) {
@@ -267,10 +274,6 @@ Options ParseArgs(int argc, char* argv[]) {
       options.strict = true;
       continue;
     }
-    if (arg == "--cpu-only") {
-      options.cpu_only = true;
-      continue;
-    }
     if (arg == "--verbose") {
       options.verbose = true;
       continue;
@@ -282,13 +285,26 @@ Options ParseArgs(int argc, char* argv[]) {
     throw std::runtime_error("unknown argument: " + arg);
   }
 
-  if (options.model_path.empty()) {
-    throw std::runtime_error("miniort_run_gpt requires a model path");
+  if (!options.prompt.empty() && !options.tokens.empty()) {
+    throw std::runtime_error("miniort_run_gpt requires exactly one of --tokens, --prompt, or --prompt-file");
   }
   if (options.tokens.empty() == options.prompt.empty()) {
-    throw std::runtime_error("miniort_run_gpt requires exactly one of --tokens or --prompt");
+    throw std::runtime_error("miniort_run_gpt requires exactly one of --tokens, --prompt, or --prompt-file");
   }
-  if (!options.prompt.empty() && options.model_dir.empty()) {
+  if (options.model_path.empty() && !options.kv_cache) {
+    options.model_path = (std::filesystem::path(options.model_dir) / "model.sim.onnx").string();
+  }
+  if (options.kv_cache) {
+    if (options.kv_cache_prefill_model_path.empty()) {
+      options.kv_cache_prefill_model_path = !options.model_path.empty()
+                                                ? options.model_path
+                                                : (std::filesystem::path(options.model_dir) / "model.kv_prefill.onnx").string();
+    }
+    if (options.kv_cache_decode_model_path.empty()) {
+      options.kv_cache_decode_model_path =
+          (std::filesystem::path(options.model_dir) / "model.kv_decode.onnx").string();
+    }
+  } else if (options.prompt.empty() && options.model_dir.empty()) {
     options.model_dir = std::filesystem::path(options.model_path).parent_path().string();
   }
   return options;
@@ -376,13 +392,22 @@ void AccumulateSummary(const miniort::RunSummary& src, miniort::RunSummary& dst)
 int main(int argc, char* argv[]) {
   try {
     const auto options = ParseArgs(argc, argv);
-    const auto prefill_model_path = options.kv_cache && !options.kv_cache_prefill_model_path.empty()
-                                        ? options.kv_cache_prefill_model_path
-                                        : options.model_path;
+    const auto prefill_model_path =
+        options.kv_cache ? options.kv_cache_prefill_model_path : options.model_path;
     const auto decode_model_path = options.kv_cache ? options.kv_cache_decode_model_path : std::string{};
+    const auto phase_id = options.kv_cache ? "phase6-kv" : "phase6";
+    const auto phase_title = options.kv_cache ? "GPT KV Cache Generation" : "GPT Text Generation";
+    const auto phase_goal = options.kv_cache
+                                ? "看 GPT-2 在 macOS provider + KV cache 路径下如何做 prefill/decode 生成。"
+                                : "看 GPT-2 在 macOS provider 路径下如何完成文本 prompt 到文本输出。";
 
     std::unique_ptr<miniort::Gpt2Tokenizer> tokenizer;
     std::vector<std::int64_t> token_ids;
+    if (!options.quiet) {
+      miniort::PrintPhaseBanner(std::cout, phase_id, phase_title, phase_goal);
+      miniort::PrintPhaseStep(std::cout, 1, 4, "Resolve Prompt And Tokenizer",
+                              options.prompt.empty() ? "从 token ids 直接开始。" : "从 prompt 文本编码成 token ids。");
+    }
     if (!options.prompt.empty()) {
       tokenizer = std::make_unique<miniort::Gpt2Tokenizer>(options.model_dir);
       token_ids = tokenizer->Encode(options.prompt);
@@ -402,12 +427,13 @@ int main(int argc, char* argv[]) {
     session_options.start_node = options.start_node;
     session_options.max_nodes = options.max_nodes;
 
-    auto make_session = [&](miniort::Graph graph) {
-      if (options.cpu_only) {
-        std::vector<std::shared_ptr<const miniort::ExecutionProvider>> providers;
-        providers.push_back(std::make_shared<miniort::CpuExecutionProvider>());
-        return std::make_unique<miniort::Session>(std::move(graph), std::move(providers), session_options);
+    if (!options.quiet) {
+      miniort::PrintPhaseStep(std::cout, 2, 4, "Load Model Graphs", prefill_model_path);
+      if (options.kv_cache) {
+        std::cout << "  decode_model=" << decode_model_path << "\n";
       }
+    }
+    auto make_session = [&](miniort::Graph graph) {
       return std::make_unique<miniort::Session>(std::move(graph), session_options);
     };
 
@@ -429,15 +455,16 @@ int main(int argc, char* argv[]) {
     }
 
     miniort::RunSummary summary;
-    std::unordered_map<std::string, miniort::Tensor> cache_state;
     std::vector<std::int64_t> step_tokens = token_ids;
 
+    if (!options.quiet) {
+      miniort::PrintPhaseStep(std::cout, 3, 4, "Run Generation",
+                              options.kv_cache ? "先跑 prefill，再进入 decode 循环。" : "重复跑 baseline 图并做 greedy 续写。");
+    }
+
     const auto run_step = [&](miniort::Session& session, const miniort::Graph& graph,
-                              const std::vector<std::int64_t>& input_ids,
-                              const std::unordered_map<std::string, miniort::Tensor>& extra_feeds,
+                              std::unordered_map<std::string, miniort::Tensor>& feeds,
                               miniort::ExecutionContext& context) -> const miniort::Tensor* {
-      std::unordered_map<std::string, miniort::Tensor> feeds = extra_feeds;
-      feeds.emplace(graph.inputs.front().name, MakeTokenTensor(graph.inputs.front(), input_ids));
       const auto step_summary = session.Run(feeds, context, options.quiet ? nullptr : &std::cout);
       AccumulateSummary(step_summary, summary);
       const auto* logits = context.FindTensor(graph.outputs.front().name);
@@ -450,7 +477,10 @@ int main(int argc, char* argv[]) {
     if (!options.kv_cache) {
       miniort::ExecutionContext context;
       for (std::size_t step = 0; step <= options.generate; ++step) {
-        const auto* logits = run_step(*prefill_session, prefill_session->graph(), step_tokens, {}, context);
+        std::unordered_map<std::string, miniort::Tensor> feeds;
+        feeds.emplace(prefill_session->graph().inputs.front().name,
+                      MakeTokenTensor(prefill_session->graph().inputs.front(), step_tokens));
+        const auto* logits = run_step(*prefill_session, prefill_session->graph(), feeds, context);
         if (step == options.generate) {
           if (!options.quiet) {
             std::cout << "\nfinal_context\n";
@@ -469,8 +499,12 @@ int main(int argc, char* argv[]) {
       }
     } else {
       miniort::ExecutionContext context;
-      const auto prefill_logits = run_step(*prefill_session, prefill_session->graph(), step_tokens, {}, context);
-      miniort::CollectCacheState(context, cache_binding, miniort::GptCacheStateSource::kPrefill, cache_state);
+      std::unordered_map<std::string, miniort::Tensor> step_feeds;
+      step_feeds.emplace(prefill_session->graph().inputs.front().name,
+                         MakeTokenTensor(prefill_session->graph().inputs.front(), step_tokens));
+
+      const auto prefill_logits = run_step(*prefill_session, prefill_session->graph(), step_feeds, context);
+      miniort::CollectCacheState(context, cache_binding, miniort::GptCacheStateSource::kPrefill, step_feeds);
 
       if (options.generate == 0) {
         if (!options.quiet) {
@@ -483,15 +517,17 @@ int main(int argc, char* argv[]) {
         const auto next_token_id = SelectGreedyNextToken(*prefill_logits);
         token_ids.push_back(next_token_id);
         step_tokens = {next_token_id};
+        step_feeds[prefill_session->graph().inputs.front().name] =
+            MakeTokenTensor(prefill_session->graph().inputs.front(), step_tokens);
         if (options.verbose && !options.quiet) {
           std::cout << "generation_step[0] next_token_id=" << next_token_id << "\n";
         }
 
         for (std::size_t step = 1; step <= options.generate; ++step) {
-          context = miniort::ExecutionContext();
-          std::vector<std::int64_t> decode_tokens = step_tokens;
-          const auto* logits = run_step(*decode_session, decode_session->graph(), decode_tokens, cache_state, context);
-          miniort::CollectCacheState(context, cache_binding, miniort::GptCacheStateSource::kDecode, cache_state);
+          step_feeds[decode_session->graph().inputs.front().name] =
+              MakeTokenTensor(decode_session->graph().inputs.front(), step_tokens);
+          const auto* logits = run_step(*decode_session, decode_session->graph(), step_feeds, context);
+          miniort::CollectCacheState(context, cache_binding, miniort::GptCacheStateSource::kDecode, step_feeds);
 
           if (step == options.generate) {
             if (!options.quiet) {
@@ -521,10 +557,19 @@ int main(int argc, char* argv[]) {
       PrintTokenIds(input_token_ids, "\ninput_token_ids:", std::cout);
       std::cout << "\noutput_text:\n" << tokenizer->Decode(token_ids) << "\n";
     }
+    if (!options.quiet) {
+      miniort::PrintPhaseStep(std::cout, 4, 4, "Summarize Outputs",
+                              "重点看 output_text、full_token_ids、summary 和 provider execution summary。");
+    }
     std::cout << "\nsummary executed=" << summary.executed_nodes
               << " skipped=" << summary.skipped_nodes
               << " materialized_outputs=" << summary.materialized_outputs << "\n";
     miniort::PrintRunSummary(summary, std::cout);
+    if (!options.quiet) {
+      miniort::PrintPhaseResult(std::cout, std::string(phase_id) + " complete",
+                                options.kv_cache ? "你现在看到的是 KV cache 生成视角。"
+                                                 : "你现在看到的是 baseline 文本生成视角。");
+    }
     return EXIT_SUCCESS;
   } catch (const std::exception& ex) {
     std::cerr << "error: " << ex.what() << "\n";

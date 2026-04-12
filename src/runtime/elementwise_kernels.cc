@@ -75,17 +75,19 @@ void RegisterElementwiseKernels(KernelRegistry& registry) {
               output.int64_data[i] = eval_int(lhs_data[lhs_offset], rhs_data[rhs_offset]);
             }
           } else {
+            const auto* lhs_float_data = lhs.dtype == "float32" ? &RequireFloatData(lhs, op_type) : nullptr;
+            const auto* lhs_int_data = lhs.dtype == "int64" ? &RequireInt64Data(lhs, op_type) : nullptr;
+            const auto* rhs_float_data = rhs.dtype == "float32" ? &RequireFloatData(rhs, op_type) : nullptr;
+            const auto* rhs_int_data = rhs.dtype == "int64" ? &RequireInt64Data(rhs, op_type) : nullptr;
             output = MakeFloatOutput(node.outputs.at(0), output_shape, context);
             for (std::size_t i = 0; i < element_count; ++i) {
               const auto output_index = UnravelIndex(i, output_shape, output_strides);
               const auto lhs_offset = ComputeBroadcastOffset(output_index, lhs.shape, lhs_strides);
               const auto rhs_offset = ComputeBroadcastOffset(output_index, rhs.shape, rhs_strides);
-              const auto lhs_value =
-                  lhs.dtype == "float32" ? RequireFloatData(lhs, op_type)[lhs_offset]
-                                         : static_cast<float>(RequireInt64Data(lhs, op_type)[lhs_offset]);
-              const auto rhs_value =
-                  rhs.dtype == "float32" ? RequireFloatData(rhs, op_type)[rhs_offset]
-                                         : static_cast<float>(RequireInt64Data(rhs, op_type)[rhs_offset]);
+              const auto lhs_value = lhs_float_data != nullptr ? (*lhs_float_data)[lhs_offset]
+                                                               : static_cast<float>((*lhs_int_data)[lhs_offset]);
+              const auto rhs_value = rhs_float_data != nullptr ? (*rhs_float_data)[rhs_offset]
+                                                               : static_cast<float>((*rhs_int_data)[rhs_offset]);
               output.float_data[i] = eval_float(lhs_value, rhs_value);
             }
           }
@@ -144,17 +146,19 @@ void RegisterElementwiseKernels(KernelRegistry& registry) {
       }
       context.BindTensor(std::move(output));
     } else {
+      const auto* lhs_float_data = lhs.dtype == "float32" ? &RequireFloatData(lhs, "Pow") : nullptr;
+      const auto* lhs_int_data = lhs.dtype == "int64" ? &RequireInt64Data(lhs, "Pow") : nullptr;
+      const auto* rhs_float_data = rhs.dtype == "float32" ? &RequireFloatData(rhs, "Pow") : nullptr;
+      const auto* rhs_int_data = rhs.dtype == "int64" ? &RequireInt64Data(rhs, "Pow") : nullptr;
       auto output = MakeFloatOutput(node.outputs.at(0), output_shape, context);
       for (std::size_t i = 0; i < element_count; ++i) {
         const auto output_index = UnravelIndex(i, output_shape, output_strides);
         const auto lhs_offset = ComputeBroadcastOffset(output_index, lhs.shape, lhs_strides);
         const auto rhs_offset = ComputeBroadcastOffset(output_index, rhs.shape, rhs_strides);
-        const auto lhs_value =
-            lhs.dtype == "float32" ? RequireFloatData(lhs, "Pow")[lhs_offset]
-                                   : static_cast<float>(RequireInt64Data(lhs, "Pow")[lhs_offset]);
-        const auto rhs_value =
-            rhs.dtype == "float32" ? RequireFloatData(rhs, "Pow")[rhs_offset]
-                                   : static_cast<float>(RequireInt64Data(rhs, "Pow")[rhs_offset]);
+        const auto lhs_value = lhs_float_data != nullptr ? (*lhs_float_data)[lhs_offset]
+                                                         : static_cast<float>((*lhs_int_data)[lhs_offset]);
+        const auto rhs_value = rhs_float_data != nullptr ? (*rhs_float_data)[rhs_offset]
+                                                         : static_cast<float>((*rhs_int_data)[rhs_offset]);
         output.float_data[i] = std::pow(lhs_value, rhs_value);
       }
       context.BindTensor(std::move(output));
@@ -177,12 +181,14 @@ void RegisterElementwiseKernels(KernelRegistry& registry) {
     const auto y_strides = ComputeStrides(y.shape);
     const auto element_count = GetElementCount(output_shape);
 
+    const auto* condition_int64_data = condition.dtype == "int64" ? &RequireInt64Data(condition, "Where") : nullptr;
+    const auto* condition_float_data = condition.dtype == "float32" ? &RequireFloatData(condition, "Where") : nullptr;
     const auto read_condition = [&](std::size_t offset) {
-      if (condition.dtype == "int64") {
-        return RequireInt64Data(condition, "Where")[offset] != 0;
+      if (condition_int64_data != nullptr) {
+        return (*condition_int64_data)[offset] != 0;
       }
-      if (condition.dtype == "float32") {
-        return RequireFloatData(condition, "Where")[offset] != 0.0f;
+      if (condition_float_data != nullptr) {
+        return (*condition_float_data)[offset] != 0.0f;
       }
       throw std::runtime_error("Where condition currently supports int64/float32 only");
     };
@@ -200,16 +206,20 @@ void RegisterElementwiseKernels(KernelRegistry& registry) {
       }
       context.BindTensor(std::move(output));
     } else {
+      const auto* x_float_data = x.dtype == "float32" ? &RequireFloatData(x, "Where") : nullptr;
+      const auto* x_int_data = x.dtype == "int64" ? &RequireInt64Data(x, "Where") : nullptr;
+      const auto* y_float_data = y.dtype == "float32" ? &RequireFloatData(y, "Where") : nullptr;
+      const auto* y_int_data = y.dtype == "int64" ? &RequireInt64Data(y, "Where") : nullptr;
       auto output = MakeFloatOutput(node.outputs.at(0), output_shape, context);
       for (std::size_t i = 0; i < element_count; ++i) {
         const auto output_index = UnravelIndex(i, output_shape, output_strides);
         const auto cond_offset = ComputeBroadcastOffset(output_index, condition.shape, condition_strides);
         const auto x_offset = ComputeBroadcastOffset(output_index, x.shape, x_strides);
         const auto y_offset = ComputeBroadcastOffset(output_index, y.shape, y_strides);
-        const auto x_value = x.dtype == "float32" ? RequireFloatData(x, "Where")[x_offset]
-                                                  : static_cast<float>(RequireInt64Data(x, "Where")[x_offset]);
-        const auto y_value = y.dtype == "float32" ? RequireFloatData(y, "Where")[y_offset]
-                                                  : static_cast<float>(RequireInt64Data(y, "Where")[y_offset]);
+        const auto x_value = x_float_data != nullptr ? (*x_float_data)[x_offset]
+                                                     : static_cast<float>((*x_int_data)[x_offset]);
+        const auto y_value = y_float_data != nullptr ? (*y_float_data)[y_offset]
+                                                     : static_cast<float>((*y_int_data)[y_offset]);
         output.float_data[i] = read_condition(cond_offset) ? x_value : y_value;
       }
       context.BindTensor(std::move(output));
@@ -245,8 +255,8 @@ void RegisterElementwiseKernels(KernelRegistry& registry) {
     } else if (to_type == 7 || to_type == 6) {
       auto output = MakeInt64Output(node.outputs.at(0), input.shape, context);
       if (input.dtype == "int64") {
-        std::copy(RequireInt64Data(input, "Cast").begin(), RequireInt64Data(input, "Cast").end(),
-                  output.int64_data.begin());
+        const auto& input_data = RequireInt64Data(input, "Cast");
+        std::copy(input_data.begin(), input_data.end(), output.int64_data.begin());
       } else if (input.dtype == "float32") {
         const auto& input_data = RequireFloatData(input, "Cast");
         for (std::size_t i = 0; i < input_data.size(); ++i) {

@@ -401,15 +401,19 @@ inline std::vector<std::int64_t> ReadVectorAsInt64(const Tensor& tensor, const s
 
 template <typename T>
 inline Tensor ConcatTensors(const Node& node, ExecutionContext* context, std::ostream* trace, const std::string& dtype,
-                            const std::vector<Tensor>& inputs,
+                            const std::vector<const Tensor*>& inputs,
                             const std::function<const std::vector<T>&(const Tensor&)>& get_data) {
   const auto axis_it = node.attributes.find("axis");
   if (axis_it == node.attributes.end()) {
     throw std::runtime_error("Concat missing axis attribute");
   }
 
+  if (inputs.empty()) {
+    throw std::runtime_error("Concat requires at least one input");
+  }
+
   auto axis = axis_it->second.int_value;
-  const auto rank = static_cast<std::int64_t>(inputs.front().shape.size());
+  const auto rank = static_cast<std::int64_t>(inputs.front()->shape.size());
   if (axis < 0) {
     axis += rank;
   }
@@ -417,22 +421,22 @@ inline Tensor ConcatTensors(const Node& node, ExecutionContext* context, std::os
     throw std::runtime_error("Concat axis is out of range");
   }
 
-  std::vector<std::int64_t> output_shape = inputs.front().shape;
+  std::vector<std::int64_t> output_shape = inputs.front()->shape;
   output_shape[static_cast<std::size_t>(axis)] = 0;
 
   for (const auto& input : inputs) {
-    if (input.dtype != dtype) {
+    if (input->dtype != dtype) {
       throw std::runtime_error("Concat input dtype mismatch");
     }
-    if (input.shape.size() != output_shape.size()) {
+    if (input->shape.size() != output_shape.size()) {
       throw std::runtime_error("Concat rank mismatch");
     }
-    for (std::size_t i = 0; i < input.shape.size(); ++i) {
+    for (std::size_t i = 0; i < input->shape.size(); ++i) {
       if (i == static_cast<std::size_t>(axis)) {
-        output_shape[i] += input.shape[i];
-      } else if (input.shape[i] < 0 || output_shape[i] < 0) {
-        output_shape[i] = std::max(output_shape[i], input.shape[i]);
-      } else if (input.shape[i] != output_shape[i]) {
+        output_shape[i] += input->shape[i];
+      } else if (input->shape[i] < 0 || output_shape[i] < 0) {
+        output_shape[i] = std::max(output_shape[i], input->shape[i]);
+      } else if (input->shape[i] != output_shape[i]) {
         throw std::runtime_error("Concat currently requires matching non-axis dimensions");
       }
     }
@@ -466,16 +470,16 @@ inline Tensor ConcatTensors(const Node& node, ExecutionContext* context, std::os
   std::size_t output_offset = 0;
   for (std::size_t outer_index = 0; outer_index < outer; ++outer_index) {
     for (const auto& input : inputs) {
-      const auto axis_dim = static_cast<std::size_t>(input.shape[static_cast<std::size_t>(axis)]);
+      const auto axis_dim = static_cast<std::size_t>(input->shape[static_cast<std::size_t>(axis)]);
       const auto copy_count = axis_dim * inner;
-      const auto& data = get_data(input);
+      const auto& data = get_data(*input);
       const auto input_base = outer_index * axis_dim * inner;
       if constexpr (std::is_same_v<T, float>) {
-        std::copy_n(data.begin() + static_cast<std::ptrdiff_t>(input_base), static_cast<std::ptrdiff_t>(copy_count),
-                    output.float_data.begin() + static_cast<std::ptrdiff_t>(output_offset));
+        std::memcpy(output.float_data.data() + output_offset, data.data() + input_base,
+                    copy_count * sizeof(float));
       } else {
-        std::copy_n(data.begin() + static_cast<std::ptrdiff_t>(input_base), static_cast<std::ptrdiff_t>(copy_count),
-                    output.int64_data.begin() + static_cast<std::ptrdiff_t>(output_offset));
+        std::memcpy(output.int64_data.data() + output_offset, data.data() + input_base,
+                    copy_count * sizeof(std::int64_t));
       }
       output_offset += copy_count;
     }

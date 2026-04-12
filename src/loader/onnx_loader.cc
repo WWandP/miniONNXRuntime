@@ -293,6 +293,7 @@ Graph LoadOnnxGraph(const std::filesystem::path& model_path, std::ostream* trace
       graph.value_infos[value.name] = value.info;
       initializer_names.insert(value.name);
     }
+
   }
 
   {

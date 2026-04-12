@@ -406,15 +406,20 @@ std::optional<Tensor> FoldConcatNode(const Node& node, const std::vector<Tensor>
   if (inputs.empty()) {
     return std::nullopt;
   }
+  std::vector<const Tensor*> input_ptrs;
+  input_ptrs.reserve(inputs.size());
+  for (const auto& input : inputs) {
+    input_ptrs.push_back(&input);
+  }
   if (inputs.front().dtype == "float32") {
-    auto output = ConcatTensors<float>(node, nullptr, nullptr, "float32", inputs,
+    auto output = ConcatTensors<float>(node, nullptr, nullptr, "float32", input_ptrs,
                                        [](const Tensor& tensor) -> const std::vector<float>& {
                                          return RequireFloatDataAllowEmpty(tensor, "Concat");
                                        });
     return output;
   }
   if (inputs.front().dtype == "int64") {
-    auto output = ConcatTensors<std::int64_t>(node, nullptr, nullptr, "int64", inputs,
+    auto output = ConcatTensors<std::int64_t>(node, nullptr, nullptr, "int64", input_ptrs,
                                               [](const Tensor& tensor) -> const std::vector<std::int64_t>& {
                                                 return RequireInt64DataAllowEmpty(tensor, "Concat");
                                               });

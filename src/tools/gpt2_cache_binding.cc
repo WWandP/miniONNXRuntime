@@ -95,7 +95,7 @@ GptCacheBinding BuildCacheBinding(const Graph& prefill_graph, const Graph& decod
 
 void CollectCacheState(const ExecutionContext& source_context, const GptCacheBinding& binding,
                        GptCacheStateSource source, std::unordered_map<std::string, Tensor>& cache_state) {
-  cache_state.clear();
+  cache_state.reserve(binding.tensors.size());
   for (const auto& tensor_binding : binding.tensors) {
     const auto& source_name = SelectSourceName(tensor_binding, source);
     const auto* tensor = source_context.FindTensor(source_name);
@@ -104,9 +104,9 @@ void CollectCacheState(const ExecutionContext& source_context, const GptCacheBin
       oss << "KV cache output was not produced: " << source_name;
       throw std::runtime_error(oss.str());
     }
-    auto mapped = *tensor;
+    auto& mapped = cache_state[tensor_binding.decode_input_name];
+    mapped = *tensor;
     mapped.name = tensor_binding.decode_input_name;
-    cache_state[tensor_binding.decode_input_name] = std::move(mapped);
   }
 }
 

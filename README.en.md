@@ -1,7 +1,10 @@
 # miniONNXRuntime
 
 A teaching-oriented mini implementation of ONNX Runtime.
-It uses `yolov8n.onnx` to show how a model is parsed, optimized, executed, and memory-optimized.
+It now follows two teaching tracks:
+
+- `yolov8n.onnx`: visual-model parsing, optimization, execution, and basic memory optimization
+- GPT-2 ONNX graphs: prompt encoding, greedy generation, provider execution, and `KV cache`
 
 ![miniONNXRuntime banner](./assets/readme_banner.png)
 
@@ -84,6 +87,12 @@ cmake --build build_local -j4
 
 # phase5: compare provider paths
 ./scripts/run_phase.sh phase5
+
+# phase6: GPT-2 macOS baseline
+./scripts/run_phase.sh phase6
+
+# phase6-kv: GPT-2 KV cache + macOS provider
+./scripts/run_phase.sh phase6-kv
 ```
 
 If you only want to build and test first:
@@ -103,12 +112,13 @@ If you want to go through the whole teaching flow in order:
 
 | Phase | Focus | Command | Read more |
 | --- | --- | --- | --- |
-| `phase1` | static graph structure | `./scripts/run_phase.sh phase1` | [ZH](/home/weiwei.pan/code/miniONNXRuntime/docs/phases/phase1.md) / [EN](/home/weiwei.pan/code/miniONNXRuntime/docs/phases/phase1.en.md) |
-| `phase2` | minimal execution pipeline | `./scripts/run_phase.sh phase2` | [ZH](/home/weiwei.pan/code/miniONNXRuntime/docs/phases/phase2.md) / [EN](/home/weiwei.pan/code/miniONNXRuntime/docs/phases/phase2.en.md) |
-| `phase3` | end-to-end CPU inference | `./scripts/run_phase.sh phase3` | [ZH](/home/weiwei.pan/code/miniONNXRuntime/docs/phases/phase3.md) / [EN](/home/weiwei.pan/code/miniONNXRuntime/docs/phases/phase3.en.md) |
-| `phase4` | graph optimization and memory tracing | `./scripts/run_phase.sh phase4-opt` / `phase4-memory` | [ZH](/home/weiwei.pan/code/miniONNXRuntime/docs/phases/phase4.md) / [EN](/home/weiwei.pan/code/miniONNXRuntime/docs/phases/phase4.en.md) |
-| `phase5` | `ExecutionProvider` abstraction and provider comparison | `./scripts/run_phase.sh phase5` | [ZH](/home/weiwei.pan/code/miniONNXRuntime/docs/phases/phase5.md) / [EN](/home/weiwei.pan/code/miniONNXRuntime/docs/phases/phase5.en.md) |
-| `phase6` | minimal GPT text I/O loop | no unified script yet, use `miniort_run_gpt` / `tools/run_gpt_text.py` directly | [phase6](/Volumes/ww/code/onnxruntime/minionnxruntime/docs/phase6_gpt_text_pipeline.md) |
+| `phase1` | static graph structure | `./scripts/run_phase.sh phase1` | [ZH](./docs/phases/phase1.md) / [EN](./docs/phases/phase1.en.md) |
+| `phase2` | minimal execution pipeline | `./scripts/run_phase.sh phase2` | [ZH](./docs/phases/phase2.md) / [EN](./docs/phases/phase2.en.md) |
+| `phase3` | end-to-end CPU inference | `./scripts/run_phase.sh phase3` | [ZH](./docs/phases/phase3.md) / [EN](./docs/phases/phase3.en.md) |
+| `phase4` | graph optimization and memory tracing | `./scripts/run_phase.sh phase4-opt` / `phase4-memory` | [ZH](./docs/phases/phase4.md) / [EN](./docs/phases/phase4.en.md) |
+| `phase5` | `ExecutionProvider` abstraction and provider comparison | `./scripts/run_phase.sh phase5` | [ZH](./docs/phases/phase5.md) / [EN](./docs/phases/phase5.en.md) |
+| `phase6` | GPT-2 macOS provider baseline | `./scripts/run_phase.sh phase6` | [ZH](./docs/phases/phase6.md) / [EN](./docs/phases/phase6.en.md) |
+| `phase6-kv` | GPT-2 KV cache + macOS provider | `./scripts/run_phase.sh phase6-kv` | [ZH](./docs/phases/phase6.md) / [EN](./docs/phases/phase6.en.md) |
 
 ## Main Entry Points
 
@@ -117,12 +127,17 @@ If you want to go through the whole teaching flow in order:
 | `miniort_inspect` | graph structure, inputs/outputs, op histogram | first look at a model |
 | `miniort_session_trace` | how the first nodes execute and how values flow | learning the minimal execution pipeline |
 | `miniort_run` | full inference timing and summary | validating end-to-end execution |
-| `miniort_run_gpt` | token input, multi-step greedy generation, top-k debugging | GPT / text model path |
-| `tools/run_gpt_text.py` | prompt encoding, GPT invocation, text decoding | first semantic text I/O loop |
 | `miniort_memory_trace` | live tensors, peak bytes, release timing | understanding memory and lifetime |
 | `miniort_optimize_model` | graph before/after optimization | phase4 walkthrough |
 | `miniort_compare_providers` | default provider vs CPU-only | phase5 walkthrough |
 | `miniort_detect_yolov8n` | final detections and output files | demo output |
+
+## GPT Entry
+
+- `./scripts/run_phase.sh phase6`
+- `./scripts/run_phase.sh phase6-kv`
+
+The GPT model assets are included in the repository.
 
 ## Repository Layout
 

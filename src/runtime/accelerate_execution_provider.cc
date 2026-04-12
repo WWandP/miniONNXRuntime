@@ -258,6 +258,7 @@ Tensor RunLayerNormalizationAccelerate(const Node& node, const Tensor& input, co
   for (std::size_t i = axis; i < input.shape.size(); ++i) {
     normalized_size *= static_cast<std::size_t>(input.shape[i]);
   }
+  const float inv_normalized_size = 1.0f / static_cast<float>(normalized_size);
 
   if (scale_data.size() != normalized_size || bias_data.size() != normalized_size) {
     throw std::runtime_error("LayerNormalization scale/bias shape mismatch");
@@ -266,23 +267,25 @@ Tensor RunLayerNormalizationAccelerate(const Node& node, const Tensor& input, co
   auto output = MakeOutputLikeWithReusedStorage(node.outputs.at(0), input, context);
   for (std::size_t outer_index = 0; outer_index < outer; ++outer_index) {
     const auto base = outer_index * normalized_size;
+    const auto* input_row = input_data.data() + base;
+    const auto* scale_row = scale_data.data();
+    const auto* bias_row = bias_data.data();
     float mean = 0.0f;
     for (std::size_t i = 0; i < normalized_size; ++i) {
-      mean += input_data[base + i];
+      mean += input_row[i];
     }
-    mean /= static_cast<float>(normalized_size);
+    mean *= inv_normalized_size;
 
     float variance = 0.0f;
     for (std::size_t i = 0; i < normalized_size; ++i) {
-      const auto diff = input_data[base + i] - mean;
+      const auto diff = input_row[i] - mean;
       variance += diff * diff;
     }
-    variance /= static_cast<float>(normalized_size);
+    variance *= inv_normalized_size;
     const float inv_stddev = 1.0f / std::sqrt(variance + epsilon);
 
     for (std::size_t i = 0; i < normalized_size; ++i) {
-      output.float_data[base + i] =
-          ((input_data[base + i] - mean) * inv_stddev) * scale_data[i] + bias_data[i];
+      output.float_data[base + i] = ((input_row[i] - mean) * inv_stddev) * scale_row[i] + bias_row[i];
     }
   }
 
@@ -390,8 +393,8 @@ Tensor RunGatherAccelerate(const Node& node, const Tensor& data, const Tensor& i
         const auto gather_index = normalize_index(index_data[index_pos]);
         const auto input_offset = (outer_index * axis_dim + gather_index) * inner;
         const auto output_offset = (outer_index * index_data.size() + index_pos) * inner;
-        std::copy_n(data_values.begin() + static_cast<std::ptrdiff_t>(input_offset), static_cast<std::ptrdiff_t>(inner),
-                    output.int64_data.begin() + static_cast<std::ptrdiff_t>(output_offset));
+        std::memcpy(output.int64_data.data() + output_offset, data_values.data() + input_offset,
+                    inner * sizeof(std::int64_t));
       }
     }
   } else if (data.dtype == "float32") {
@@ -403,8 +406,8 @@ Tensor RunGatherAccelerate(const Node& node, const Tensor& data, const Tensor& i
         const auto gather_index = normalize_index(index_data[index_pos]);
         const auto input_offset = (outer_index * axis_dim + gather_index) * inner;
         const auto output_offset = (outer_index * index_data.size() + index_pos) * inner;
-        std::copy_n(data_values.begin() + static_cast<std::ptrdiff_t>(input_offset), static_cast<std::ptrdiff_t>(inner),
-                    output.float_data.begin() + static_cast<std::ptrdiff_t>(output_offset));
+        std::memcpy(output.float_data.data() + output_offset, data_values.data() + input_offset,
+                    inner * sizeof(float));
       }
     }
   } else {
@@ -492,8 +495,8 @@ Tensor RunTransposeAccelerate(const Node& node, const Tensor& input, ExecutionCo
           for (std::size_t c = 0; c < c_dim; ++c) {
             const auto src = (((n * h_dim + h) * c_dim + c) * w_dim);
             const auto dst = (((n * c_dim + c) * h_dim + h) * w_dim);
-            std::copy_n(input_data.begin() + static_cast<std::ptrdiff_t>(src), static_cast<std::ptrdiff_t>(w_dim),
-                        output.int64_data.begin() + static_cast<std::ptrdiff_t>(dst));
+            std::memcpy(output.int64_data.data() + dst, input_data.data() + src,
+                        w_dim * sizeof(std::int64_t));
           }
         }
       }
@@ -539,13 +542,17 @@ Tensor RunWhereAccelerate(const Node& node, const Tensor& condition, const Tenso
   const auto x_strides = ComputeStrides(x.shape);
   const auto y_strides = ComputeStrides(y.shape);
   const auto element_count = GetElementCount(output_shape);
+  const auto* condition_int64_data =
+      condition.dtype == "int64" ? &RequireInt64Data(condition, "Where") : nullptr;
+  const auto* condition_float_data =
+      condition.dtype == "float32" ? &RequireFloatData(condition, "Where") : nullptr;
 
   const auto read_condition = [&](std::size_t offset) {
-    if (condition.dtype == "int64") {
-      return RequireInt64Data(condition, "Where")[offset] != 0;
+    if (condition_int64_data != nullptr) {
+      return (*condition_int64_data)[offset] != 0;
     }
-    if (condition.dtype == "float32") {
-      return RequireFloatData(condition, "Where")[offset] != 0.0f;
+    if (condition_float_data != nullptr) {
+      return (*condition_float_data)[offset] != 0.0f;
     }
     throw std::runtime_error("Where condition currently supports int64/float32 only");
   };
@@ -569,6 +576,10 @@ Tensor RunWhereAccelerate(const Node& node, const Tensor& condition, const Tenso
       output.int64_data[i] = read_condition(cond_offset) ? x_data[x_offset] : y_data[y_offset];
     }
   } else {
+    const auto* x_float_data = x.dtype == "float32" ? &RequireFloatData(x, "Where") : nullptr;
+    const auto* x_int_data = x.dtype == "int64" ? &RequireInt64Data(x, "Where") : nullptr;
+    const auto* y_float_data = y.dtype == "float32" ? &RequireFloatData(y, "Where") : nullptr;
+    const auto* y_int_data = y.dtype == "int64" ? &RequireInt64Data(y, "Where") : nullptr;
     output.float_data = context.AcquireFloatBuffer(element_count);
     output.float_data.resize(element_count);
     for (std::size_t i = 0; i < element_count; ++i) {
@@ -576,10 +587,10 @@ Tensor RunWhereAccelerate(const Node& node, const Tensor& condition, const Tenso
       const auto cond_offset = ComputeBroadcastOffset(output_index, condition.shape, condition_strides);
       const auto x_offset = ComputeBroadcastOffset(output_index, x.shape, x_strides);
       const auto y_offset = ComputeBroadcastOffset(output_index, y.shape, y_strides);
-      const auto x_value = x.dtype == "float32" ? RequireFloatData(x, "Where")[x_offset]
-                                                : static_cast<float>(RequireInt64Data(x, "Where")[x_offset]);
-      const auto y_value = y.dtype == "float32" ? RequireFloatData(y, "Where")[y_offset]
-                                                : static_cast<float>(RequireInt64Data(y, "Where")[y_offset]);
+      const auto x_value = x_float_data != nullptr ? (*x_float_data)[x_offset]
+                                                   : static_cast<float>((*x_int_data)[x_offset]);
+      const auto y_value = y_float_data != nullptr ? (*y_float_data)[y_offset]
+                                                   : static_cast<float>((*y_int_data)[y_offset]);
       output.float_data[i] = read_condition(cond_offset) ? x_value : y_value;
     }
   }
@@ -629,22 +640,23 @@ Tensor RunSoftmaxAccelerate(const Node& node, const Tensor& input, ExecutionCont
 
   for (std::size_t outer_index = 0; outer_index < outer; ++outer_index) {
     for (std::size_t inner_index = 0; inner_index < inner; ++inner_index) {
+      const auto row_base = (outer_index * axis_dim) * inner + inner_index;
       float max_value = -std::numeric_limits<float>::infinity();
       for (std::size_t axis_index = 0; axis_index < axis_dim; ++axis_index) {
-        const auto offset = (outer_index * axis_dim + axis_index) * inner + inner_index;
+        const auto offset = row_base + axis_index * inner;
         max_value = std::max(max_value, input_data[offset]);
       }
 
       float sum = 0.0f;
       for (std::size_t axis_index = 0; axis_index < axis_dim; ++axis_index) {
-        const auto offset = (outer_index * axis_dim + axis_index) * inner + inner_index;
+        const auto offset = row_base + axis_index * inner;
         const auto value = std::exp(input_data[offset] - max_value);
         output.float_data[offset] = value;
         sum += value;
       }
 
       for (std::size_t axis_index = 0; axis_index < axis_dim; ++axis_index) {
-        const auto offset = (outer_index * axis_dim + axis_index) * inner + inner_index;
+        const auto offset = row_base + axis_index * inner;
         output.float_data[offset] /= sum;
       }
     }
@@ -749,15 +761,19 @@ void RunBinaryNumericFallback(const std::string& op_type, const Node& node, Exec
     }
     context.BindTensor(std::move(output));
   } else {
+    const auto* lhs_float_data = lhs.dtype == "float32" ? &RequireFloatData(lhs, op_type) : nullptr;
+    const auto* lhs_int_data = lhs.dtype == "int64" ? &RequireInt64Data(lhs, op_type) : nullptr;
+    const auto* rhs_float_data = rhs.dtype == "float32" ? &RequireFloatData(rhs, op_type) : nullptr;
+    const auto* rhs_int_data = rhs.dtype == "int64" ? &RequireInt64Data(rhs, op_type) : nullptr;
     auto output = MakeFloatOutput(node.outputs.at(0), output_shape, context);
     for (std::size_t i = 0; i < element_count; ++i) {
       const auto output_index = UnravelIndex(i, output_shape, output_strides);
       const auto lhs_offset = ComputeBroadcastOffset(output_index, lhs.shape, lhs_strides);
       const auto rhs_offset = ComputeBroadcastOffset(output_index, rhs.shape, rhs_strides);
-      const auto lhs_value = lhs.dtype == "float32" ? RequireFloatData(lhs, op_type)[lhs_offset]
-                                                    : static_cast<float>(RequireInt64Data(lhs, op_type)[lhs_offset]);
-      const auto rhs_value = rhs.dtype == "float32" ? RequireFloatData(rhs, op_type)[rhs_offset]
-                                                    : static_cast<float>(RequireInt64Data(rhs, op_type)[rhs_offset]);
+      const auto lhs_value = lhs_float_data != nullptr ? (*lhs_float_data)[lhs_offset]
+                                                       : static_cast<float>((*lhs_int_data)[lhs_offset]);
+      const auto rhs_value = rhs_float_data != nullptr ? (*rhs_float_data)[rhs_offset]
+                                                       : static_cast<float>((*rhs_int_data)[rhs_offset]);
       output.float_data[i] = eval_float(lhs_value, rhs_value);
     }
     context.BindTensor(std::move(output));

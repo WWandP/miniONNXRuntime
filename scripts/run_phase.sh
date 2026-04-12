@@ -6,6 +6,12 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BUILD_DIR="${BUILD_DIR:-$ROOT_DIR/build_local}"
 MODEL_PATH="${MODEL_PATH:-$ROOT_DIR/models/yolov8n.onnx}"
 IMAGE_PATH="${IMAGE_PATH:-$ROOT_DIR/pic/bus.jpg}"
+GPT_MODEL_DIR="${GPT_MODEL_DIR:-$ROOT_DIR/models/gpt2}"
+GPT_MODEL_PATH="${GPT_MODEL_PATH:-$GPT_MODEL_DIR/model.kv_prefill.onnx}"
+GPT_KV_PREFILL_MODEL_PATH="${GPT_KV_PREFILL_MODEL_PATH:-$GPT_MODEL_DIR/model.kv_prefill.onnx}"
+GPT_KV_DECODE_MODEL_PATH="${GPT_KV_DECODE_MODEL_PATH:-$GPT_MODEL_DIR/model.kv_decode.onnx}"
+GPT_PROMPT_FILE="${GPT_PROMPT_FILE:-$ROOT_DIR/examples/gpt2_tiny/story_prompt.txt}"
+GPT_GENERATE="${GPT_GENERATE:-48}"
 CMAKE_BIN="${CMAKE_BIN:-cmake}"
 
 usage() {
@@ -19,12 +25,20 @@ usage:
   ./scripts/run_phase.sh phase4-opt
   ./scripts/run_phase.sh phase4-memory
   ./scripts/run_phase.sh phase5
+  ./scripts/run_phase.sh phase6
+  ./scripts/run_phase.sh phase6-kv
   ./scripts/run_phase.sh all
 
 environment overrides:
   BUILD_DIR=/path/to/build
   MODEL_PATH=/path/to/model.onnx
   IMAGE_PATH=/path/to/image.jpg
+  GPT_MODEL_DIR=/path/to/models/gpt2
+  GPT_MODEL_PATH=/path/to/model.kv_prefill.onnx
+  GPT_KV_PREFILL_MODEL_PATH=/path/to/model.kv_prefill.onnx
+  GPT_KV_DECODE_MODEL_PATH=/path/to/model.kv_decode.onnx
+  GPT_PROMPT_FILE=/path/to/prompt.txt
+  GPT_GENERATE=48
   CMAKE_BIN=/path/to/cmake
 EOF
 }
@@ -98,6 +112,39 @@ run_phase5() {
   "$BUILD_DIR/miniort_compare_providers" "$MODEL_PATH" --image "$IMAGE_PATH" --repeat 1
 }
 
+run_phase6() {
+  build_all
+  require_file "$GPT_MODEL_PATH"
+  require_file "$GPT_PROMPT_FILE"
+  require_file "$GPT_MODEL_DIR/vocab.json"
+  require_file "$GPT_MODEL_DIR/merges.txt"
+  "$BUILD_DIR/miniort_run_gpt" \
+    "$GPT_MODEL_PATH" \
+    --prompt-file "$GPT_PROMPT_FILE" \
+    --model-dir "$GPT_MODEL_DIR" \
+    --generate "$GPT_GENERATE" \
+    --top-k 5 \
+    --strict
+}
+
+run_phase6_kv() {
+  build_all
+  require_file "$GPT_KV_PREFILL_MODEL_PATH"
+  require_file "$GPT_KV_DECODE_MODEL_PATH"
+  require_file "$GPT_PROMPT_FILE"
+  require_file "$GPT_MODEL_DIR/vocab.json"
+  require_file "$GPT_MODEL_DIR/merges.txt"
+  "$BUILD_DIR/miniort_run_gpt" \
+    --prompt-file "$GPT_PROMPT_FILE" \
+    --model-dir "$GPT_MODEL_DIR" \
+    --generate "$GPT_GENERATE" \
+    --top-k 5 \
+    --kv-cache \
+    --kv-cache-prefill-model "$GPT_KV_PREFILL_MODEL_PATH" \
+    --kv-cache-decode-model "$GPT_KV_DECODE_MODEL_PATH" \
+    --strict
+}
+
 run_all() {
   run_phase1
   run_phase2
@@ -105,6 +152,8 @@ run_all() {
   run_phase4_opt
   run_phase4_memory
   run_phase5
+  run_phase6
+  run_phase6_kv
 }
 
 main() {
@@ -139,6 +188,12 @@ main() {
       ;;
     phase5)
       run_phase5
+      ;;
+    phase6)
+      run_phase6
+      ;;
+    phase6-kv)
+      run_phase6_kv
       ;;
     all)
       run_all

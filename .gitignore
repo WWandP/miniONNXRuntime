@@ -29,6 +29,16 @@ outputs/
 resume/
 models/gpt2/
 models/tiny-gpt2/
+!models/gpt2/
+models/gpt2/*
+!models/gpt2/model.kv_prefill.onnx
+!models/gpt2/model.kv_decode.onnx
+!models/gpt2/vocab.json
+!models/gpt2/merges.txt
+!models/gpt2/tokenizer.json
+!models/gpt2/tokenizer_config.json
+!models/gpt2/config.json
+!models/gpt2/generation_config.json
 
 # IDE / editor
 .DS_Store
@@ -42,3 +52,6 @@ docs/*
 !docs/gpt2_onnx_gap_analysis.md
 !docs/phase5_gpt2_cpu_bringup.md
 !docs/phase6_gpt_text_pipeline.md
+!docs/phases/
+!docs/phases/*.md
+docs/phase6_gpt_text_pipeline.md

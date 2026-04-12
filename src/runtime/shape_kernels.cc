@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <limits>
 #include <stdexcept>
 #include <vector>
@@ -88,8 +89,8 @@ void RegisterShapeKernels(KernelRegistry& registry) {
           const auto gather_index = normalize_index(index_data[index_pos]);
           const auto input_offset = (outer_index * axis_dim + gather_index) * inner;
           const auto output_offset = (outer_index * index_data.size() + index_pos) * inner;
-          std::copy_n(data_values.begin() + static_cast<std::ptrdiff_t>(input_offset), static_cast<std::ptrdiff_t>(inner),
-                      output.int64_data.begin() + static_cast<std::ptrdiff_t>(output_offset));
+          std::memcpy(output.int64_data.data() + output_offset, data_values.data() + input_offset,
+                      inner * sizeof(std::int64_t));
         }
       }
       context.BindTensor(std::move(output));
@@ -101,8 +102,8 @@ void RegisterShapeKernels(KernelRegistry& registry) {
           const auto gather_index = normalize_index(index_data[index_pos]);
           const auto input_offset = (outer_index * axis_dim + gather_index) * inner;
           const auto output_offset = (outer_index * index_data.size() + index_pos) * inner;
-          std::copy_n(data_values.begin() + static_cast<std::ptrdiff_t>(input_offset), static_cast<std::ptrdiff_t>(inner),
-                      output.float_data.begin() + static_cast<std::ptrdiff_t>(output_offset));
+          std::memcpy(output.float_data.data() + output_offset, data_values.data() + input_offset,
+                      inner * sizeof(float));
         }
       }
       context.BindTensor(std::move(output));
@@ -194,25 +195,25 @@ void RegisterShapeKernels(KernelRegistry& registry) {
   });
 
   registry.Register("Concat", [](const Node& node, ExecutionContext& context, std::ostream* trace) {
-    std::vector<Tensor> inputs;
+    std::vector<const Tensor*> inputs;
     inputs.reserve(node.inputs.size());
     for (const auto& input_name : node.inputs) {
       if (input_name.empty()) {
         continue;
       }
-      inputs.push_back(RequireTensor(context, input_name));
+      inputs.push_back(&RequireTensor(context, input_name));
     }
     if (inputs.empty()) {
       throw std::runtime_error("Concat requires at least one input");
     }
 
     Tensor output;
-    if (inputs.front().dtype == "float32") {
+    if (inputs.front()->dtype == "float32") {
       output = ConcatTensors<float>(node, &context, trace, "float32", inputs,
                                     [](const Tensor& tensor) -> const std::vector<float>& {
                                       return RequireFloatData(tensor, "Concat");
                                     });
-    } else if (inputs.front().dtype == "int64") {
+    } else if (inputs.front()->dtype == "int64") {
       output = ConcatTensors<std::int64_t>(node, &context, trace, "int64", inputs,
                                            [](const Tensor& tensor) -> const std::vector<std::int64_t>& {
                                              return RequireInt64Data(tensor, "Concat");
@@ -323,9 +324,8 @@ void RegisterShapeKernels(KernelRegistry& registry) {
           const auto input_base =
               (outer_index * static_cast<std::size_t>(data.shape[static_cast<std::size_t>(axis)]) + axis_offset) * inner;
           const auto copy_count = split_dim * inner;
-          std::copy_n(input_data.begin() + static_cast<std::ptrdiff_t>(input_base),
-                      static_cast<std::ptrdiff_t>(copy_count),
-                      output.float_data.begin() + static_cast<std::ptrdiff_t>(output_offset));
+          std::memcpy(output.float_data.data() + output_offset, input_data.data() + input_base,
+                      copy_count * sizeof(float));
           output_offset += copy_count;
         }
         axis_offset += split_dim;
@@ -354,9 +354,8 @@ void RegisterShapeKernels(KernelRegistry& registry) {
           const auto input_base =
               (outer_index * static_cast<std::size_t>(data.shape[static_cast<std::size_t>(axis)]) + axis_offset) * inner;
           const auto copy_count = split_dim * inner;
-          std::copy_n(input_data.begin() + static_cast<std::ptrdiff_t>(input_base),
-                      static_cast<std::ptrdiff_t>(copy_count),
-                      output.int64_data.begin() + static_cast<std::ptrdiff_t>(output_offset));
+          std::memcpy(output.int64_data.data() + output_offset, input_data.data() + input_base,
+                      copy_count * sizeof(std::int64_t));
           output_offset += copy_count;
         }
         axis_offset += split_dim;
@@ -447,17 +446,74 @@ void RegisterShapeKernels(KernelRegistry& registry) {
 
     const auto input_strides = ComputeStrides(input.shape);
     const auto output_strides = ComputeStrides(output.shape);
+    const auto perm_matches = [&](std::initializer_list<std::int64_t> expected) {
+      if (perm.size() != expected.size()) {
+        return false;
+      }
+      std::size_t i = 0;
+      for (const auto value : expected) {
+        if (perm[i++] != value) {
+          return false;
+        }
+      }
+      return true;
+    };
+
+    if (input.shape.size() == 4 && perm_matches({0, 2, 1, 3})) {
+      const auto n_dim = static_cast<std::size_t>(input.shape[0]);
+      const auto h_dim = static_cast<std::size_t>(input.shape[1]);
+      const auto c_dim = static_cast<std::size_t>(input.shape[2]);
+      const auto w_dim = static_cast<std::size_t>(input.shape[3]);
+      if (input.dtype == "float32") {
+        const auto& input_data = RequireFloatData(input, "Transpose");
+        output.float_data = context.AcquireFloatBuffer(GetElementCount(output.shape));
+        output.float_data.resize(GetElementCount(output.shape));
+        for (std::size_t n = 0; n < n_dim; ++n) {
+          for (std::size_t h = 0; h < h_dim; ++h) {
+            for (std::size_t c = 0; c < c_dim; ++c) {
+              const auto src = (((n * h_dim + h) * c_dim + c) * w_dim);
+              const auto dst = (((n * c_dim + c) * h_dim + h) * w_dim);
+              std::memcpy(output.float_data.data() + dst, input_data.data() + src, w_dim * sizeof(float));
+            }
+          }
+        }
+      } else if (input.dtype == "int64") {
+        const auto& input_data = RequireInt64Data(input, "Transpose");
+        output.int64_data = context.AcquireInt64Buffer(GetElementCount(output.shape));
+        output.int64_data.resize(GetElementCount(output.shape));
+        for (std::size_t n = 0; n < n_dim; ++n) {
+          for (std::size_t h = 0; h < h_dim; ++h) {
+            for (std::size_t c = 0; c < c_dim; ++c) {
+              const auto src = (((n * h_dim + h) * c_dim + c) * w_dim);
+              const auto dst = (((n * c_dim + c) * h_dim + h) * w_dim);
+              std::memcpy(output.int64_data.data() + dst, input_data.data() + src,
+                          w_dim * sizeof(std::int64_t));
+            }
+          }
+        }
+      } else {
+        throw std::runtime_error("Transpose currently supports float32/int64 only");
+      }
+
+      context.BindTensor(std::move(output));
+      if (trace != nullptr) {
+        *trace << "    kernel Transpose produced " << node.outputs.at(0) << "\n";
+      }
+      return;
+    }
+
     if (input.dtype == "float32") {
       const auto& input_data = RequireFloatData(input, "Transpose");
       output.float_data = context.AcquireFloatBuffer(GetElementCount(output.shape));
       output.float_data.resize(GetElementCount(output.shape));
       for (std::size_t i = 0; i < output.float_data.size(); ++i) {
         const auto output_index = UnravelIndex(i, output.shape, output_strides);
-        std::vector<std::int64_t> input_index(input.shape.size(), 0);
+        std::size_t input_offset = 0;
         for (std::size_t j = 0; j < perm.size(); ++j) {
-          input_index[static_cast<std::size_t>(perm[j])] = output_index[j];
+          input_offset += static_cast<std::size_t>(output_index[j]) *
+                          input_strides[static_cast<std::size_t>(perm[j])];
         }
-        output.float_data[i] = input_data[ComputeOffset(input_index, input_strides)];
+        output.float_data[i] = input_data[input_offset];
       }
     } else if (input.dtype == "int64") {
       const auto& input_data = RequireInt64Data(input, "Transpose");
@@ -465,11 +521,12 @@ void RegisterShapeKernels(KernelRegistry& registry) {
       output.int64_data.resize(GetElementCount(output.shape));
       for (std::size_t i = 0; i < output.int64_data.size(); ++i) {
         const auto output_index = UnravelIndex(i, output.shape, output_strides);
-        std::vector<std::int64_t> input_index(input.shape.size(), 0);
+        std::size_t input_offset = 0;
         for (std::size_t j = 0; j < perm.size(); ++j) {
-          input_index[static_cast<std::size_t>(perm[j])] = output_index[j];
+          input_offset += static_cast<std::size_t>(output_index[j]) *
+                          input_strides[static_cast<std::size_t>(perm[j])];
         }
-        output.int64_data[i] = input_data[ComputeOffset(input_index, input_strides)];
+        output.int64_data[i] = input_data[input_offset];
       }
     } else {
       throw std::runtime_error("Transpose currently supports float32/int64 only");

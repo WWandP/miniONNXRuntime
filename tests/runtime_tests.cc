@@ -524,6 +524,158 @@ void TestSqueezeExecutionProducesExpectedOutput() {
   Expect(output->float_data == x.float_data, "expected Squeeze to preserve element order");
 }
 
+void TestConcatExecutionProducesExpectedOutput() {
+  auto graph = MakeGraphWithOps({"Concat"});
+  graph.nodes[0].inputs = {"a", "b"};
+  graph.nodes[0].attributes["axis"].kind = miniort::AttributeValue::Kind::kInt;
+  graph.nodes[0].attributes["axis"].int_value = 1;
+
+  miniort::Tensor a;
+  a.name = "a";
+  a.dtype = "float32";
+  a.shape = {2, 2};
+  a.float_data = {1.f, 2.f,
+                  3.f, 4.f};
+
+  miniort::Tensor b;
+  b.name = "b";
+  b.dtype = "float32";
+  b.shape = {2, 1};
+  b.float_data = {5.f,
+                  6.f};
+
+  Session session = MakeCpuSession(std::move(graph), SessionOptions{});
+  miniort::ExecutionContext context;
+  std::unordered_map<std::string, miniort::Tensor> feeds;
+  feeds.emplace(a.name, a);
+  feeds.emplace(b.name, b);
+
+  const auto summary = session.Run(feeds, context, nullptr);
+  Expect(summary.executed_nodes == 1, "expected Concat graph to execute one node");
+  const auto* output = context.FindTensor("out_0");
+  Expect(output != nullptr, "expected Concat output tensor");
+  Expect(output->shape == std::vector<std::int64_t>({2, 3}), "expected Concat output shape [2,3]");
+  const std::vector<float> expected = {1.f, 2.f, 5.f, 3.f, 4.f, 6.f};
+  Expect(output->float_data == expected, "unexpected Concat output");
+}
+
+void TestTransposeExecutionProducesExpectedOutput() {
+  auto graph = MakeGraphWithOps({"Transpose"});
+  graph.nodes[0].inputs = {"x"};
+  graph.nodes[0].attributes["perm"].kind = miniort::AttributeValue::Kind::kInts;
+  graph.nodes[0].attributes["perm"].ints = {1, 0};
+
+  miniort::Tensor x;
+  x.name = "x";
+  x.dtype = "float32";
+  x.shape = {2, 3};
+  x.float_data = {1.f, 2.f, 3.f,
+                  4.f, 5.f, 6.f};
+
+  Session session = MakeCpuSession(std::move(graph), SessionOptions{});
+  miniort::ExecutionContext context;
+  std::unordered_map<std::string, miniort::Tensor> feeds;
+  feeds.emplace(x.name, x);
+
+  const auto summary = session.Run(feeds, context, nullptr);
+  Expect(summary.executed_nodes == 1, "expected Transpose graph to execute one node");
+  const auto* output = context.FindTensor("out_0");
+  Expect(output != nullptr, "expected Transpose output tensor");
+  Expect(output->shape == std::vector<std::int64_t>({3, 2}), "expected Transpose output shape [3,2]");
+  const std::vector<float> expected = {1.f, 4.f, 2.f, 5.f, 3.f, 6.f};
+  Expect(output->float_data == expected, "unexpected Transpose output");
+}
+
+void TestSoftmaxExecutionProducesExpectedOutput() {
+  auto graph = MakeGraphWithOps({"Softmax"});
+  graph.nodes[0].inputs = {"x"};
+  graph.nodes[0].attributes["axis"].kind = miniort::AttributeValue::Kind::kInt;
+  graph.nodes[0].attributes["axis"].int_value = 1;
+
+  miniort::Tensor x;
+  x.name = "x";
+  x.dtype = "float32";
+  x.shape = {2, 3};
+  x.float_data = {1.f, 2.f, 3.f,
+                  4.f, 5.f, 6.f};
+
+  Session session = MakeCpuSession(std::move(graph), SessionOptions{});
+  miniort::ExecutionContext context;
+  std::unordered_map<std::string, miniort::Tensor> feeds;
+  feeds.emplace(x.name, x);
+
+  const auto summary = session.Run(feeds, context, nullptr);
+  Expect(summary.executed_nodes == 1, "expected Softmax graph to execute one node");
+  const auto* output = context.FindTensor("out_0");
+  Expect(output != nullptr, "expected Softmax output tensor");
+  Expect(output->shape == std::vector<std::int64_t>({2, 3}), "expected Softmax output shape [2,3]");
+  const std::vector<float> expected = {
+      0.09003057f, 0.24472848f, 0.66524094f,
+      0.09003057f, 0.24472848f, 0.66524094f,
+  };
+  for (std::size_t i = 0; i < expected.size(); ++i) {
+    Expect(std::fabs(output->float_data[i] - expected[i]) < 1e-5f, "unexpected Softmax output value");
+  }
+}
+
+void TestSplitExecutionProducesExpectedOutput() {
+  Graph graph;
+  graph.name = "split_graph";
+
+  Node data;
+  data.name = "data_const";
+  data.op_type = "Constant";
+  data.outputs = {"data"};
+  miniort::TensorData data_value;
+  data_value.dtype = "float32";
+  data_value.shape = {2, 4};
+  data_value.float_data = {1.f, 2.f, 3.f, 4.f, 5.f, 6.f, 7.f, 8.f};
+  data.attributes["value"].tensor = data_value;
+
+  Node split_sizes;
+  split_sizes.name = "split_sizes_const";
+  split_sizes.op_type = "Constant";
+  split_sizes.outputs = {"split_sizes"};
+  miniort::TensorData split_sizes_value;
+  split_sizes_value.dtype = "int64";
+  split_sizes_value.shape = {2};
+  split_sizes_value.int64_data = {1, 3};
+  split_sizes.attributes["value"].tensor = split_sizes_value;
+
+  Node split;
+  split.name = "split";
+  split.op_type = "Split";
+  split.inputs = {"data", "split_sizes"};
+  split.outputs = {"left", "right"};
+  split.attributes["axis"].kind = miniort::AttributeValue::Kind::kInt;
+  split.attributes["axis"].int_value = 1;
+
+  graph.node_name_to_index[data.name] = 0;
+  graph.node_name_to_index[split_sizes.name] = 1;
+  graph.node_name_to_index[split.name] = 2;
+  graph.topological_order = {0, 1, 2};
+  graph.nodes.push_back(std::move(data));
+  graph.nodes.push_back(std::move(split_sizes));
+  graph.nodes.push_back(std::move(split));
+
+  Session session = MakeCpuSession(std::move(graph), SessionOptions{});
+  miniort::ExecutionContext context;
+  const auto summary = session.Run({}, context, nullptr);
+
+  Expect(summary.executed_nodes == 3, "expected split graph to execute three nodes");
+
+  const auto* left = context.FindTensor("left");
+  Expect(left != nullptr, "expected left split output tensor");
+  Expect(left->shape == std::vector<std::int64_t>({2, 1}), "expected left split shape [2,1]");
+  Expect(left->float_data == std::vector<float>({1.f, 5.f}), "unexpected left split output");
+
+  const auto* right = context.FindTensor("right");
+  Expect(right != nullptr, "expected right split output tensor");
+  Expect(right->shape == std::vector<std::int64_t>({2, 3}), "expected right split shape [2,3]");
+  Expect(right->float_data == std::vector<float>({2.f, 3.f, 4.f, 6.f, 7.f, 8.f}),
+         "unexpected right split output");
+}
+
 void TestLayerNormalizationExecutionProducesExpectedOutput() {
   auto graph = MakeGraphWithOps({"LayerNormalization"});
   graph.nodes[0].inputs = {"x", "scale", "bias"};
@@ -1008,6 +1160,10 @@ int main() {
     TestConvSiLUExecutionProducesExpectedOutput();
     TestTanhExecutionProducesExpectedOutput();
     TestSqueezeExecutionProducesExpectedOutput();
+    TestConcatExecutionProducesExpectedOutput();
+    TestTransposeExecutionProducesExpectedOutput();
+    TestSoftmaxExecutionProducesExpectedOutput();
+    TestSplitExecutionProducesExpectedOutput();
     TestLayerNormalizationExecutionProducesExpectedOutput();
     TestWhereExecutionProducesExpectedOutput();
     TestMatMulExecutionSupportsBatchedInputs();
