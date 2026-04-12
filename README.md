@@ -126,6 +126,7 @@ cmake --build build_local -j4
 | `miniort_optimize_model` | 优化前后图差异、优化后再运行 | 看 phase4 |
 | `miniort_compare_providers` | 默认 provider 和 CPU-only 的差异 | 看 phase5 |
 | `miniort_detect_yolov8n` | 最终检测结果和输出文件 | 看 demo 效果 |
+| `miniort_run_gpt` | GPT-2文本生成和推理 | 看GPT模型执行 |
 
 ## 下载模型
 

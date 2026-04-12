@@ -126,6 +126,7 @@ If you want to go through the whole teaching flow in order:
 | `miniort_optimize_model` | graph before/after optimization | phase4 walkthrough |
 | `miniort_compare_providers` | default provider vs CPU-only | phase5 walkthrough |
 | `miniort_detect_yolov8n` | final detections and output files | demo output |
+| `miniort_run_gpt` | GPT-2 text generation and inference | understanding GPT model execution |
 
 ## Download Models
 
