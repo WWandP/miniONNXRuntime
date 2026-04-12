@@ -55,3 +55,5 @@ docs/*
 !docs/phases/
 !docs/phases/*.md
 docs/phase6_gpt_text_pipeline.md
+models/gpt2/model.kv_prefill.onnx
+models/gpt2/model.kv_decode.onnx

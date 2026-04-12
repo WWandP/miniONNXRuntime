@@ -60,11 +60,6 @@ brew install cmake protobuf git
 - Run CPU / Apple provider kernels
 - Trace tensor memory and buffer reuse
 
-## Documentation
-
-- Chinese phase guide: [docs/phases/README.md](./docs/phases/README.md)
-- English phase guide: [docs/phases/README.en.md](./docs/phases/README.en.md)
-
 ## Quick Start
 
 After dependencies are installed, the build/run flow is the same on Linux and macOS:
@@ -132,12 +127,24 @@ If you want to go through the whole teaching flow in order:
 | `miniort_compare_providers` | default provider vs CPU-only | phase5 walkthrough |
 | `miniort_detect_yolov8n` | final detections and output files | demo output |
 
+## Download Models
+
+Since the model files are large, they cannot be uploaded directly to GitHub. Please run the following script to download all required models:
+
+```bash
+./scripts/download_models.sh
+```
+
+This will download the GPT-2 model to the `models/gpt2/` directory and the additional model to the `models/` directory. After downloading, you can run the related phases.
+
 ## GPT Entry
+
+**Note: Before running GPT-2 related phases, please run `./scripts/download_models.sh` to download all models.**
 
 - `./scripts/run_phase.sh phase6`
 - `./scripts/run_phase.sh phase6-kv`
 
-The GPT model assets are included in the repository.
+Please download the models first (see above).
 
 ## Repository Layout
 

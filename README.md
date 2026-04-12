@@ -8,7 +8,7 @@
 
 ![miniONNXRuntime banner](./assets/readme_banner.png)
 
-英文版说明见 [README.en.md](./README.en.md)。
+English version: [README.en.md](./README.en.md)
 
 ## 环境要求
 
@@ -59,11 +59,6 @@ brew install cmake protobuf git
 - 优化图结构
 - 执行 CPU / Apple provider kernels
 - 跟踪 tensor 内存和 buffer reuse
-
-## 文档入口
-
-- 中文 phase 主线：[docs/phases/README.md](./docs/phases/README.md)
-- 英文 phase 主线：[docs/phases/README.en.md](./docs/phases/README.en.md)
 
 ## 快速开始
 
@@ -132,12 +127,24 @@ cmake --build build_local -j4
 | `miniort_compare_providers` | 默认 provider 和 CPU-only 的差异 | 看 phase5 |
 | `miniort_detect_yolov8n` | 最终检测结果和输出文件 | 看 demo 效果 |
 
+## 下载模型
+
+由于模型文件较大，无法直接上传到GitHub。请运行以下脚本下载所有必需的模型：
+
+```bash
+./scripts/download_models.sh
+```
+
+这将下载GPT-2模型到 `models/gpt2/` 目录，并下载附加模型到 `models/` 目录。下载完成后，即可运行相关phase。
+
 ## GPT 入口
+
+**注意：运行GPT-2相关phase前，请先运行 `./scripts/download_models.sh` 下载所有模型。**
 
 - `./scripts/run_phase.sh phase6`
 - `./scripts/run_phase.sh phase6-kv`
 
-GPT 模型资产已随仓库提供。
+请先下载模型（见上文）。
 
 ## 仓库结构
 
