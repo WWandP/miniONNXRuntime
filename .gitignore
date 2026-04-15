@@ -47,13 +47,7 @@ models/gpt2/*
 docs/
 !docs/
 docs/*
-!docs/blog_graph_optimization.md
-!docs/memory_optimization.md
-!docs/gpt2_onnx_gap_analysis.md
-!docs/phase5_gpt2_cpu_bringup.md
-!docs/phase6_gpt_text_pipeline.md
 !docs/phases/
 !docs/phases/*.md
-docs/phase6_gpt_text_pipeline.md
 models/gpt2/model.kv_prefill.onnx
 models/gpt2/model.kv_decode.onnx
