@@ -1,4 +1,5 @@
 #include "miniort/runtime/accelerate_execution_provider.h"
+#include "miniort/runtime/cuda_execution_provider.h"
 #include "miniort/runtime/cpu_execution_provider.h"
 #include "miniort/runtime/session.h"
 
@@ -19,6 +20,11 @@ namespace {
 
 std::vector<std::shared_ptr<const ExecutionProvider>> MakeDefaultProviders() {
   std::vector<std::shared_ptr<const ExecutionProvider>> providers;
+#if defined(MINIORT_BUILD_CUDA_EP)
+  if (IsCudaExecutionProviderAvailable()) {
+    providers.push_back(std::make_shared<CudaExecutionProvider>());
+  }
+#endif
 #if defined(__APPLE__)
   if (IsAccelerateAvailable()) {
     providers.push_back(std::make_shared<AccelerateExecutionProvider>());

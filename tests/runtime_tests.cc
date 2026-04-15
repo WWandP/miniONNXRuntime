@@ -7,6 +7,7 @@
 #include <unordered_map>
 
 #include "miniort/model/graph.h"
+#include "miniort/runtime/cuda_execution_provider.h"
 #include "miniort/runtime/cpu_execution_provider.h"
 #include "miniort/runtime/execution_context.h"
 #include "miniort/runtime/tensor.h"
@@ -27,6 +28,15 @@ Session MakeCpuSession(Graph graph, SessionOptions options = {}) {
   providers.push_back(std::make_shared<miniort::CpuExecutionProvider>());
   return Session(std::move(graph), std::move(providers), options);
 }
+
+#if defined(MINIORT_BUILD_CUDA_EP)
+Session MakeCudaThenCpuSession(Graph graph, SessionOptions options = {}) {
+  std::vector<std::shared_ptr<const miniort::ExecutionProvider>> providers;
+  providers.push_back(std::make_shared<miniort::CudaExecutionProvider>());
+  providers.push_back(std::make_shared<miniort::CpuExecutionProvider>());
+  return Session(std::move(graph), std::move(providers), options);
+}
+#endif
 
 void Expect(bool condition, const std::string& message) {
   if (!condition) {
@@ -315,6 +325,284 @@ void TestMatMulExecutionProducesExpectedOutput() {
   Expect(std::fabs(output->float_data[2] - 139.f) < 1e-5f, "unexpected MatMul output[2]");
   Expect(std::fabs(output->float_data[3] - 154.f) < 1e-5f, "unexpected MatMul output[3]");
 }
+
+#if defined(MINIORT_BUILD_CUDA_EP)
+void TestCudaProviderPrefersMatMulAndFallsBackForUnsupportedOps() {
+  auto graph = MakeGraphWithOps({"MatMul", "Gemm", "Sigmoid", "Add", "Mul", "SiLU"});
+  Session session = MakeCudaThenCpuSession(std::move(graph), SessionOptions{});
+
+  Expect(session.graph().nodes.size() == 6, "expected six-node graph");
+  Expect(session.graph().nodes[0].execution_provider == "CUDA", "expected MatMul to assign to CUDA");
+  Expect(session.graph().nodes[1].execution_provider == "CUDA", "expected Gemm to assign to CUDA");
+  Expect(session.graph().nodes[2].execution_provider == "CUDA", "expected Sigmoid to assign to CUDA");
+  Expect(session.graph().nodes[3].execution_provider == "CUDA", "expected Add to assign to CUDA");
+  Expect(session.graph().nodes[4].execution_provider == "CUDA", "expected Mul to assign to CUDA");
+  Expect(session.graph().nodes[5].execution_provider == "CUDA", "expected SiLU to assign to CUDA");
+}
+
+void TestCudaMatMulExecutionProducesExpectedOutput() {
+  auto graph = MakeGraphWithOps({"MatMul"});
+  graph.nodes[0].inputs = {"a", "b"};
+
+  miniort::Tensor lhs;
+  lhs.name = "a";
+  lhs.dtype = "float32";
+  lhs.shape = {2, 3};
+  lhs.float_data = {1.f, 2.f, 3.f,
+                    4.f, 5.f, 6.f};
+
+  miniort::Tensor rhs;
+  rhs.name = "b";
+  rhs.dtype = "float32";
+  rhs.shape = {3, 2};
+  rhs.float_data = {7.f, 8.f,
+                    9.f, 10.f,
+                    11.f, 12.f};
+
+  Session session = MakeCudaThenCpuSession(std::move(graph), SessionOptions{});
+  miniort::ExecutionContext context;
+  std::unordered_map<std::string, miniort::Tensor> feeds;
+  feeds.emplace(lhs.name, lhs);
+  feeds.emplace(rhs.name, rhs);
+
+  const auto summary = session.Run(feeds, context, nullptr);
+  Expect(summary.executed_nodes == 1, "expected CUDA MatMul graph to execute one node");
+  Expect(summary.provider_executed_node_counts.contains("CUDA"), "expected CUDA execution count");
+  Expect(summary.provider_executed_node_counts.at("CUDA") == 1, "expected CUDA to execute one node");
+
+  const auto* output = context.FindTensor("out_0");
+  Expect(output != nullptr, "expected CUDA MatMul output tensor");
+  Expect(output->shape == std::vector<std::int64_t>({2, 2}), "expected CUDA MatMul output shape [2,2]");
+  Expect(output->float_data.size() == 4, "expected CUDA MatMul output size 4");
+  Expect(std::fabs(output->float_data[0] - 58.f) < 1e-5f, "unexpected CUDA MatMul output[0]");
+  Expect(std::fabs(output->float_data[1] - 64.f) < 1e-5f, "unexpected CUDA MatMul output[1]");
+  Expect(std::fabs(output->float_data[2] - 139.f) < 1e-5f, "unexpected CUDA MatMul output[2]");
+  Expect(std::fabs(output->float_data[3] - 154.f) < 1e-5f, "unexpected CUDA MatMul output[3]");
+}
+
+void TestCudaGemmExecutionProducesExpectedOutput() {
+  auto graph = MakeGraphWithOps({"Gemm"});
+  graph.nodes[0].inputs = {"a", "b", "c"};
+
+  miniort::Tensor a;
+  a.name = "a";
+  a.dtype = "float32";
+  a.shape = {2, 2};
+  a.float_data = {1.f, 2.f,
+                  3.f, 4.f};
+
+  miniort::Tensor b;
+  b.name = "b";
+  b.dtype = "float32";
+  b.shape = {2, 2};
+  b.float_data = {5.f, 6.f,
+                  7.f, 8.f};
+
+  miniort::Tensor c;
+  c.name = "c";
+  c.dtype = "float32";
+  c.shape = {2};
+  c.float_data = {1.f, 2.f};
+
+  Session session = MakeCudaThenCpuSession(std::move(graph), SessionOptions{});
+  miniort::ExecutionContext context;
+  std::unordered_map<std::string, miniort::Tensor> feeds;
+  feeds.emplace(a.name, a);
+  feeds.emplace(b.name, b);
+  feeds.emplace(c.name, c);
+
+  const auto summary = session.Run(feeds, context, nullptr);
+  Expect(summary.executed_nodes == 1, "expected CUDA Gemm graph to execute one node");
+  Expect(summary.provider_executed_node_counts.contains("CUDA"), "expected CUDA Gemm execution count");
+  Expect(summary.provider_executed_node_counts.at("CUDA") == 1, "expected CUDA to execute one Gemm node");
+
+  const auto* output = context.FindTensor("out_0");
+  Expect(output != nullptr, "expected CUDA Gemm output tensor");
+  Expect(output->shape == std::vector<std::int64_t>({2, 2}), "expected CUDA Gemm output shape [2,2]");
+  Expect(output->float_data.size() == 4, "expected CUDA Gemm output size 4");
+  Expect(std::fabs(output->float_data[0] - 20.f) < 1e-5f, "unexpected CUDA Gemm output[0]");
+  Expect(std::fabs(output->float_data[1] - 24.f) < 1e-5f, "unexpected CUDA Gemm output[1]");
+  Expect(std::fabs(output->float_data[2] - 44.f) < 1e-5f, "unexpected CUDA Gemm output[2]");
+  Expect(std::fabs(output->float_data[3] - 52.f) < 1e-5f, "unexpected CUDA Gemm output[3]");
+}
+
+void TestCudaElementwiseExecutionProducesExpectedOutput() {
+  auto graph = MakeGraphWithOps({"Sigmoid", "Tanh", "Add", "Mul", "Div", "SiLU"});
+  graph.nodes[0].inputs = {"x"};
+  graph.nodes[1].inputs = {"x"};
+  graph.nodes[2].inputs = {"a", "b"};
+  graph.nodes[3].inputs = {"a", "b"};
+  graph.nodes[4].inputs = {"a", "scalar_two"};
+  graph.nodes[5].inputs = {"x"};
+
+  miniort::Tensor x;
+  x.name = "x";
+  x.dtype = "float32";
+  x.shape = {3};
+  x.float_data = {-1.f, 0.f, 1.f};
+
+  miniort::Tensor a;
+  a.name = "a";
+  a.dtype = "float32";
+  a.shape = {3};
+  a.float_data = {2.f, 4.f, 6.f};
+
+  miniort::Tensor b;
+  b.name = "b";
+  b.dtype = "float32";
+  b.shape = {3};
+  b.float_data = {1.f, 3.f, 5.f};
+
+  miniort::Tensor scalar_two;
+  scalar_two.name = "scalar_two";
+  scalar_two.dtype = "float32";
+  scalar_two.shape = {};
+  scalar_two.float_data = {2.f};
+
+  Session session = MakeCudaThenCpuSession(std::move(graph), SessionOptions{});
+  miniort::ExecutionContext context;
+  std::unordered_map<std::string, miniort::Tensor> feeds;
+  feeds.emplace(x.name, x);
+  feeds.emplace(a.name, a);
+  feeds.emplace(b.name, b);
+  feeds.emplace(scalar_two.name, scalar_two);
+
+  const auto summary = session.Run(feeds, context, nullptr);
+  Expect(summary.executed_nodes == 6, "expected CUDA elementwise graph to execute six nodes");
+  Expect(summary.provider_executed_node_counts.contains("CUDA"), "expected CUDA elementwise execution count");
+  Expect(summary.provider_executed_node_counts.at("CUDA") == 6, "expected CUDA to execute all elementwise nodes");
+
+  const auto* sigmoid_output = context.FindTensor("out_0");
+  Expect(sigmoid_output != nullptr, "expected CUDA Sigmoid output tensor");
+  const std::vector<float> expected_sigmoid = {
+      1.0f / (1.0f + std::exp(1.0f)),
+      0.5f,
+      1.0f / (1.0f + std::exp(-1.0f)),
+  };
+  for (std::size_t i = 0; i < expected_sigmoid.size(); ++i) {
+    Expect(std::fabs(sigmoid_output->float_data[i] - expected_sigmoid[i]) < 1e-5f,
+           "unexpected CUDA Sigmoid output");
+  }
+
+  const auto* tanh_output = context.FindTensor("out_1");
+  Expect(tanh_output != nullptr, "expected CUDA Tanh output tensor");
+  for (std::size_t i = 0; i < x.float_data.size(); ++i) {
+    Expect(std::fabs(tanh_output->float_data[i] - std::tanh(x.float_data[i])) < 1e-5f,
+           "unexpected CUDA Tanh output");
+  }
+
+  const auto* add_output = context.FindTensor("out_2");
+  Expect(add_output != nullptr, "expected CUDA Add output tensor");
+  const std::vector<float> expected_add = {3.f, 7.f, 11.f};
+  Expect(add_output->float_data == expected_add, "unexpected CUDA Add output");
+
+  const auto* mul_output = context.FindTensor("out_3");
+  Expect(mul_output != nullptr, "expected CUDA Mul output tensor");
+  const std::vector<float> expected_mul = {2.f, 12.f, 30.f};
+  Expect(mul_output->float_data == expected_mul, "unexpected CUDA Mul output");
+
+  const auto* div_output = context.FindTensor("out_4");
+  Expect(div_output != nullptr, "expected CUDA Div output tensor");
+  const std::vector<float> expected_div = {1.f, 2.f, 3.f};
+  for (std::size_t i = 0; i < expected_div.size(); ++i) {
+    Expect(std::fabs(div_output->float_data[i] - expected_div[i]) < 1e-5f,
+           "unexpected CUDA Div output");
+  }
+
+  const auto* silu_output = context.FindTensor("out_5");
+  Expect(silu_output != nullptr, "expected CUDA SiLU output tensor");
+  for (std::size_t i = 0; i < x.float_data.size(); ++i) {
+    const auto value = x.float_data[i];
+    const auto expected = value * (1.0f / (1.0f + std::exp(-value)));
+    Expect(std::fabs(silu_output->float_data[i] - expected) < 1e-5f,
+           "unexpected CUDA SiLU output");
+  }
+}
+
+void TestCudaConvExecutionProducesExpectedOutput() {
+  auto graph = MakeGraphWithOps({"Conv"});
+  graph.nodes[0].inputs = {"x", "w", "b"};
+
+  miniort::Tensor x;
+  x.name = "x";
+  x.dtype = "float32";
+  x.shape = {1, 1, 2, 2};
+  x.float_data = {1.f, 2.f,
+                  3.f, 4.f};
+
+  miniort::Tensor w;
+  w.name = "w";
+  w.dtype = "float32";
+  w.shape = {1, 1, 1, 1};
+  w.float_data = {2.f};
+
+  miniort::Tensor b;
+  b.name = "b";
+  b.dtype = "float32";
+  b.shape = {1};
+  b.float_data = {1.f};
+
+  Session session = MakeCudaThenCpuSession(std::move(graph), SessionOptions{});
+  miniort::ExecutionContext context;
+  std::unordered_map<std::string, miniort::Tensor> feeds;
+  feeds.emplace(x.name, x);
+  feeds.emplace(w.name, w);
+  feeds.emplace(b.name, b);
+
+  const auto summary = session.Run(feeds, context, nullptr);
+  Expect(summary.executed_nodes == 1, "expected CUDA Conv graph to execute one node");
+  Expect(summary.provider_executed_node_counts.contains("CUDA"), "expected CUDA Conv execution count");
+  Expect(summary.provider_executed_node_counts.at("CUDA") == 1, "expected CUDA to execute one Conv node");
+
+  const auto* output = context.FindTensor("out_0");
+  Expect(output != nullptr, "expected CUDA Conv output tensor");
+  Expect(output->shape == std::vector<std::int64_t>({1, 1, 2, 2}), "expected CUDA Conv output shape [1,1,2,2]");
+  const std::vector<float> expected = {3.f, 5.f, 7.f, 9.f};
+  for (std::size_t i = 0; i < expected.size(); ++i) {
+    Expect(std::fabs(output->float_data[i] - expected[i]) < 1e-5f, "unexpected CUDA Conv output value");
+  }
+}
+
+void TestCudaMaxPoolExecutionProducesExpectedOutput() {
+  auto graph = MakeGraphWithOps({"MaxPool"});
+  graph.nodes[0].inputs = {"x"};
+  graph.nodes[0].attributes["kernel_shape"].kind = miniort::AttributeValue::Kind::kInts;
+  graph.nodes[0].attributes["kernel_shape"].ints = {2, 2};
+  graph.nodes[0].attributes["strides"].kind = miniort::AttributeValue::Kind::kInts;
+  graph.nodes[0].attributes["strides"].ints = {2, 2};
+  graph.nodes[0].attributes["pads"].kind = miniort::AttributeValue::Kind::kInts;
+  graph.nodes[0].attributes["pads"].ints = {0, 0, 0, 0};
+
+  miniort::Tensor x;
+  x.name = "x";
+  x.dtype = "float32";
+  x.shape = {1, 1, 4, 4};
+  x.float_data = {
+      1.f, 2.f, 3.f, 4.f,
+      5.f, 6.f, 7.f, 8.f,
+      9.f, 10.f, 11.f, 12.f,
+      13.f, 14.f, 15.f, 16.f,
+  };
+
+  Session session = MakeCudaThenCpuSession(std::move(graph), SessionOptions{});
+  miniort::ExecutionContext context;
+  std::unordered_map<std::string, miniort::Tensor> feeds;
+  feeds.emplace(x.name, x);
+
+  const auto summary = session.Run(feeds, context, nullptr);
+  Expect(summary.executed_nodes == 1, "expected CUDA MaxPool graph to execute one node");
+  Expect(summary.provider_executed_node_counts.contains("CUDA"), "expected CUDA MaxPool execution count");
+  Expect(summary.provider_executed_node_counts.at("CUDA") == 1, "expected CUDA to execute one MaxPool node");
+
+  const auto* output = context.FindTensor("out_0");
+  Expect(output != nullptr, "expected CUDA MaxPool output tensor");
+  Expect(output->shape == std::vector<std::int64_t>({1, 1, 2, 2}), "expected CUDA MaxPool output shape [1,1,2,2]");
+  const std::vector<float> expected = {6.f, 8.f, 14.f, 16.f};
+  for (std::size_t i = 0; i < expected.size(); ++i) {
+    Expect(std::fabs(output->float_data[i] - expected[i]) < 1e-5f, "unexpected CUDA MaxPool output value");
+  }
+}
+#endif
 
 void TestConvExecutionProducesExpectedOutput() {
   auto graph = MakeGraphWithOps({"Conv"});
@@ -1154,6 +1442,14 @@ int main() {
   TestGptCacheBindingRejectsMalformedSchemas();
   TestEmptyInt64ConstantSurvivesAndFeedsConstantOfShape();
   TestMatMulExecutionProducesExpectedOutput();
+#if defined(MINIORT_BUILD_CUDA_EP)
+    TestCudaProviderPrefersMatMulAndFallsBackForUnsupportedOps();
+    TestCudaMatMulExecutionProducesExpectedOutput();
+    TestCudaGemmExecutionProducesExpectedOutput();
+    TestCudaElementwiseExecutionProducesExpectedOutput();
+    TestCudaConvExecutionProducesExpectedOutput();
+    TestCudaMaxPoolExecutionProducesExpectedOutput();
+#endif
     TestConvExecutionProducesExpectedOutput();
     TestGemmExecutionProducesExpectedOutput();
     TestSiLUExecutionProducesExpectedOutput();

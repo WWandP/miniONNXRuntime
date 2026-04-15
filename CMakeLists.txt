@@ -11,6 +11,7 @@ option(MINIORT_BUILD_RUNTIME_TOOLS "Build phase-2/3 runtime tools" ON)
 option(MINIORT_BUILD_DETECT_TOOL "Build yolov8n detect demo tool" ON)
 option(MINIORT_BUILD_OPTIMIZER_TOOLS "Build graph optimizer demo tool" OFF)
 option(MINIORT_BUILD_TESTS "Build runtime tests" ON)
+option(MINIORT_BUILD_CUDA_EP "Build CUDA execution provider" OFF)
 
 set(MINIORT_THIRD_PARTY_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party")
 set(MINIORT_ONNX_DIR "${MINIORT_THIRD_PARTY_DIR}/onnx")
@@ -28,6 +29,23 @@ endforeach()
 find_package(Protobuf CONFIG QUIET)
 if(NOT Protobuf_FOUND)
   find_package(Protobuf REQUIRED)
+endif()
+
+if(MINIORT_BUILD_CUDA_EP)
+  if(NOT CMAKE_CUDA_COMPILER)
+    if(DEFINED ENV{CUDACXX} AND EXISTS "$ENV{CUDACXX}")
+      set(CMAKE_CUDA_COMPILER "$ENV{CUDACXX}" CACHE FILEPATH "CUDA compiler" FORCE)
+    elseif(EXISTS "/usr/local/cuda/bin/nvcc")
+      set(CMAKE_CUDA_COMPILER "/usr/local/cuda/bin/nvcc" CACHE FILEPATH "CUDA compiler" FORCE)
+    endif()
+  endif()
+  if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
+    set(CMAKE_CUDA_ARCHITECTURES native CACHE STRING "CUDA architectures" FORCE)
+  endif()
+  enable_language(CUDA)
+  set(CMAKE_CUDA_STANDARD 17)
+  set(CMAKE_CUDA_STANDARD_REQUIRED ON)
+  find_package(CUDAToolkit REQUIRED)
 endif()
 
 add_library(miniort_onnx_proto STATIC
@@ -102,6 +120,13 @@ if(MINIORT_BUILD_RUNTIME_TOOLS OR MINIORT_BUILD_DETECT_TOOL OR MINIORT_BUILD_TES
     src/tools/gpt2_cache_binding.cc
   )
 
+  if(MINIORT_BUILD_CUDA_EP)
+    target_sources(miniort_runtime PRIVATE
+      src/runtime/cuda_execution_provider.cc
+      src/runtime/cuda_elementwise_kernels.cu
+    )
+  endif()
+
   if(APPLE)
     target_sources(miniort_runtime PRIVATE
       src/runtime/accelerate_execution_provider.cc
@@ -118,10 +143,22 @@ if(MINIORT_BUILD_RUNTIME_TOOLS OR MINIORT_BUILD_DETECT_TOOL OR MINIORT_BUILD_TES
 
   target_compile_definitions(miniort_runtime PUBLIC ONNX_ML=1)
 
+  if(MINIORT_BUILD_CUDA_EP)
+    target_compile_definitions(miniort_runtime PUBLIC MINIORT_BUILD_CUDA_EP=1)
+  endif()
+
   target_link_libraries(miniort_runtime
     PUBLIC
       miniort_model
   )
+
+  if(MINIORT_BUILD_CUDA_EP)
+    target_link_libraries(miniort_runtime
+      PUBLIC
+        CUDA::cudart
+        CUDA::cublas
+    )
+  endif()
 
   if(APPLE)
     target_compile_definitions(miniort_runtime PUBLIC ACCELERATE_NEW_LAPACK=1)
