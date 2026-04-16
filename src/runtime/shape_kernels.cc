@@ -675,6 +675,150 @@ void RegisterShapeKernels(KernelRegistry& registry) {
     }
   });
 
+  registry.Register("ReduceMean", [](const Node& node, ExecutionContext& context, std::ostream* trace) {
+    const auto& input = RequireTensor(context, node.inputs.at(0));
+    const auto& input_data = RequireFloatData(input, "ReduceMean");
+    std::vector<std::int64_t> axes;
+    if (node.inputs.size() > 1 && !node.inputs.at(1).empty()) {
+      axes = ReadVectorAsInt64(RequireTensor(context, node.inputs.at(1)), "ReduceMean");
+    } else {
+      axes = ReadIntsAttribute(node, "axes", {});
+    }
+    if (axes.empty()) {
+      axes.resize(input.shape.size());
+      for (std::size_t i = 0; i < axes.size(); ++i) {
+        axes[i] = static_cast<std::int64_t>(i);
+      }
+    }
+    const auto keepdims = ReadIntAttribute(node, "keepdims", 1);
+    const auto normalized_axes = NormalizeAxes(axes, input.shape.size());
+
+    std::vector<bool> is_reduced_axis(input.shape.size(), false);
+    for (const auto axis : normalized_axes) {
+      is_reduced_axis[static_cast<std::size_t>(axis)] = true;
+    }
+
+    std::vector<std::int64_t> output_shape;
+    output_shape.reserve(input.shape.size());
+    for (std::size_t i = 0; i < input.shape.size(); ++i) {
+      if (is_reduced_axis[i]) {
+        if (keepdims != 0) {
+          output_shape.push_back(1);
+        }
+      } else {
+        output_shape.push_back(input.shape[i]);
+      }
+    }
+
+    auto output = MakeFloatOutput(node.outputs.at(0), output_shape, context);
+    std::fill(output.float_data.begin(), output.float_data.end(), 0.0f);
+    std::vector<std::int64_t> counts(output.float_data.size(), 0);
+    const auto input_strides = ComputeStrides(input.shape);
+    const auto output_strides = ComputeStrides(output_shape);
+
+    for (std::size_t i = 0; i < input_data.size(); ++i) {
+      const auto input_index = UnravelIndex(i, input.shape, input_strides);
+      std::vector<std::int64_t> output_index;
+      output_index.reserve(output_shape.size());
+      for (std::size_t dim = 0; dim < input.shape.size(); ++dim) {
+        if (is_reduced_axis[dim]) {
+          if (keepdims != 0) {
+            output_index.push_back(0);
+          }
+        } else {
+          output_index.push_back(input_index[dim]);
+        }
+      }
+
+      const auto output_offset = output_index.empty() ? 0 : ComputeOffset(output_index, output_strides);
+      output.float_data[output_offset] += input_data[i];
+      ++counts[output_offset];
+    }
+
+    for (std::size_t i = 0; i < output.float_data.size(); ++i) {
+      if (counts[i] == 0) {
+        throw std::runtime_error("ReduceMean encountered empty reduction bucket");
+      }
+      output.float_data[i] /= static_cast<float>(counts[i]);
+    }
+
+    context.BindTensor(std::move(output));
+    if (trace != nullptr) {
+      *trace << "    kernel ReduceMean produced " << node.outputs.at(0) << "\n";
+    }
+  });
+
+  registry.Register("Trilu", [](const Node& node, ExecutionContext& context, std::ostream* trace) {
+    const auto& input = RequireTensor(context, node.inputs.at(0));
+    if (input.shape.size() < 2) {
+      throw std::runtime_error("Trilu requires rank >= 2");
+    }
+
+    const auto upper = ReadIntAttribute(node, "upper", 1) != 0;
+    std::int64_t k = 0;
+    if (node.inputs.size() > 1 && !node.inputs.at(1).empty()) {
+      k = ReadScalarAsInt64(RequireTensor(context, node.inputs.at(1)), "Trilu");
+    }
+
+    const auto rows = static_cast<std::size_t>(input.shape[input.shape.size() - 2]);
+    const auto cols = static_cast<std::size_t>(input.shape[input.shape.size() - 1]);
+    const auto matrix_size = rows * cols;
+    std::size_t batch = 1;
+    for (std::size_t i = 0; i + 2 < input.shape.size(); ++i) {
+      batch *= static_cast<std::size_t>(input.shape[i]);
+    }
+
+    if (input.dtype == "float32") {
+      const auto& input_data = RequireFloatData(input, "Trilu");
+      auto output = MakeFloatOutput(node.outputs.at(0), input.shape, context);
+      std::fill(output.float_data.begin(), output.float_data.end(), 0.0f);
+
+      for (std::size_t b = 0; b < batch; ++b) {
+        const auto base = b * matrix_size;
+        for (std::size_t i = 0; i < rows; ++i) {
+          for (std::size_t j = 0; j < cols; ++j) {
+            const auto row = static_cast<std::int64_t>(i);
+            const auto col = static_cast<std::int64_t>(j);
+            const bool keep = upper ? (col - row >= k) : (col - row <= k);
+            if (keep) {
+              const auto offset = base + i * cols + j;
+              output.float_data[offset] = input_data[offset];
+            }
+          }
+        }
+      }
+
+      context.BindTensor(std::move(output));
+    } else if (input.dtype == "int64") {
+      const auto& input_data = RequireInt64Data(input, "Trilu");
+      auto output = MakeInt64Output(node.outputs.at(0), input.shape, context);
+      std::fill(output.int64_data.begin(), output.int64_data.end(), 0);
+
+      for (std::size_t b = 0; b < batch; ++b) {
+        const auto base = b * matrix_size;
+        for (std::size_t i = 0; i < rows; ++i) {
+          for (std::size_t j = 0; j < cols; ++j) {
+            const auto row = static_cast<std::int64_t>(i);
+            const auto col = static_cast<std::int64_t>(j);
+            const bool keep = upper ? (col - row >= k) : (col - row <= k);
+            if (keep) {
+              const auto offset = base + i * cols + j;
+              output.int64_data[offset] = input_data[offset];
+            }
+          }
+        }
+      }
+
+      context.BindTensor(std::move(output));
+    } else {
+      throw std::runtime_error("Trilu currently supports float32/int64 only");
+    }
+
+    if (trace != nullptr) {
+      *trace << "    kernel Trilu produced " << node.outputs.at(0) << "\n";
+    }
+  });
+
   registry.Register("ArgMax", [](const Node& node, ExecutionContext& context, std::ostream* trace) {
     const auto& input = RequireTensor(context, node.inputs.at(0));
     const auto& input_data = RequireFloatData(input, "ArgMax");

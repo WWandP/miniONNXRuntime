@@ -4,6 +4,7 @@
 #include "miniort/runtime/session.h"
 
 #include <algorithm>
+#include <cstdint>
 #include <iomanip>
 #include <memory>
 #include <set>
@@ -45,6 +46,124 @@ std::string JoinProviderNames(const std::vector<std::shared_ptr<const ExecutionP
   return oss.str();
 }
 
+std::vector<std::int64_t> ResolveTransposePerm2D(const Node& node, const std::vector<std::int64_t>& input_shape) {
+  if (input_shape.size() != 2) {
+    return {};
+  }
+  const auto perm_it = node.attributes.find("perm");
+  if (perm_it == node.attributes.end()) {
+    return {1, 0};
+  }
+  const auto& attr = perm_it->second;
+  if (attr.kind != AttributeValue::Kind::kInts || attr.ints.size() != 2) {
+    return {};
+  }
+  if (attr.ints[0] == 1 && attr.ints[1] == 0) {
+    return {1, 0};
+  }
+  return {};
+}
+
+bool TryFoldInitializerTranspose2D(Graph& graph, Node& node) {
+  if (node.op_type != "Transpose" || node.inputs.size() != 1 || node.outputs.empty()) {
+    return false;
+  }
+
+  const auto init_it = graph.initializers.find(node.inputs[0]);
+  if (init_it == graph.initializers.end() || !init_it->second.data.has_value()) {
+    return false;
+  }
+
+  const auto& source_value = init_it->second;
+  const auto& source_data = *source_value.data;
+  const auto perm = ResolveTransposePerm2D(node, source_data.shape);
+  if (perm.empty()) {
+    return false;
+  }
+
+  const auto rows = static_cast<std::size_t>(source_data.shape[0]);
+  const auto cols = static_cast<std::size_t>(source_data.shape[1]);
+  const auto expected_count = rows * cols;
+  if (expected_count == 0) {
+    return false;
+  }
+
+  TensorData folded_data;
+  folded_data.dtype = source_data.dtype;
+  folded_data.shape = {source_data.shape[1], source_data.shape[0]};
+
+  if (source_data.dtype == "float32") {
+    if (source_data.float_data.size() != expected_count) {
+      return false;
+    }
+    folded_data.float_data.resize(expected_count);
+    for (std::size_t i = 0; i < rows; ++i) {
+      for (std::size_t j = 0; j < cols; ++j) {
+        folded_data.float_data[j * rows + i] = source_data.float_data[i * cols + j];
+      }
+    }
+  } else if (source_data.dtype == "int64") {
+    if (source_data.int64_data.size() != expected_count) {
+      return false;
+    }
+    folded_data.int64_data.resize(expected_count);
+    for (std::size_t i = 0; i < rows; ++i) {
+      for (std::size_t j = 0; j < cols; ++j) {
+        folded_data.int64_data[j * rows + i] = source_data.int64_data[i * cols + j];
+      }
+    }
+  } else {
+    return false;
+  }
+
+  Value folded_value;
+  folded_value.name = node.outputs[0];
+  folded_value.info.dtype = folded_data.dtype;
+  folded_value.info.is_initializer = true;
+  for (const auto dim : folded_data.shape) {
+    folded_value.info.shape.push_back(std::to_string(dim));
+  }
+  folded_value.data = folded_data;
+  graph.initializers[folded_value.name] = folded_value;
+
+  if (auto info_it = graph.value_infos.find(folded_value.name); info_it != graph.value_infos.end()) {
+    info_it->second.dtype = folded_value.info.dtype;
+    info_it->second.is_initializer = true;
+    info_it->second.shape = folded_value.info.shape;
+  }
+
+  node.op_type = "Constant";
+  node.inputs.clear();
+  node.attributes.clear();
+  AttributeValue value_attr;
+  value_attr.kind = AttributeValue::Kind::kTensor;
+  value_attr.tensor = folded_data;
+  node.attributes.emplace("value", std::move(value_attr));
+  return true;
+}
+
+void FoldInitializerTransposeNodes(Graph& graph) {
+  std::size_t folded_count = 0;
+  for (auto& node : graph.nodes) {
+    if (TryFoldInitializerTranspose2D(graph, node)) {
+      ++folded_count;
+    }
+  }
+  if (folded_count == 0) {
+    return;
+  }
+
+  const auto transpose_it = graph.op_type_histogram.find("Transpose");
+  if (transpose_it != graph.op_type_histogram.end()) {
+    if (transpose_it->second > folded_count) {
+      transpose_it->second -= folded_count;
+    } else {
+      graph.op_type_histogram.erase(transpose_it);
+    }
+  }
+  graph.op_type_histogram["Constant"] += folded_count;
+}
+
 }  // namespace
 
 Session::Session(Graph graph, SessionOptions options)
@@ -52,6 +171,7 @@ Session::Session(Graph graph, SessionOptions options)
 
 Session::Session(Graph graph, std::vector<std::shared_ptr<const ExecutionProvider>> providers, SessionOptions options)
     : graph_(std::move(graph)), options_(options), providers_(std::move(providers)) {
+  FoldInitializerTransposeNodes(graph_);
   providers_.erase(std::remove(providers_.begin(), providers_.end(), nullptr), providers_.end());
   if (providers_.empty()) {
     providers_ = MakeDefaultProviders();

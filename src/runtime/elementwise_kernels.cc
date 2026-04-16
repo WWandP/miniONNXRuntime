@@ -50,6 +50,40 @@ void RegisterElementwiseKernels(KernelRegistry& registry) {
     }
   });
 
+  registry.Register("Neg", [](const Node& node, ExecutionContext& context, std::ostream* trace) {
+    const auto& input = RequireTensor(context, node.inputs.at(0));
+    if (input.dtype == "float32") {
+      const auto& input_data = RequireFloatData(input, "Neg");
+      auto output = MakeOutputLikeWithReusedStorage(node.outputs.at(0), input, context);
+      std::transform(input_data.begin(), input_data.end(), output.float_data.begin(),
+                     [](float value) { return -value; });
+      context.BindTensor(std::move(output));
+    } else if (input.dtype == "int64") {
+      const auto& input_data = RequireInt64Data(input, "Neg");
+      auto output = MakeOutputLikeWithReusedStorage(node.outputs.at(0), input, context);
+      std::transform(input_data.begin(), input_data.end(), output.int64_data.begin(),
+                     [](std::int64_t value) { return -value; });
+      context.BindTensor(std::move(output));
+    } else {
+      throw std::runtime_error("Neg currently supports float32/int64 only");
+    }
+    if (trace != nullptr) {
+      *trace << "    kernel Neg produced " << node.outputs.at(0) << "\n";
+    }
+  });
+
+  registry.Register("Sqrt", [](const Node& node, ExecutionContext& context, std::ostream* trace) {
+    const auto& input = RequireTensor(context, node.inputs.at(0));
+    const auto& input_data = RequireFloatData(input, "Sqrt");
+    auto output = MakeOutputLikeWithReusedStorage(node.outputs.at(0), input, context);
+    std::transform(input_data.begin(), input_data.end(), output.float_data.begin(),
+                   [](float value) { return std::sqrt(value); });
+    context.BindTensor(std::move(output));
+    if (trace != nullptr) {
+      *trace << "    kernel Sqrt produced " << node.outputs.at(0) << "\n";
+    }
+  });
+
   const auto register_binary_numeric_kernel =
       [&registry](const std::string& op_type, const std::function<float(float, float)>& eval_float,
                   const std::function<std::int64_t(std::int64_t, std::int64_t)>& eval_int) {
@@ -99,6 +133,53 @@ void RegisterElementwiseKernels(KernelRegistry& registry) {
         });
       };
 
+  const auto register_binary_compare_kernel =
+      [&registry](const std::string& op_type, const std::function<bool(float, float)>& eval_float,
+                  const std::function<bool(std::int64_t, std::int64_t)>& eval_int) {
+        registry.Register(op_type, [op_type, eval_float, eval_int](const Node& node, ExecutionContext& context,
+                                                                   std::ostream* trace) {
+          const auto& lhs = RequireTensor(context, node.inputs.at(0));
+          const auto& rhs = RequireTensor(context, node.inputs.at(1));
+          const auto output_shape = ComputeBroadcastShape(lhs.shape, rhs.shape, op_type);
+          const auto output_strides = ComputeStrides(output_shape);
+          const auto lhs_strides = ComputeStrides(lhs.shape);
+          const auto rhs_strides = ComputeStrides(rhs.shape);
+          const auto element_count = GetElementCount(output_shape);
+          auto output = MakeInt64Output(node.outputs.at(0), output_shape, context);
+
+          if (lhs.dtype == "int64" && rhs.dtype == "int64") {
+            const auto& lhs_data = RequireInt64Data(lhs, op_type);
+            const auto& rhs_data = RequireInt64Data(rhs, op_type);
+            for (std::size_t i = 0; i < element_count; ++i) {
+              const auto output_index = UnravelIndex(i, output_shape, output_strides);
+              const auto lhs_offset = ComputeBroadcastOffset(output_index, lhs.shape, lhs_strides);
+              const auto rhs_offset = ComputeBroadcastOffset(output_index, rhs.shape, rhs_strides);
+              output.int64_data[i] = eval_int(lhs_data[lhs_offset], rhs_data[rhs_offset]) ? 1 : 0;
+            }
+          } else {
+            const auto* lhs_float_data = lhs.dtype == "float32" ? &RequireFloatData(lhs, op_type) : nullptr;
+            const auto* lhs_int_data = lhs.dtype == "int64" ? &RequireInt64Data(lhs, op_type) : nullptr;
+            const auto* rhs_float_data = rhs.dtype == "float32" ? &RequireFloatData(rhs, op_type) : nullptr;
+            const auto* rhs_int_data = rhs.dtype == "int64" ? &RequireInt64Data(rhs, op_type) : nullptr;
+            for (std::size_t i = 0; i < element_count; ++i) {
+              const auto output_index = UnravelIndex(i, output_shape, output_strides);
+              const auto lhs_offset = ComputeBroadcastOffset(output_index, lhs.shape, lhs_strides);
+              const auto rhs_offset = ComputeBroadcastOffset(output_index, rhs.shape, rhs_strides);
+              const auto lhs_value = lhs_float_data != nullptr ? (*lhs_float_data)[lhs_offset]
+                                                               : static_cast<float>((*lhs_int_data)[lhs_offset]);
+              const auto rhs_value = rhs_float_data != nullptr ? (*rhs_float_data)[rhs_offset]
+                                                               : static_cast<float>((*rhs_int_data)[rhs_offset]);
+              output.int64_data[i] = eval_float(lhs_value, rhs_value) ? 1 : 0;
+            }
+          }
+
+          context.BindTensor(std::move(output));
+          if (trace != nullptr) {
+            *trace << "    kernel " << op_type << " produced " << node.outputs.at(0) << "\n";
+          }
+        });
+      };
+
   register_binary_numeric_kernel("Add", [](float lhs, float rhs) { return lhs + rhs; },
                                  [](std::int64_t lhs, std::int64_t rhs) { return lhs + rhs; });
 
@@ -122,6 +203,12 @@ void RegisterElementwiseKernels(KernelRegistry& registry) {
 
   register_binary_numeric_kernel("Sub", [](float lhs, float rhs) { return lhs - rhs; },
                                  [](std::int64_t lhs, std::int64_t rhs) { return lhs - rhs; });
+
+  register_binary_compare_kernel("Equal", [](float lhs, float rhs) { return lhs == rhs; },
+                                 [](std::int64_t lhs, std::int64_t rhs) { return lhs == rhs; });
+
+  register_binary_compare_kernel("Less", [](float lhs, float rhs) { return lhs < rhs; },
+                                 [](std::int64_t lhs, std::int64_t rhs) { return lhs < rhs; });
 
   registry.Register("Pow", [](const Node& node, ExecutionContext& context, std::ostream* trace) {
     const auto& lhs = RequireTensor(context, node.inputs.at(0));
@@ -266,8 +353,24 @@ void RegisterElementwiseKernels(KernelRegistry& registry) {
         throw std::runtime_error("Cast to int64 currently supports int64/float32 only");
       }
       context.BindTensor(std::move(output));
+    } else if (to_type == 9) {
+      auto output = MakeInt64Output(node.outputs.at(0), input.shape, context);
+      if (input.dtype == "int64") {
+        const auto& input_data = RequireInt64Data(input, "Cast");
+        for (std::size_t i = 0; i < input_data.size(); ++i) {
+          output.int64_data[i] = input_data[i] != 0 ? 1 : 0;
+        }
+      } else if (input.dtype == "float32") {
+        const auto& input_data = RequireFloatData(input, "Cast");
+        for (std::size_t i = 0; i < input_data.size(); ++i) {
+          output.int64_data[i] = input_data[i] != 0.0f ? 1 : 0;
+        }
+      } else {
+        throw std::runtime_error("Cast to bool currently supports int64/float32 only");
+      }
+      context.BindTensor(std::move(output));
     } else {
-      throw std::runtime_error("Cast currently supports only float32/int32/int64 outputs");
+      throw std::runtime_error("Cast currently supports only float32/int32/int64/bool outputs");
     }
     if (trace != nullptr) {
       *trace << "    kernel Cast produced " << node.outputs.at(0) << "\n";

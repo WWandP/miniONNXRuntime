@@ -598,6 +598,174 @@ Tensor RunWhereAccelerate(const Node& node, const Tensor& condition, const Tenso
   return output;
 }
 
+template <typename IntCompare, typename FloatCompare>
+Tensor RunCompareAccelerate(const std::string& op_type, const Node& node, const Tensor& lhs, const Tensor& rhs,
+                            ExecutionContext& context, IntCompare int_compare, FloatCompare float_compare) {
+  const auto output_shape = ComputeBroadcastShape(lhs.shape, rhs.shape, op_type);
+  const auto output_strides = ComputeStrides(output_shape);
+  const auto lhs_strides = ComputeStrides(lhs.shape);
+  const auto rhs_strides = ComputeStrides(rhs.shape);
+  const auto element_count = GetElementCount(output_shape);
+  auto output = MakeInt64Output(node.outputs.at(0), output_shape, context);
+
+  if (lhs.dtype == "int64" && rhs.dtype == "int64") {
+    const auto& lhs_data = RequireInt64Data(lhs, op_type);
+    const auto& rhs_data = RequireInt64Data(rhs, op_type);
+    for (std::size_t i = 0; i < element_count; ++i) {
+      const auto output_index = UnravelIndex(i, output_shape, output_strides);
+      const auto lhs_offset = ComputeBroadcastOffset(output_index, lhs.shape, lhs_strides);
+      const auto rhs_offset = ComputeBroadcastOffset(output_index, rhs.shape, rhs_strides);
+      output.int64_data[i] = int_compare(lhs_data[lhs_offset], rhs_data[rhs_offset]) ? 1 : 0;
+    }
+    return output;
+  }
+
+  const auto* lhs_float_data = lhs.dtype == "float32" ? &RequireFloatData(lhs, op_type) : nullptr;
+  const auto* lhs_int_data = lhs.dtype == "int64" ? &RequireInt64Data(lhs, op_type) : nullptr;
+  const auto* rhs_float_data = rhs.dtype == "float32" ? &RequireFloatData(rhs, op_type) : nullptr;
+  const auto* rhs_int_data = rhs.dtype == "int64" ? &RequireInt64Data(rhs, op_type) : nullptr;
+  for (std::size_t i = 0; i < element_count; ++i) {
+    const auto output_index = UnravelIndex(i, output_shape, output_strides);
+    const auto lhs_offset = ComputeBroadcastOffset(output_index, lhs.shape, lhs_strides);
+    const auto rhs_offset = ComputeBroadcastOffset(output_index, rhs.shape, rhs_strides);
+    const auto lhs_value =
+        lhs_float_data != nullptr ? (*lhs_float_data)[lhs_offset] : static_cast<float>((*lhs_int_data)[lhs_offset]);
+    const auto rhs_value =
+        rhs_float_data != nullptr ? (*rhs_float_data)[rhs_offset] : static_cast<float>((*rhs_int_data)[rhs_offset]);
+    output.int64_data[i] = float_compare(lhs_value, rhs_value) ? 1 : 0;
+  }
+  return output;
+}
+
+Tensor RunReduceMeanAccelerate(const Node& node, const Tensor& input, ExecutionContext& context) {
+  const auto& input_data = RequireFloatData(input, "ReduceMean");
+  std::vector<std::int64_t> axes;
+  if (node.inputs.size() > 1 && !node.inputs.at(1).empty()) {
+    axes = ReadVectorAsInt64(RequireTensor(context, node.inputs.at(1)), "ReduceMean");
+  } else {
+    axes = ReadIntsAttribute(node, "axes", {});
+  }
+  if (axes.empty()) {
+    axes.resize(input.shape.size());
+    for (std::size_t i = 0; i < axes.size(); ++i) {
+      axes[i] = static_cast<std::int64_t>(i);
+    }
+  }
+  const auto keepdims = ReadIntAttribute(node, "keepdims", 1);
+  const auto normalized_axes = NormalizeAxes(axes, input.shape.size());
+  std::vector<bool> is_reduced_axis(input.shape.size(), false);
+  for (const auto axis : normalized_axes) {
+    is_reduced_axis[static_cast<std::size_t>(axis)] = true;
+  }
+
+  std::vector<std::int64_t> output_shape;
+  output_shape.reserve(input.shape.size());
+  for (std::size_t i = 0; i < input.shape.size(); ++i) {
+    if (is_reduced_axis[i]) {
+      if (keepdims != 0) {
+        output_shape.push_back(1);
+      }
+    } else {
+      output_shape.push_back(input.shape[i]);
+    }
+  }
+
+  auto output = MakeFloatOutput(node.outputs.at(0), output_shape, context);
+  std::fill(output.float_data.begin(), output.float_data.end(), 0.0f);
+  std::vector<std::int64_t> counts(output.float_data.size(), 0);
+  const auto input_strides = ComputeStrides(input.shape);
+  const auto output_strides = ComputeStrides(output_shape);
+
+  for (std::size_t i = 0; i < input_data.size(); ++i) {
+    const auto input_index = UnravelIndex(i, input.shape, input_strides);
+    std::vector<std::int64_t> output_index;
+    output_index.reserve(output_shape.size());
+    for (std::size_t dim = 0; dim < input.shape.size(); ++dim) {
+      if (is_reduced_axis[dim]) {
+        if (keepdims != 0) {
+          output_index.push_back(0);
+        }
+      } else {
+        output_index.push_back(input_index[dim]);
+      }
+    }
+    const auto output_offset = output_index.empty() ? 0 : ComputeOffset(output_index, output_strides);
+    output.float_data[output_offset] += input_data[i];
+    ++counts[output_offset];
+  }
+
+  for (std::size_t i = 0; i < output.float_data.size(); ++i) {
+    if (counts[i] == 0) {
+      throw std::runtime_error("ReduceMean encountered empty reduction bucket");
+    }
+    output.float_data[i] /= static_cast<float>(counts[i]);
+  }
+  return output;
+}
+
+Tensor RunTriluAccelerate(const Node& node, const Tensor& input, ExecutionContext& context) {
+  if (input.shape.size() < 2) {
+    throw std::runtime_error("Trilu requires rank >= 2");
+  }
+  const auto upper = ReadIntAttribute(node, "upper", 1) != 0;
+  std::int64_t k = 0;
+  if (node.inputs.size() > 1 && !node.inputs.at(1).empty()) {
+    k = ReadScalarAsInt64(RequireTensor(context, node.inputs.at(1)), "Trilu");
+  }
+
+  const auto rows = static_cast<std::size_t>(input.shape[input.shape.size() - 2]);
+  const auto cols = static_cast<std::size_t>(input.shape[input.shape.size() - 1]);
+  const auto matrix_size = rows * cols;
+  std::size_t batch = 1;
+  for (std::size_t i = 0; i + 2 < input.shape.size(); ++i) {
+    batch *= static_cast<std::size_t>(input.shape[i]);
+  }
+
+  if (input.dtype == "float32") {
+    const auto& input_data = RequireFloatData(input, "Trilu");
+    auto output = MakeFloatOutput(node.outputs.at(0), input.shape, context);
+    std::fill(output.float_data.begin(), output.float_data.end(), 0.0f);
+    for (std::size_t b = 0; b < batch; ++b) {
+      const auto base = b * matrix_size;
+      for (std::size_t i = 0; i < rows; ++i) {
+        for (std::size_t j = 0; j < cols; ++j) {
+          const auto row = static_cast<std::int64_t>(i);
+          const auto col = static_cast<std::int64_t>(j);
+          const bool keep = upper ? (col - row >= k) : (col - row <= k);
+          if (keep) {
+            const auto offset = base + i * cols + j;
+            output.float_data[offset] = input_data[offset];
+          }
+        }
+      }
+    }
+    return output;
+  }
+
+  if (input.dtype == "int64") {
+    const auto& input_data = RequireInt64Data(input, "Trilu");
+    auto output = MakeInt64Output(node.outputs.at(0), input.shape, context);
+    std::fill(output.int64_data.begin(), output.int64_data.end(), 0);
+    for (std::size_t b = 0; b < batch; ++b) {
+      const auto base = b * matrix_size;
+      for (std::size_t i = 0; i < rows; ++i) {
+        for (std::size_t j = 0; j < cols; ++j) {
+          const auto row = static_cast<std::int64_t>(i);
+          const auto col = static_cast<std::int64_t>(j);
+          const bool keep = upper ? (col - row >= k) : (col - row <= k);
+          if (keep) {
+            const auto offset = base + i * cols + j;
+            output.int64_data[offset] = input_data[offset];
+          }
+        }
+      }
+    }
+    return output;
+  }
+
+  throw std::runtime_error("Trilu currently supports float32/int64 only");
+}
+
 Tensor RunSoftmaxAccelerate(const Node& node, const Tensor& input, ExecutionContext& context) {
   const auto& input_data = RequireFloatData(input, "Softmax");
   const auto axis = static_cast<std::size_t>(NormalizeAxis(ReadIntAttribute(node, "axis", 1), input.shape.size(),
@@ -1036,6 +1204,40 @@ void RegisterAccelerateElementwiseKernels(KernelRegistry& registry) {
     }
   });
 
+  registry.Register("Neg", [](const Node& node, ExecutionContext& context, std::ostream* trace) {
+    const auto& input = RequireTensor(context, node.inputs.at(0));
+    if (input.dtype == "float32") {
+      const auto& input_data = RequireFloatData(input, "Neg");
+      auto output = MakeOutputLikeWithReusedStorage(node.outputs.at(0), input, context);
+      float minus_one = -1.0f;
+      vDSP_vsmul(input_data.data(), 1, &minus_one, output.float_data.data(), 1, input_data.size());
+      context.BindTensor(std::move(output));
+    } else if (input.dtype == "int64") {
+      const auto& input_data = RequireInt64Data(input, "Neg");
+      auto output = MakeOutputLikeWithReusedStorage(node.outputs.at(0), input, context);
+      std::transform(input_data.begin(), input_data.end(), output.int64_data.begin(),
+                     [](std::int64_t value) { return -value; });
+      context.BindTensor(std::move(output));
+    } else {
+      throw std::runtime_error("Neg currently supports float32/int64 only");
+    }
+    if (trace != nullptr) {
+      *trace << "    kernel Neg produced " << node.outputs.at(0) << " via Accelerate\n";
+    }
+  });
+
+  registry.Register("Sqrt", [](const Node& node, ExecutionContext& context, std::ostream* trace) {
+    const auto& input = RequireTensor(context, node.inputs.at(0));
+    const auto& input_data = RequireFloatData(input, "Sqrt");
+    auto output = MakeOutputLikeWithReusedStorage(node.outputs.at(0), input, context);
+    const int element_count = static_cast<int>(input_data.size());
+    vvsqrtf(output.float_data.data(), input_data.data(), &element_count);
+    context.BindTensor(std::move(output));
+    if (trace != nullptr) {
+      *trace << "    kernel Sqrt produced " << node.outputs.at(0) << " via Accelerate\n";
+    }
+  });
+
   registry.Register("Pow", [](const Node& node, ExecutionContext& context, std::ostream* trace) {
     const auto& lhs = RequireTensor(context, node.inputs.at(0));
     const auto& rhs = RequireTensor(context, node.inputs.at(1));
@@ -1059,6 +1261,30 @@ void RegisterAccelerateElementwiseKernels(KernelRegistry& registry) {
     }
   });
 
+  registry.Register("Equal", [](const Node& node, ExecutionContext& context, std::ostream* trace) {
+    const auto& lhs = RequireTensor(context, node.inputs.at(0));
+    const auto& rhs = RequireTensor(context, node.inputs.at(1));
+    auto output = RunCompareAccelerate("Equal", node, lhs, rhs, context,
+                                       [](std::int64_t a, std::int64_t b) { return a == b; },
+                                       [](float a, float b) { return a == b; });
+    context.BindTensor(std::move(output));
+    if (trace != nullptr) {
+      *trace << "    kernel Equal produced " << node.outputs.at(0) << " via Accelerate\n";
+    }
+  });
+
+  registry.Register("Less", [](const Node& node, ExecutionContext& context, std::ostream* trace) {
+    const auto& lhs = RequireTensor(context, node.inputs.at(0));
+    const auto& rhs = RequireTensor(context, node.inputs.at(1));
+    auto output = RunCompareAccelerate("Less", node, lhs, rhs, context,
+                                       [](std::int64_t a, std::int64_t b) { return a < b; },
+                                       [](float a, float b) { return a < b; });
+    context.BindTensor(std::move(output));
+    if (trace != nullptr) {
+      *trace << "    kernel Less produced " << node.outputs.at(0) << " via Accelerate\n";
+    }
+  });
+
   registry.Register("Where", [](const Node& node, ExecutionContext& context, std::ostream* trace) {
     const auto& condition = RequireTensor(context, node.inputs.at(0));
     const auto& x = RequireTensor(context, node.inputs.at(1));
@@ -1070,12 +1296,90 @@ void RegisterAccelerateElementwiseKernels(KernelRegistry& registry) {
     }
   });
 
+  registry.Register("Cast", [](const Node& node, ExecutionContext& context, std::ostream* trace) {
+    const auto& input = RequireTensor(context, node.inputs.at(0));
+    const auto to_it = node.attributes.find("to");
+    if (to_it == node.attributes.end()) {
+      throw std::runtime_error("Cast missing to attribute");
+    }
+
+    const auto to_type = to_it->second.int_value;
+    if (to_type == 1) {
+      auto output = MakeFloatOutput(node.outputs.at(0), input.shape, context);
+      if (input.dtype == "float32") {
+        const auto& input_data = RequireFloatData(input, "Cast");
+        std::copy(input_data.begin(), input_data.end(), output.float_data.begin());
+      } else if (input.dtype == "int64") {
+        const auto& input_data = RequireInt64Data(input, "Cast");
+        for (std::size_t i = 0; i < input_data.size(); ++i) {
+          output.float_data[i] = static_cast<float>(input_data[i]);
+        }
+      } else {
+        throw std::runtime_error("Cast to float32 currently supports int64/float32 only");
+      }
+      context.BindTensor(std::move(output));
+    } else if (to_type == 7 || to_type == 6) {
+      auto output = MakeInt64Output(node.outputs.at(0), input.shape, context);
+      if (input.dtype == "int64") {
+        const auto& input_data = RequireInt64Data(input, "Cast");
+        std::copy(input_data.begin(), input_data.end(), output.int64_data.begin());
+      } else if (input.dtype == "float32") {
+        const auto& input_data = RequireFloatData(input, "Cast");
+        for (std::size_t i = 0; i < input_data.size(); ++i) {
+          output.int64_data[i] = static_cast<std::int64_t>(input_data[i]);
+        }
+      } else {
+        throw std::runtime_error("Cast to int64 currently supports int64/float32 only");
+      }
+      context.BindTensor(std::move(output));
+    } else if (to_type == 9) {
+      auto output = MakeInt64Output(node.outputs.at(0), input.shape, context);
+      if (input.dtype == "int64") {
+        const auto& input_data = RequireInt64Data(input, "Cast");
+        for (std::size_t i = 0; i < input_data.size(); ++i) {
+          output.int64_data[i] = input_data[i] != 0 ? 1 : 0;
+        }
+      } else if (input.dtype == "float32") {
+        const auto& input_data = RequireFloatData(input, "Cast");
+        for (std::size_t i = 0; i < input_data.size(); ++i) {
+          output.int64_data[i] = input_data[i] != 0.0f ? 1 : 0;
+        }
+      } else {
+        throw std::runtime_error("Cast to bool currently supports int64/float32 only");
+      }
+      context.BindTensor(std::move(output));
+    } else {
+      throw std::runtime_error("Cast currently supports only float32/int32/int64/bool outputs");
+    }
+    if (trace != nullptr) {
+      *trace << "    kernel Cast produced " << node.outputs.at(0) << " via Accelerate\n";
+    }
+  });
+
   registry.Register("Softmax", [](const Node& node, ExecutionContext& context, std::ostream* trace) {
     const auto& input = RequireTensor(context, node.inputs.at(0));
     auto output = RunSoftmaxAccelerate(node, input, context);
     context.BindTensor(std::move(output));
     if (trace != nullptr) {
       *trace << "    kernel Softmax produced " << node.outputs.at(0) << " via Accelerate\n";
+    }
+  });
+
+  registry.Register("ReduceMean", [](const Node& node, ExecutionContext& context, std::ostream* trace) {
+    const auto& input = RequireTensor(context, node.inputs.at(0));
+    auto output = RunReduceMeanAccelerate(node, input, context);
+    context.BindTensor(std::move(output));
+    if (trace != nullptr) {
+      *trace << "    kernel ReduceMean produced " << node.outputs.at(0) << " via Accelerate\n";
+    }
+  });
+
+  registry.Register("Trilu", [](const Node& node, ExecutionContext& context, std::ostream* trace) {
+    const auto& input = RequireTensor(context, node.inputs.at(0));
+    auto output = RunTriluAccelerate(node, input, context);
+    context.BindTensor(std::move(output));
+    if (trace != nullptr) {
+      *trace << "    kernel Trilu produced " << node.outputs.at(0) << " via Accelerate\n";
     }
   });
 

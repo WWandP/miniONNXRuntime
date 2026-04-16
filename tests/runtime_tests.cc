@@ -183,6 +183,32 @@ void TestEmptyInt64ConstantSurvivesAndFeedsConstantOfShape() {
   Expect(output->float_data.front() == 0.0f, "expected ConstantOfShape default fill value");
 }
 
+void TestIdentityExecutionPassesThroughTensorData() {
+  auto graph = MakeGraphWithOps({"Identity"});
+  graph.nodes[0].inputs = {"x"};
+  graph.nodes[0].outputs = {"y"};
+
+  miniort::Tensor input;
+  input.name = "x";
+  input.dtype = "float32";
+  input.shape = {2, 2};
+  input.float_data = {1.f, 2.f, 3.f, 4.f};
+
+  Session session = MakeCpuSession(std::move(graph), SessionOptions{});
+  miniort::ExecutionContext context;
+  std::unordered_map<std::string, miniort::Tensor> feeds;
+  feeds.emplace(input.name, input);
+
+  const auto summary = session.Run(feeds, context, nullptr);
+  Expect(summary.executed_nodes == 1, "expected Identity graph to execute one node");
+
+  const auto* output = context.FindTensor("y");
+  Expect(output != nullptr, "expected Identity output tensor");
+  Expect(output->dtype == "float32", "expected Identity output dtype=float32");
+  Expect(output->shape == std::vector<std::int64_t>({2, 2}), "expected Identity output shape");
+  Expect(output->float_data == input.float_data, "expected Identity to preserve float payload");
+}
+
 void TestGptCacheBindingMatchesExpectedSchema() {
   auto prefill_graph = MakeCacheGraph({
       "logits",
@@ -282,10 +308,42 @@ void TestGptCacheBindingRejectsMalformedSchemas() {
     (void)miniort::BuildCacheBinding(prefill_graph, decode_graph);
   } catch (const std::exception& ex) {
     threw = true;
-    Expect(std::string(ex.what()).find("mismatch") != std::string::npos,
+    Expect(std::string(ex.what()).find("KV cache") != std::string::npos,
            "expected cache binding schema validation failure");
   }
   Expect(threw, "expected malformed cache schema to be rejected");
+}
+
+void TestGptCacheBindingSupportsGenericTensorNames() {
+  auto prefill_graph = MakeCacheGraph({
+      "logits",
+      "layer_cache.0.key_state",
+      "layer_cache.0.value_state",
+      "layer_cache.1.key_state",
+      "layer_cache.1.value_state",
+  });
+  auto decode_graph = MakeCacheGraph({
+      "logits",
+      "present_layer_0_k",
+      "present_layer_0_v",
+      "present_layer_1_k",
+      "present_layer_1_v",
+  }, {
+      "input_ids",
+      "past.0.k",
+      "past.0.v",
+      "past.1.k",
+      "past.1.v",
+  });
+
+  const auto binding = miniort::BuildCacheBinding(prefill_graph, decode_graph);
+  Expect(binding.tensors.size() == 4, "expected generic naming to bind four cache tensors");
+  Expect(binding.tensors[0].prefill_output_name == "layer_cache.0.key_state", "unexpected generic layer0 key");
+  Expect(binding.tensors[0].decode_input_name == "past.0.k", "unexpected generic decode input key");
+  Expect(binding.tensors[0].decode_output_name == "present_layer_0_k", "unexpected generic decode output key");
+  Expect(binding.tensors[1].prefill_output_name == "layer_cache.0.value_state", "unexpected generic layer0 value");
+  Expect(binding.tensors[2].prefill_output_name == "layer_cache.1.key_state", "unexpected generic layer1 key");
+  Expect(binding.tensors[3].decode_output_name == "present_layer_1_v", "unexpected generic layer1 value");
 }
 
 void TestMatMulExecutionProducesExpectedOutput() {
@@ -874,6 +932,54 @@ void TestTransposeExecutionProducesExpectedOutput() {
   Expect(output->float_data == expected, "unexpected Transpose output");
 }
 
+void TestSessionFoldsInitializerTransposeToConstant() {
+  Graph graph;
+  graph.name = "fold_transpose_graph";
+
+  miniort::Value weight;
+  weight.name = "weight";
+  weight.info.dtype = "float32";
+  weight.info.shape = {"2", "3"};
+  weight.info.is_initializer = true;
+  miniort::TensorData weight_data;
+  weight_data.dtype = "float32";
+  weight_data.shape = {2, 3};
+  weight_data.float_data = {1.f, 2.f, 3.f,
+                            4.f, 5.f, 6.f};
+  weight.data = weight_data;
+  graph.initializers.emplace(weight.name, weight);
+
+  Node transpose;
+  transpose.name = "transpose";
+  transpose.op_type = "Transpose";
+  transpose.inputs = {"weight"};
+  transpose.outputs = {"out_0"};
+  miniort::AttributeValue perm;
+  perm.kind = miniort::AttributeValue::Kind::kInts;
+  perm.ints = {1, 0};
+  transpose.attributes.emplace("perm", perm);
+
+  graph.node_name_to_index[transpose.name] = 0;
+  graph.topological_order = {0};
+  graph.op_type_histogram["Transpose"] = 1;
+  graph.nodes.push_back(std::move(transpose));
+
+  Session session = MakeCpuSession(std::move(graph), SessionOptions{});
+  const auto& optimized_node = session.graph().nodes[0];
+  Expect(optimized_node.op_type == "Constant", "expected initializer Transpose to fold into Constant");
+  Expect(optimized_node.inputs.empty(), "expected folded Constant to have no inputs");
+  Expect(optimized_node.attributes.contains("value"), "expected folded Constant to contain value tensor");
+
+  miniort::ExecutionContext context;
+  const auto summary = session.Run({}, context, nullptr);
+  Expect(summary.executed_nodes == 1, "expected folded graph to execute one node");
+  const auto* output = context.FindTensor("out_0");
+  Expect(output != nullptr, "expected folded transpose output tensor");
+  Expect(output->shape == std::vector<std::int64_t>({3, 2}), "expected folded transpose output shape [3,2]");
+  const std::vector<float> expected = {1.f, 4.f, 2.f, 5.f, 3.f, 6.f};
+  Expect(output->float_data == expected, "unexpected folded transpose output");
+}
+
 void TestSoftmaxExecutionProducesExpectedOutput() {
   auto graph = MakeGraphWithOps({"Softmax"});
   graph.nodes[0].inputs = {"x"};
@@ -1047,6 +1153,158 @@ void TestWhereExecutionProducesExpectedOutput() {
   }
 }
 
+void TestCastToBoolExecutionProducesExpectedOutput() {
+  auto graph = MakeGraphWithOps({"Cast"});
+  graph.nodes[0].inputs = {"x"};
+  graph.nodes[0].attributes["to"].kind = miniort::AttributeValue::Kind::kInt;
+  graph.nodes[0].attributes["to"].int_value = 9;
+
+  miniort::Tensor x;
+  x.name = "x";
+  x.dtype = "float32";
+  x.shape = {5};
+  x.float_data = {-2.f, 0.f, 3.f, 0.f, -0.5f};
+
+  Session session = MakeCpuSession(std::move(graph), SessionOptions{});
+  miniort::ExecutionContext context;
+  std::unordered_map<std::string, miniort::Tensor> feeds;
+  feeds.emplace(x.name, x);
+
+  const auto summary = session.Run(feeds, context, nullptr);
+  Expect(summary.executed_nodes == 1, "expected Cast graph to execute one node");
+  const auto* output = context.FindTensor("out_0");
+  Expect(output != nullptr, "expected Cast output tensor");
+  Expect(output->int64_data == std::vector<std::int64_t>({1, 0, 1, 0, 1}), "unexpected Cast(bool) output");
+}
+
+void TestQwenGapOpsExecutionProducesExpectedOutput() {
+  auto graph = MakeGraphWithOps({"Neg", "Sqrt", "Equal", "Less", "ReduceMean", "Trilu"});
+  graph.nodes[0].inputs = {"neg_x"};
+  graph.nodes[1].inputs = {"sqrt_x"};
+  graph.nodes[2].inputs = {"equal_lhs", "equal_rhs"};
+  graph.nodes[3].inputs = {"less_lhs", "less_rhs"};
+  graph.nodes[4].inputs = {"reduce_x", "reduce_axes"};
+  graph.nodes[4].attributes["keepdims"].kind = miniort::AttributeValue::Kind::kInt;
+  graph.nodes[4].attributes["keepdims"].int_value = 1;
+  graph.nodes[5].inputs = {"trilu_x", "trilu_k"};
+  graph.nodes[5].attributes["upper"].kind = miniort::AttributeValue::Kind::kInt;
+  graph.nodes[5].attributes["upper"].int_value = 1;
+
+  miniort::Tensor neg_x;
+  neg_x.name = "neg_x";
+  neg_x.dtype = "float32";
+  neg_x.shape = {3};
+  neg_x.float_data = {1.f, -2.f, 3.f};
+
+  miniort::Tensor sqrt_x;
+  sqrt_x.name = "sqrt_x";
+  sqrt_x.dtype = "float32";
+  sqrt_x.shape = {3};
+  sqrt_x.float_data = {1.f, 4.f, 9.f};
+
+  miniort::Tensor equal_lhs;
+  equal_lhs.name = "equal_lhs";
+  equal_lhs.dtype = "int64";
+  equal_lhs.shape = {2, 2};
+  equal_lhs.int64_data = {1, 2, 3, 4};
+
+  miniort::Tensor equal_rhs;
+  equal_rhs.name = "equal_rhs";
+  equal_rhs.dtype = "int64";
+  equal_rhs.shape = {2, 2};
+  equal_rhs.int64_data = {1, 0, 3, 5};
+
+  miniort::Tensor less_lhs;
+  less_lhs.name = "less_lhs";
+  less_lhs.dtype = "float32";
+  less_lhs.shape = {2, 2};
+  less_lhs.float_data = {1.f, 5.f, 3.f, 7.f};
+
+  miniort::Tensor less_rhs;
+  less_rhs.name = "less_rhs";
+  less_rhs.dtype = "float32";
+  less_rhs.shape = {2, 2};
+  less_rhs.float_data = {2.f, 4.f, 3.f, 8.f};
+
+  miniort::Tensor reduce_x;
+  reduce_x.name = "reduce_x";
+  reduce_x.dtype = "float32";
+  reduce_x.shape = {2, 3};
+  reduce_x.float_data = {1.f, 2.f, 3.f, 4.f, 5.f, 6.f};
+
+  miniort::Tensor reduce_axes;
+  reduce_axes.name = "reduce_axes";
+  reduce_axes.dtype = "int64";
+  reduce_axes.shape = {1};
+  reduce_axes.int64_data = {1};
+
+  miniort::Tensor trilu_x;
+  trilu_x.name = "trilu_x";
+  trilu_x.dtype = "float32";
+  trilu_x.shape = {3, 3};
+  trilu_x.float_data = {
+      1.f, 2.f, 3.f,
+      4.f, 5.f, 6.f,
+      7.f, 8.f, 9.f,
+  };
+
+  miniort::Tensor trilu_k;
+  trilu_k.name = "trilu_k";
+  trilu_k.dtype = "int64";
+  trilu_k.shape = {};
+  trilu_k.int64_data = {0};
+
+  Session session = MakeCpuSession(std::move(graph), SessionOptions{});
+  miniort::ExecutionContext context;
+  std::unordered_map<std::string, miniort::Tensor> feeds;
+  feeds.emplace(neg_x.name, neg_x);
+  feeds.emplace(sqrt_x.name, sqrt_x);
+  feeds.emplace(equal_lhs.name, equal_lhs);
+  feeds.emplace(equal_rhs.name, equal_rhs);
+  feeds.emplace(less_lhs.name, less_lhs);
+  feeds.emplace(less_rhs.name, less_rhs);
+  feeds.emplace(reduce_x.name, reduce_x);
+  feeds.emplace(reduce_axes.name, reduce_axes);
+  feeds.emplace(trilu_x.name, trilu_x);
+  feeds.emplace(trilu_k.name, trilu_k);
+
+  const auto summary = session.Run(feeds, context, nullptr);
+  Expect(summary.executed_nodes == 6, "expected qwen-gap graph to execute six nodes");
+
+  const auto* neg_out = context.FindTensor("out_0");
+  Expect(neg_out != nullptr, "expected Neg output");
+  Expect(neg_out->float_data == std::vector<float>({-1.f, 2.f, -3.f}), "unexpected Neg output");
+
+  const auto* sqrt_out = context.FindTensor("out_1");
+  Expect(sqrt_out != nullptr, "expected Sqrt output");
+  Expect(sqrt_out->float_data == std::vector<float>({1.f, 2.f, 3.f}), "unexpected Sqrt output");
+
+  const auto* equal_out = context.FindTensor("out_2");
+  Expect(equal_out != nullptr, "expected Equal output");
+  Expect(equal_out->int64_data == std::vector<std::int64_t>({1, 0, 1, 0}), "unexpected Equal output");
+
+  const auto* less_out = context.FindTensor("out_3");
+  Expect(less_out != nullptr, "expected Less output");
+  Expect(less_out->int64_data == std::vector<std::int64_t>({1, 0, 0, 1}), "unexpected Less output");
+
+  const auto* reduce_out = context.FindTensor("out_4");
+  Expect(reduce_out != nullptr, "expected ReduceMean output");
+  Expect(reduce_out->shape == std::vector<std::int64_t>({2, 1}), "unexpected ReduceMean output shape");
+  const std::vector<float> expected_reduce = {2.f, 5.f};
+  for (std::size_t i = 0; i < expected_reduce.size(); ++i) {
+    Expect(std::fabs(reduce_out->float_data[i] - expected_reduce[i]) < 1e-6f, "unexpected ReduceMean output value");
+  }
+
+  const auto* trilu_out = context.FindTensor("out_5");
+  Expect(trilu_out != nullptr, "expected Trilu output");
+  const std::vector<float> expected_trilu = {
+      1.f, 2.f, 3.f,
+      0.f, 5.f, 6.f,
+      0.f, 0.f, 9.f,
+  };
+  Expect(trilu_out->float_data == expected_trilu, "unexpected Trilu output");
+}
+
 void TestMatMulExecutionSupportsBatchedInputs() {
   auto graph = MakeGraphWithOps({"MatMul"});
   graph.nodes[0].inputs = {"a", "b"};
@@ -1185,6 +1443,111 @@ void TestAppleDefaultProvidersPreferAccelerateForSupportedOps() {
          "expected Accelerate provider count");
   Expect(session.assignment_summary().provider_node_counts.at("Accelerate") == 10,
          "expected Accelerate to own ten nodes");
+}
+
+void TestAppleAccelerateSupportsQwenGapOps() {
+  auto graph = MakeGraphWithOps({"Neg", "Sqrt", "Equal", "Less", "ReduceMean", "Trilu", "Cast"});
+  graph.nodes[0].inputs = {"neg_x"};
+  graph.nodes[1].inputs = {"sqrt_x"};
+  graph.nodes[2].inputs = {"equal_lhs", "equal_rhs"};
+  graph.nodes[3].inputs = {"less_lhs", "less_rhs"};
+  graph.nodes[4].inputs = {"reduce_x", "reduce_axes"};
+  graph.nodes[5].inputs = {"trilu_x", "trilu_k"};
+  graph.nodes[6].inputs = {"cast_x"};
+  graph.nodes[6].attributes["to"].kind = miniort::AttributeValue::Kind::kInt;
+  graph.nodes[6].attributes["to"].int_value = 9;
+
+  Session session(std::move(graph), SessionOptions{});
+  for (const auto& node : session.graph().nodes) {
+    Expect(node.execution_provider == "Accelerate", "expected Qwen gap ops to prefer Accelerate on Apple");
+  }
+
+  miniort::Tensor neg_x;
+  neg_x.name = "neg_x";
+  neg_x.dtype = "float32";
+  neg_x.shape = {2};
+  neg_x.float_data = {1.f, -3.f};
+
+  miniort::Tensor sqrt_x;
+  sqrt_x.name = "sqrt_x";
+  sqrt_x.dtype = "float32";
+  sqrt_x.shape = {2};
+  sqrt_x.float_data = {1.f, 9.f};
+
+  miniort::Tensor equal_lhs;
+  equal_lhs.name = "equal_lhs";
+  equal_lhs.dtype = "int64";
+  equal_lhs.shape = {2};
+  equal_lhs.int64_data = {4, 5};
+
+  miniort::Tensor equal_rhs;
+  equal_rhs.name = "equal_rhs";
+  equal_rhs.dtype = "int64";
+  equal_rhs.shape = {2};
+  equal_rhs.int64_data = {4, 7};
+
+  miniort::Tensor less_lhs;
+  less_lhs.name = "less_lhs";
+  less_lhs.dtype = "float32";
+  less_lhs.shape = {2};
+  less_lhs.float_data = {1.f, 3.f};
+
+  miniort::Tensor less_rhs;
+  less_rhs.name = "less_rhs";
+  less_rhs.dtype = "float32";
+  less_rhs.shape = {2};
+  less_rhs.float_data = {2.f, 3.f};
+
+  miniort::Tensor reduce_x;
+  reduce_x.name = "reduce_x";
+  reduce_x.dtype = "float32";
+  reduce_x.shape = {1, 2};
+  reduce_x.float_data = {2.f, 4.f};
+
+  miniort::Tensor reduce_axes;
+  reduce_axes.name = "reduce_axes";
+  reduce_axes.dtype = "int64";
+  reduce_axes.shape = {1};
+  reduce_axes.int64_data = {1};
+
+  miniort::Tensor trilu_x;
+  trilu_x.name = "trilu_x";
+  trilu_x.dtype = "float32";
+  trilu_x.shape = {2, 2};
+  trilu_x.float_data = {1.f, 2.f, 3.f, 4.f};
+
+  miniort::Tensor trilu_k;
+  trilu_k.name = "trilu_k";
+  trilu_k.dtype = "int64";
+  trilu_k.shape = {};
+  trilu_k.int64_data = {0};
+
+  miniort::Tensor cast_x;
+  cast_x.name = "cast_x";
+  cast_x.dtype = "float32";
+  cast_x.shape = {4};
+  cast_x.float_data = {-1.f, 0.f, 2.f, 0.f};
+
+  miniort::ExecutionContext context;
+  std::unordered_map<std::string, miniort::Tensor> feeds;
+  feeds.emplace(neg_x.name, neg_x);
+  feeds.emplace(sqrt_x.name, sqrt_x);
+  feeds.emplace(equal_lhs.name, equal_lhs);
+  feeds.emplace(equal_rhs.name, equal_rhs);
+  feeds.emplace(less_lhs.name, less_lhs);
+  feeds.emplace(less_rhs.name, less_rhs);
+  feeds.emplace(reduce_x.name, reduce_x);
+  feeds.emplace(reduce_axes.name, reduce_axes);
+  feeds.emplace(trilu_x.name, trilu_x);
+  feeds.emplace(trilu_k.name, trilu_k);
+  feeds.emplace(cast_x.name, cast_x);
+
+  const auto summary = session.Run(feeds, context, nullptr);
+  Expect(summary.executed_nodes == 7, "expected Accelerate Qwen gap graph to execute seven nodes");
+  const auto* cast_out = context.FindTensor("out_6");
+  Expect(cast_out != nullptr, "expected Cast(bool) output tensor");
+  Expect(cast_out->int64_data == std::vector<std::int64_t>({1, 0, 1, 0}),
+         "unexpected Accelerate Cast(bool) output");
 }
 
 void TestAppleAccelerateSupportsGpt2HotPathOps() {
@@ -1438,8 +1801,10 @@ int main() {
   TestAssignmentSummaryMarksSupportedAndUnsupportedOps();
   TestSessionRejectsUnassignedNodesWhenConfigured();
   TestRunInjectsAllocatorIntoExecutionContext();
+  TestIdentityExecutionPassesThroughTensorData();
   TestGptCacheBindingMatchesExpectedSchema();
   TestGptCacheBindingRejectsMalformedSchemas();
+  TestGptCacheBindingSupportsGenericTensorNames();
   TestEmptyInt64ConstantSurvivesAndFeedsConstantOfShape();
   TestMatMulExecutionProducesExpectedOutput();
 #if defined(MINIORT_BUILD_CUDA_EP)
@@ -1458,15 +1823,19 @@ int main() {
     TestSqueezeExecutionProducesExpectedOutput();
     TestConcatExecutionProducesExpectedOutput();
     TestTransposeExecutionProducesExpectedOutput();
+    TestSessionFoldsInitializerTransposeToConstant();
     TestSoftmaxExecutionProducesExpectedOutput();
     TestSplitExecutionProducesExpectedOutput();
     TestLayerNormalizationExecutionProducesExpectedOutput();
     TestWhereExecutionProducesExpectedOutput();
+    TestCastToBoolExecutionProducesExpectedOutput();
+    TestQwenGapOpsExecutionProducesExpectedOutput();
     TestMatMulExecutionSupportsBatchedInputs();
     TestGatherExecutionSupportsEmbeddingLookup();
     TestGatherExecutionSupportsNonZeroAxis();
 #if defined(__APPLE__)
     TestAppleDefaultProvidersPreferAccelerateForSupportedOps();
+    TestAppleAccelerateSupportsQwenGapOps();
     TestAppleAccelerateSupportsGpt2HotPathOps();
 #endif
     std::cout << "runtime_tests: ok\n";
