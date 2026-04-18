@@ -1,11 +1,11 @@
 # miniONNXRuntime
 
 一个面向教学的 ONNX Runtime 迷你实现。
-它现在围绕三条主线展开：
+它围绕三条教学主线展开：
 
 - `yolov8n.onnx`：看视觉模型如何被解析、优化、执行，以及如何做基础内存优化
 - `gpt2` ONNX 图族：看文本模型如何做 prompt 编码、greedy 生成、provider 执行和 `KV cache`
-- `qwen2.5-0.5b` ONNX 图族：看更大文本模型如何做 baseline / KV cache 推理与 provider 路径对比
+- `qwen2.5-0.5b` ONNX 图族：看更大文本模型如何被解析、优化、执行，以及如何做基础内存优化
 
 ![miniONNXRuntime banner](./assets/readme_banner.png)
 
@@ -54,12 +54,21 @@ sudo apt install -y build-essential cmake git libprotobuf-dev protobuf-compiler
 brew install cmake protobuf git
 ```
 
-## 这个项目展示什么
+## 下载模型
 
-- 解析 ONNX 图
-- 优化图结构
-- 执行 CPU / Apple provider kernels
-- 跟踪 tensor 内存和 buffer reuse
+由于模型文件较大，无法直接上传到 GitHub。请先运行：
+
+```bash
+./scripts/download_models.sh
+```
+
+这会下载：
+
+- GPT-2 模型到 `models/gpt2/`
+- 其他附加模型到 `models/`
+- Qwen 相关模型到本地 `models/`（脚本会按提示使用 `gdown` 拉取）
+
+下载完成后即可运行相关 phase。
 
 ## 快速开始
 
@@ -75,7 +84,7 @@ cmake --build build_local -j4
 # phase1: 先看静态图结构
 ./scripts/run_phase.sh phase1
 
-# phase3: 再跑一次完整 CPU 推理
+# phase3: 跑一次完整 CPU 推理
 ./scripts/run_phase.sh phase3
 
 # phase4: 看图优化前后差异
@@ -84,10 +93,10 @@ cmake --build build_local -j4
 # phase5: 看 provider 路径对比
 ./scripts/run_phase.sh phase5
 
-# phase6: 跑 GPT-2 macOS baseline
+# phase6: 跑 GPT-2 baseline
 ./scripts/run_phase.sh phase6
 
-# phase6-kv: 跑 GPT-2 KV cache + macOS provider
+# phase6-kv: 跑 GPT-2 KV cache
 ./scripts/run_phase.sh phase6-kv
 
 # phase7: 跑 Qwen KV cache（默认）
@@ -107,10 +116,7 @@ cmake --build build_local -j4
 ./scripts/run_phase.sh all
 ```
 
-说明：
-
-- `all` 当前覆盖默认教学主线：`phase1 -> phase5`
-- 文本模型阶段（`phase6` / `phase6-kv` / `phase7`）为可选分支，需要本地先准备模型资产
+说明：`all` 当前覆盖默认主线 `phase1 -> phase5`。文本模型阶段（`phase6` / `phase6-kv` / `phase7`）需要先下载模型。
 
 ## 学习路径
 
@@ -140,42 +146,17 @@ cmake --build build_local -j4
 | `miniort_run_qwen`（Qwen） | Qwen KV cache 推理 | 看 Qwen 文本模型执行 |
 | `tools/chat_web_demo.py`（Qwen） | 简单聊天网页 + 后端调用 `miniort_run_qwen` | 快速演示 Qwen 对话效果 |
 
-## 下载模型
+## 文本模型入口（GPT / Qwen）
 
-由于模型文件较大，无法直接上传到GitHub。请运行以下脚本下载所有必需的模型：
+运行前先执行 `./scripts/download_models.sh`。
 
-```bash
-./scripts/download_models.sh
-```
+- GPT-2：`./scripts/run_phase.sh phase6` / `./scripts/run_phase.sh phase6-kv`
+- Qwen（默认 KV cache）：`./scripts/run_phase.sh phase7`
 
-这将下载GPT-2模型到 `models/gpt2/` 目录，并下载附加模型到 `models/` 目录。下载完成后，即可运行相关phase。
+Qwen 进一步说明可看：
 
-## GPT 入口
-
-**注意：运行GPT-2相关phase前，请先运行 `./scripts/download_models.sh` 下载所有模型。**
-
-- `./scripts/run_phase.sh phase6`
-- `./scripts/run_phase.sh phase6-kv`
-
-请先下载模型（见上文）。
-
-## Qwen 入口（可选）
-
-Qwen 相关流程是可选教学分支（当前不在 `run_phase.sh` 的 phase1~6 主线中）。
-
-- 参考文档：`docs/phase7_qwen_inference_bringup.md`
-- 示例配置：`examples/qwen2_5_0_5b/kv_generate.cfg`
-
-注意事项：
-
-- Qwen ONNX/权重文件体积较大，仓库默认通过 `.gitignore` 忽略模型二进制（如 `.onnx` / `.safetensors`）。
-- 你需要在本地自行准备模型资产并导出 ONNX。
-
-常用脚本：
-
-- baseline 导出：`scripts/export_qwen_onnx.py`
-- KV 双图导出：`scripts/export_qwen_kv_onnx.py`
-- INT8 量化：`scripts/export_qwen_int8_onnx.py`
+- `docs/phase7_qwen_inference_bringup.md`
+- `examples/qwen2_5_0_5b/kv_generate.cfg`
 
 运行示例：
 

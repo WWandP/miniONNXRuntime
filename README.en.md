@@ -5,7 +5,7 @@ It now follows three teaching tracks:
 
 - `yolov8n.onnx`: visual-model parsing, optimization, execution, and basic memory optimization
 - GPT-2 ONNX graphs: prompt encoding, greedy generation, provider execution, and `KV cache`
-- Qwen2.5-0.5B ONNX graphs: baseline/KV-cache inference on a larger text model and provider-path comparison
+- Qwen2.5-0.5B ONNX graphs: parsing, optimization, execution, and basic memory optimization on a larger text model
 
 ![miniONNXRuntime banner](./assets/readme_banner.png)
 
@@ -54,12 +54,21 @@ On macOS, install the Homebrew dependencies:
 brew install cmake protobuf git
 ```
 
-## What It Shows
+## Download Models
 
-- Parse ONNX graph
-- Optimize graph structure
-- Run CPU / Apple provider kernels
-- Trace tensor memory and buffer reuse
+Since model files are large, they are not committed to GitHub. Run:
+
+```bash
+./scripts/download_models.sh
+```
+
+This downloads:
+
+- GPT-2 models to `models/gpt2/`
+- additional model assets to `models/`
+- Qwen assets into local `models/` (the script uses `gdown` when available)
+
+After download completes, you can run the related phases.
 
 ## Quick Start
 
@@ -84,10 +93,10 @@ cmake --build build_local -j4
 # phase5: compare provider paths
 ./scripts/run_phase.sh phase5
 
-# phase6: GPT-2 macOS baseline
+# phase6: GPT-2 baseline
 ./scripts/run_phase.sh phase6
 
-# phase6-kv: GPT-2 KV cache + macOS provider
+# phase6-kv: GPT-2 KV cache
 ./scripts/run_phase.sh phase6-kv
 
 # phase7: Qwen KV cache (default)
@@ -107,10 +116,7 @@ If you want to go through the whole teaching flow in order:
 ./scripts/run_phase.sh all
 ```
 
-Notes:
-
-- `all` currently covers the default teaching flow: `phase1 -> phase5`
-- text-model phases (`phase6` / `phase6-kv` / `phase7`) are optional and require local model assets
+Note: `all` currently covers the default flow `phase1 -> phase5`. Text-model phases (`phase6` / `phase6-kv` / `phase7`) require model download first.
 
 ## Learning Path
 
@@ -140,42 +146,17 @@ Notes:
 | `miniort_run_qwen` (Qwen) | Qwen KV-cache inference | understanding Qwen execution |
 | `tools/chat_web_demo.py` (Qwen) | simple chat webpage backed by `miniort_run_qwen` | quick Qwen chat demo |
 
-## Download Models
+## Text Model Entry (GPT / Qwen)
 
-Since the model files are large, they cannot be uploaded directly to GitHub. Please run the following script to download all required models:
+Run `./scripts/download_models.sh` first.
 
-```bash
-./scripts/download_models.sh
-```
+- GPT-2: `./scripts/run_phase.sh phase6` / `./scripts/run_phase.sh phase6-kv`
+- Qwen (default KV cache): `./scripts/run_phase.sh phase7`
 
-This will download the GPT-2 model to the `models/gpt2/` directory and the additional model to the `models/` directory. After downloading, you can run the related phases.
+For more Qwen details:
 
-## GPT Entry
-
-**Note: Before running GPT-2 related phases, please run `./scripts/download_models.sh` to download all models.**
-
-- `./scripts/run_phase.sh phase6`
-- `./scripts/run_phase.sh phase6-kv`
-
-Please download the models first (see above).
-
-## Qwen Entry (Optional)
-
-The Qwen flow is an optional teaching track (not part of the default phase1~6 path in `run_phase.sh`).
-
-- Bring-up doc: `docs/phase7_qwen_inference_bringup.md`
-- Example config: `examples/qwen2_5_0_5b/kv_generate.cfg`
-
-Notes:
-
-- Qwen ONNX/weight files are large, so model binaries (for example `.onnx` / `.safetensors`) are ignored by default via `.gitignore`.
-- Prepare model assets locally and export ONNX before running.
-
-Common scripts:
-
-- baseline export: `scripts/export_qwen_onnx.py`
-- KV prefill/decode export: `scripts/export_qwen_kv_onnx.py`
-- INT8 quantization: `scripts/export_qwen_int8_onnx.py`
+- `docs/phase7_qwen_inference_bringup.md`
+- `examples/qwen2_5_0_5b/kv_generate.cfg`
 
 Run examples:
 
