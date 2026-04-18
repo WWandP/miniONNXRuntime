@@ -69,3 +69,7 @@ models/**/_inner_model_*
 models/**/inner.model.*
 models/**/.msc
 models/**/.mv
+
+# Ignore all local model assets; keep only docs placeholder in git
+models/*
+!models/README.md
