@@ -14,6 +14,7 @@
 4. [phase4](./phase4.md): 图优化与内存
 5. [phase5](./phase5.md): Execution Provider
 6. [phase6](./phase6.md): GPT 文本生成与 KV cache
+7. [phase7](./phase7.md): Qwen 文本生成与 KV cache
 
 ## 统一入口
 
@@ -32,4 +33,10 @@
 ./scripts/run_phase.sh phase5
 ./scripts/run_phase.sh phase6
 ./scripts/run_phase.sh phase6-kv
+./scripts/run_phase.sh phase7
 ```
+
+补充说明：
+
+- `./scripts/run_phase.sh all` 当前只覆盖 `phase1 -> phase5`
+- 文本模型阶段（`phase6` / `phase6-kv` / `phase7`）为可选分支，需本地先准备模型资产

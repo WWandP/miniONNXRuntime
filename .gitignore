@@ -51,3 +51,21 @@ docs/*
 !docs/phases/*.md
 models/gpt2/model.kv_prefill.onnx
 models/gpt2/model.kv_decode.onnx
+# Qwen export intermediate shards/artifacts (keep main model files)
+models/qwen2_5_0_5b_instruct/onnx__*
+models/qwen2_5_0_5b_instruct/_inner_model_*
+models/qwen2_5_0_5b_instruct/inner.model.*
+models/qwen2_5_0_5b_instruct/.msc
+models/qwen2_5_0_5b_instruct/.mv
+
+# Model binaries/weights (avoid committing large artifacts)
+models/**/*.onnx
+models/**/*.safetensors
+models/**/*.bin
+models/**/*.pt
+models/**/*.pth
+models/**/onnx__*
+models/**/_inner_model_*
+models/**/inner.model.*
+models/**/.msc
+models/**/.mv

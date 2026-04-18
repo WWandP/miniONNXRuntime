@@ -55,3 +55,39 @@
   --generate 8 \
   --quiet
 ```
+
+## 收尾更新（2026-04-18）
+
+### 本轮已完成（低风险、教学导向）
+- `Session` provider 分配优化：
+  - 在 Session 初始化时缓存各 provider 支持的 `op_type` 集合；
+  - 节点分配阶段不再对每个节点重复 `RegisterKernels()`。
+- `Expand` 优化（CPU 路径）：
+  - 增加同 shape、标量扩展、仅前缀维扩展 fast-path；
+  - 通用广播路径改为无临时索引分配的线性推进。
+- elementwise 广播优化（CPU 路径）：
+  - `Add/Mul/Sub/Div` 增加同 shape / 标量广播 fast-path，减少通用广播索引开销。
+- `MatMul` 优化（macOS Accelerate 路径）：
+  - 增加 `batch_count == 1` 直接 `cblas_sgemm`；
+  - 增加线性 batch 映射 fast-path，减少 `UnravelIndex/ComputeBroadcastOffset` 调度开销。
+- `Where` 优化（CPU + Accelerate）：
+  - 增加“condition/x/y 与输出同 shape” fast-path。
+
+### 影响文件
+- `include/miniort/runtime/session.h`
+- `src/runtime/session.cc`
+- `src/runtime/shape_kernels.cc`
+- `src/runtime/elementwise_kernels.cc`
+- `src/runtime/accelerate_execution_provider.cc`
+
+### 回归与冒烟结果
+- `cmake --build build_local -j4`：通过
+- `ctest --test-dir build_local --output-on-failure`：通过（`1/1`）
+- Qwen strict 冒烟：
+  - baseline：`executed=7149 skipped=0`
+  - KV cache（`--generate 1`）：`executed=14498 skipped=0`
+
+### 当前结论
+- 功能闭环稳定，Qwen baseline + KV cache strict 路径可重复通过。
+- 本轮优化已覆盖“低成本、可讲解”的热点路径，符合教学项目定位。
+- 若准备收尾，可转入文档整理/提交归档，不必继续做激进性能改造。

@@ -12,6 +12,11 @@ GPT_KV_PREFILL_MODEL_PATH="${GPT_KV_PREFILL_MODEL_PATH:-$GPT_MODEL_DIR/model.kv_
 GPT_KV_DECODE_MODEL_PATH="${GPT_KV_DECODE_MODEL_PATH:-$GPT_MODEL_DIR/model.kv_decode.onnx}"
 GPT_PROMPT_FILE="${GPT_PROMPT_FILE:-$ROOT_DIR/examples/gpt2_tiny/story_prompt.txt}"
 GPT_GENERATE="${GPT_GENERATE:-48}"
+QWEN_MODEL_DIR="${QWEN_MODEL_DIR:-$ROOT_DIR/models/qwen2_5_0_5b_instruct}"
+QWEN_KV_PREFILL_MODEL_PATH="${QWEN_KV_PREFILL_MODEL_PATH:-$QWEN_MODEL_DIR/model.kv_prefill.onnx}"
+QWEN_KV_DECODE_MODEL_PATH="${QWEN_KV_DECODE_MODEL_PATH:-$QWEN_MODEL_DIR/model.kv_decode.onnx}"
+QWEN_PROMPT="${QWEN_PROMPT:-你好}"
+QWEN_GENERATE="${QWEN_GENERATE:-8}"
 CMAKE_BIN="${CMAKE_BIN:-cmake}"
 
 usage() {
@@ -27,7 +32,12 @@ usage:
   ./scripts/run_phase.sh phase5
   ./scripts/run_phase.sh phase6
   ./scripts/run_phase.sh phase6-kv
+  ./scripts/run_phase.sh phase7
   ./scripts/run_phase.sh all
+
+notes:
+  - all currently runs phase1 -> phase5
+  - phase6 / phase6-kv / phase7 are opt-in text-model phases (local model assets are required)
 
 environment overrides:
   BUILD_DIR=/path/to/build
@@ -39,6 +49,11 @@ environment overrides:
   GPT_KV_DECODE_MODEL_PATH=/path/to/model.kv_decode.onnx
   GPT_PROMPT_FILE=/path/to/prompt.txt
   GPT_GENERATE=48
+  QWEN_MODEL_DIR=/path/to/models/qwen
+  QWEN_KV_PREFILL_MODEL_PATH=/path/to/model.kv_prefill.onnx
+  QWEN_KV_DECODE_MODEL_PATH=/path/to/model.kv_decode.onnx
+  QWEN_PROMPT=你好
+  QWEN_GENERATE=8
   CMAKE_BIN=/path/to/cmake
 EOF
 }
@@ -145,15 +160,32 @@ run_phase6_kv() {
     --strict
 }
 
+run_phase7() {
+  build_all
+  require_file "$QWEN_KV_PREFILL_MODEL_PATH"
+  require_file "$QWEN_KV_DECODE_MODEL_PATH"
+  require_file "$QWEN_MODEL_DIR/vocab.json"
+  require_file "$QWEN_MODEL_DIR/merges.txt"
+  "$BUILD_DIR/miniort_run_qwen" \
+    --kv-cache \
+    --kv-cache-prefill-model "$QWEN_KV_PREFILL_MODEL_PATH" \
+    --kv-cache-decode-model "$QWEN_KV_DECODE_MODEL_PATH" \
+    --model-dir "$QWEN_MODEL_DIR" \
+    --prompt "$QWEN_PROMPT" \
+    --generate "$QWEN_GENERATE" \
+    --top-k 5 \
+    --strict
+}
+
 run_all() {
+  # Keep `all` stable for the default teaching flow.
+  # Text-model phases are opt-in to avoid failures on missing local model assets.
   run_phase1
   run_phase2
   run_phase3
   run_phase4_opt
   run_phase4_memory
   run_phase5
-  run_phase6
-  run_phase6_kv
 }
 
 main() {
@@ -194,6 +226,9 @@ main() {
       ;;
     phase6-kv)
       run_phase6_kv
+      ;;
+    phase7)
+      run_phase7
       ;;
     all)
       run_all

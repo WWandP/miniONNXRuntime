@@ -379,37 +379,97 @@ void RegisterShapeKernels(KernelRegistry& registry) {
     const auto& data = RequireTensor(context, node.inputs.at(0));
     const auto& shape_tensor = RequireTensor(context, node.inputs.at(1));
     const auto output_shape = ReadVectorAsInt64(shape_tensor, "Expand");
-    const auto output_strides = ComputeStrides(output_shape);
-    const auto input_strides = ComputeStrides(data.shape);
 
     if (output_shape.size() < data.shape.size()) {
       throw std::runtime_error("Expand output rank must be >= input rank");
     }
-    for (std::size_t i = 0; i < data.shape.size(); ++i) {
-      const auto input_dim = data.shape[data.shape.size() - 1 - i];
-      const auto output_dim = output_shape[output_shape.size() - 1 - i];
+    for (const auto dim : output_shape) {
+      if (dim < 0) {
+        throw std::runtime_error("Expand output shape must be non-negative");
+      }
+    }
+
+    const std::size_t output_rank = output_shape.size();
+    const std::size_t input_rank = data.shape.size();
+    const std::size_t input_offset = output_rank - input_rank;
+    std::vector<std::int64_t> aligned_input_shape(output_rank, 1);
+    for (std::size_t i = 0; i < input_rank; ++i) {
+      aligned_input_shape[input_offset + i] = data.shape[i];
+    }
+
+    for (std::size_t i = 0; i < output_rank; ++i) {
+      const auto input_dim = aligned_input_shape[i];
+      const auto output_dim = output_shape[i];
       if (input_dim != output_dim && input_dim != 1) {
         throw std::runtime_error("Expand shape is incompatible with input");
       }
     }
 
+    const auto input_strides = ComputeStrides(data.shape);
+    std::vector<std::size_t> broadcast_input_strides(output_rank, 0);
+    for (std::size_t i = 0; i < input_rank; ++i) {
+      const auto aligned_dim = input_offset + i;
+      broadcast_input_strides[aligned_dim] = data.shape[i] == 1 ? 0 : input_strides[i];
+    }
+
+    const auto broadcast_fill = [&](const auto& input_data, auto& output_data) {
+      if (output_shape == data.shape) {
+        std::copy(input_data.begin(), input_data.end(), output_data.begin());
+        return;
+      }
+
+      if (GetElementCount(data.shape) == 1 && !input_data.empty()) {
+        std::fill(output_data.begin(), output_data.end(), input_data.front());
+        return;
+      }
+
+      // Fast path: only leading dimensions are expanded.
+      bool leading_only_expand = true;
+      for (std::size_t i = input_offset; i < output_rank; ++i) {
+        if (aligned_input_shape[i] != output_shape[i]) {
+          leading_only_expand = false;
+          break;
+        }
+      }
+      if (leading_only_expand) {
+        const auto block_size = input_data.size();
+        if (block_size == 0) {
+          return;
+        }
+        const auto repeats = output_data.size() / block_size;
+        for (std::size_t r = 0; r < repeats; ++r) {
+          std::memcpy(output_data.data() + r * block_size, input_data.data(), block_size * sizeof(input_data[0]));
+        }
+        return;
+      }
+
+      // Generic broadcast fill without per-element temporary index allocations.
+      std::vector<std::int64_t> index(output_rank, 0);
+      std::size_t input_flat_offset = 0;
+      for (std::size_t i = 0; i < output_data.size(); ++i) {
+        output_data[i] = input_data[input_flat_offset];
+        for (std::size_t d = output_rank; d > 0; --d) {
+          const auto dim = d - 1;
+          ++index[dim];
+          input_flat_offset += broadcast_input_strides[dim];
+          if (index[dim] < output_shape[dim]) {
+            break;
+          }
+          input_flat_offset -= broadcast_input_strides[dim] * static_cast<std::size_t>(output_shape[dim]);
+          index[dim] = 0;
+        }
+      }
+    };
+
     if (data.dtype == "float32") {
       const auto& input_data = RequireFloatData(data, "Expand");
       auto output = MakeFloatOutput(node.outputs.at(0), output_shape, context);
-      for (std::size_t i = 0; i < output.float_data.size(); ++i) {
-        const auto output_index = UnravelIndex(i, output_shape, output_strides);
-        const auto input_offset = ComputeBroadcastOffset(output_index, data.shape, input_strides);
-        output.float_data[i] = input_data[input_offset];
-      }
+      broadcast_fill(input_data, output.float_data);
       context.BindTensor(std::move(output));
     } else if (data.dtype == "int64") {
       const auto& input_data = RequireInt64Data(data, "Expand");
       auto output = MakeInt64Output(node.outputs.at(0), output_shape, context);
-      for (std::size_t i = 0; i < output.int64_data.size(); ++i) {
-        const auto output_index = UnravelIndex(i, output_shape, output_strides);
-        const auto input_offset = ComputeBroadcastOffset(output_index, data.shape, input_strides);
-        output.int64_data[i] = input_data[input_offset];
-      }
+      broadcast_fill(input_data, output.int64_data);
       context.BindTensor(std::move(output));
     } else {
       throw std::runtime_error("Expand currently supports float32/int64 only");

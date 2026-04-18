@@ -14,6 +14,7 @@ These docs are user-facing and focus on three things:
 4. [phase4](./phase4.en.md): graph optimization and memory
 5. [phase5](./phase5.en.md): Execution Provider
 6. [phase6](./phase6.en.md): GPT text generation and KV cache
+7. [phase7](./phase7.en.md): Qwen text generation and KV cache
 
 ## Unified Entry
 
@@ -32,4 +33,10 @@ Common commands:
 ./scripts/run_phase.sh phase5
 ./scripts/run_phase.sh phase6
 ./scripts/run_phase.sh phase6-kv
+./scripts/run_phase.sh phase7
 ```
+
+Additional notes:
+
+- `./scripts/run_phase.sh all` currently covers only `phase1 -> phase5`
+- text-model phases (`phase6` / `phase6-kv` / `phase7`) are optional and require local model assets

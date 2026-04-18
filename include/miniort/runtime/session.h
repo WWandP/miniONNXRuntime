@@ -6,6 +6,7 @@
 #include <ostream>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "miniort/model/graph.h"
@@ -83,6 +84,7 @@ class Session {
   KernelRegistry kernel_registry_;
   SessionOptions options_;
   std::vector<std::shared_ptr<const ExecutionProvider>> providers_;
+  std::vector<std::unordered_set<std::string>> provider_supported_ops_;
   SessionAssignmentSummary assignment_summary_;
   std::unordered_map<std::string, std::size_t> tensor_last_use_topo_index_;
   std::unordered_map<std::string, bool> tensor_is_persistent_;

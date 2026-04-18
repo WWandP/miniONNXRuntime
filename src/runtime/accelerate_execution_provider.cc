@@ -316,11 +316,47 @@ Tensor RunMatMulAccelerate(const Node& node, const Tensor& lhs, const Tensor& rh
   output_shape.push_back(static_cast<std::int64_t>(n));
   auto output = MakeFloatOutput(node.outputs.at(0), output_shape, context);
 
+  const auto batch_count = GetElementCount(output_batch_shape);
+
+  if (batch_count == 1) {
+    cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
+                static_cast<int>(m), static_cast<int>(n), static_cast<int>(k),
+                1.0f,
+                lhs_data.data(), static_cast<int>(k),
+                rhs_data.data(), static_cast<int>(n),
+                0.0f,
+                output.float_data.data(), static_cast<int>(n));
+    return output;
+  }
+
+  // Fast path: when batch mapping is linear (no true broadcast index remap),
+  // avoid per-batch index unravel/offset recompute.
+  const bool lhs_scalar_batch = lhs_batch_shape.empty();
+  const bool rhs_scalar_batch = rhs_batch_shape.empty();
+  const bool lhs_linear_batch = lhs_scalar_batch || lhs_batch_shape == output_batch_shape;
+  const bool rhs_linear_batch = rhs_scalar_batch || rhs_batch_shape == output_batch_shape;
+  if (lhs_linear_batch && rhs_linear_batch) {
+    const auto lhs_batch_stride = m * k;
+    const auto rhs_batch_stride = k * n;
+    const auto out_batch_stride = m * n;
+    for (std::size_t batch = 0; batch < batch_count; ++batch) {
+      const auto lhs_base = lhs_scalar_batch ? 0 : batch * lhs_batch_stride;
+      const auto rhs_base = rhs_scalar_batch ? 0 : batch * rhs_batch_stride;
+      const auto out_base = batch * out_batch_stride;
+      cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
+                  static_cast<int>(m), static_cast<int>(n), static_cast<int>(k),
+                  1.0f,
+                  lhs_data.data() + lhs_base, static_cast<int>(k),
+                  rhs_data.data() + rhs_base, static_cast<int>(n),
+                  0.0f,
+                  output.float_data.data() + out_base, static_cast<int>(n));
+    }
+    return output;
+  }
+
   const auto output_batch_strides = ComputeStrides(output_batch_shape);
   const auto lhs_full_strides = ComputeStrides(lhs.shape);
   const auto rhs_full_strides = ComputeStrides(rhs.shape);
-  const auto batch_count = GetElementCount(output_batch_shape);
-
   for (std::size_t batch = 0; batch < batch_count; ++batch) {
     const auto batch_index = UnravelIndex(batch, output_batch_shape, output_batch_strides);
     const auto lhs_batch_offset =
@@ -568,12 +604,18 @@ Tensor RunWhereAccelerate(const Node& node, const Tensor& condition, const Tenso
     const auto& y_data = RequireInt64Data(y, "Where");
     output.int64_data = context.AcquireInt64Buffer(element_count);
     output.int64_data.resize(element_count);
-    for (std::size_t i = 0; i < element_count; ++i) {
-      const auto output_index = UnravelIndex(i, output_shape, output_strides);
-      const auto cond_offset = ComputeBroadcastOffset(output_index, condition.shape, condition_strides);
-      const auto x_offset = ComputeBroadcastOffset(output_index, x.shape, x_strides);
-      const auto y_offset = ComputeBroadcastOffset(output_index, y.shape, y_strides);
-      output.int64_data[i] = read_condition(cond_offset) ? x_data[x_offset] : y_data[y_offset];
+    if (condition.shape == output_shape && x.shape == output_shape && y.shape == output_shape) {
+      for (std::size_t i = 0; i < element_count; ++i) {
+        output.int64_data[i] = read_condition(i) ? x_data[i] : y_data[i];
+      }
+    } else {
+      for (std::size_t i = 0; i < element_count; ++i) {
+        const auto output_index = UnravelIndex(i, output_shape, output_strides);
+        const auto cond_offset = ComputeBroadcastOffset(output_index, condition.shape, condition_strides);
+        const auto x_offset = ComputeBroadcastOffset(output_index, x.shape, x_strides);
+        const auto y_offset = ComputeBroadcastOffset(output_index, y.shape, y_strides);
+        output.int64_data[i] = read_condition(cond_offset) ? x_data[x_offset] : y_data[y_offset];
+      }
     }
   } else {
     const auto* x_float_data = x.dtype == "float32" ? &RequireFloatData(x, "Where") : nullptr;
@@ -582,16 +624,24 @@ Tensor RunWhereAccelerate(const Node& node, const Tensor& condition, const Tenso
     const auto* y_int_data = y.dtype == "int64" ? &RequireInt64Data(y, "Where") : nullptr;
     output.float_data = context.AcquireFloatBuffer(element_count);
     output.float_data.resize(element_count);
-    for (std::size_t i = 0; i < element_count; ++i) {
-      const auto output_index = UnravelIndex(i, output_shape, output_strides);
-      const auto cond_offset = ComputeBroadcastOffset(output_index, condition.shape, condition_strides);
-      const auto x_offset = ComputeBroadcastOffset(output_index, x.shape, x_strides);
-      const auto y_offset = ComputeBroadcastOffset(output_index, y.shape, y_strides);
-      const auto x_value = x_float_data != nullptr ? (*x_float_data)[x_offset]
-                                                   : static_cast<float>((*x_int_data)[x_offset]);
-      const auto y_value = y_float_data != nullptr ? (*y_float_data)[y_offset]
-                                                   : static_cast<float>((*y_int_data)[y_offset]);
-      output.float_data[i] = read_condition(cond_offset) ? x_value : y_value;
+    const auto read_x = [&](std::size_t offset) {
+      return x_float_data != nullptr ? (*x_float_data)[offset] : static_cast<float>((*x_int_data)[offset]);
+    };
+    const auto read_y = [&](std::size_t offset) {
+      return y_float_data != nullptr ? (*y_float_data)[offset] : static_cast<float>((*y_int_data)[offset]);
+    };
+    if (condition.shape == output_shape && x.shape == output_shape && y.shape == output_shape) {
+      for (std::size_t i = 0; i < element_count; ++i) {
+        output.float_data[i] = read_condition(i) ? read_x(i) : read_y(i);
+      }
+    } else {
+      for (std::size_t i = 0; i < element_count; ++i) {
+        const auto output_index = UnravelIndex(i, output_shape, output_strides);
+        const auto cond_offset = ComputeBroadcastOffset(output_index, condition.shape, condition_strides);
+        const auto x_offset = ComputeBroadcastOffset(output_index, x.shape, x_strides);
+        const auto y_offset = ComputeBroadcastOffset(output_index, y.shape, y_strides);
+        output.float_data[i] = read_condition(cond_offset) ? read_x(x_offset) : read_y(y_offset);
+      }
     }
   }
 

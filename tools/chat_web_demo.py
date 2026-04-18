@@ -22,13 +22,13 @@ SYSTEM_PROMPT = "你是一个聊天助手。"
 
 def parse_args() -> argparse.Namespace:
   root_dir = Path(__file__).resolve().parents[1]
-  parser = argparse.ArgumentParser(description="Simple web chat demo backed by miniort_run_gpt.")
+  parser = argparse.ArgumentParser(description="Simple web chat demo backed by miniort_run_qwen.")
   parser.add_argument("--host", default="127.0.0.1", help="HTTP bind host.")
   parser.add_argument("--port", type=int, default=8080, help="HTTP bind port.")
   parser.add_argument(
       "--miniort-bin",
-      default=str(root_dir / "build_local" / "miniort_run_gpt"),
-      help="Path to miniort_run_gpt binary.",
+      default=str(root_dir / "build_local" / "miniort_run_qwen"),
+      help="Path to miniort_run_qwen binary.",
   )
   parser.add_argument(
       "--model-dir",
@@ -51,7 +51,7 @@ def parse_args() -> argparse.Namespace:
       help="Optional kv decode model path. If empty, auto-resolve from model dir.",
   )
   parser.add_argument("--generate", type=int, default=48, help="Max new tokens per assistant turn.")
-  parser.add_argument("--strict", action="store_true", help="Pass --strict to miniort_run_gpt.")
+  parser.add_argument("--strict", action="store_true", help="Pass --strict to miniort_run_qwen.")
   parser.add_argument("--timeout-sec", type=int, default=300, help="Timeout for one model call.")
   return parser.parse_args()
 
@@ -186,7 +186,7 @@ class ChatRuntime:
       stderr = proc.stderr.strip()
       stdout = proc.stdout.strip()
       detail = stderr if stderr else stdout
-      raise RuntimeError(f"miniort_run_gpt failed (code={proc.returncode}): {detail}")
+      raise RuntimeError(f"miniort_run_qwen failed (code={proc.returncode}): {detail}")
 
     output_text = extract_output_text(proc.stdout)
     reply = extract_assistant_reply(output_text, prompt)

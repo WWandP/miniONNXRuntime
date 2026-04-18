@@ -1,10 +1,11 @@
 # miniONNXRuntime
 
 A teaching-oriented mini implementation of ONNX Runtime.
-It now follows two teaching tracks:
+It now follows three teaching tracks:
 
 - `yolov8n.onnx`: visual-model parsing, optimization, execution, and basic memory optimization
 - GPT-2 ONNX graphs: prompt encoding, greedy generation, provider execution, and `KV cache`
+- Qwen2.5-0.5B ONNX graphs: baseline/KV-cache inference on a larger text model and provider-path comparison
 
 ![miniONNXRuntime banner](./assets/readme_banner.png)
 
@@ -88,6 +89,9 @@ cmake --build build_local -j4
 
 # phase6-kv: GPT-2 KV cache + macOS provider
 ./scripts/run_phase.sh phase6-kv
+
+# phase7: Qwen KV cache (default)
+./scripts/run_phase.sh phase7
 ```
 
 If you only want to build and test first:
@@ -103,6 +107,11 @@ If you want to go through the whole teaching flow in order:
 ./scripts/run_phase.sh all
 ```
 
+Notes:
+
+- `all` currently covers the default teaching flow: `phase1 -> phase5`
+- text-model phases (`phase6` / `phase6-kv` / `phase7`) are optional and require local model assets
+
 ## Learning Path
 
 | Phase | Focus | Command | Read more |
@@ -114,6 +123,7 @@ If you want to go through the whole teaching flow in order:
 | `phase5` | `ExecutionProvider` abstraction and provider comparison | `./scripts/run_phase.sh phase5` | [ZH](./docs/phases/phase5.md) / [EN](./docs/phases/phase5.en.md) |
 | `phase6` | GPT-2 macOS provider baseline | `./scripts/run_phase.sh phase6` | [ZH](./docs/phases/phase6.md) / [EN](./docs/phases/phase6.en.md) |
 | `phase6-kv` | GPT-2 KV cache + macOS provider | `./scripts/run_phase.sh phase6-kv` | [ZH](./docs/phases/phase6.md) / [EN](./docs/phases/phase6.en.md) |
+| `phase7` | Qwen KV-cache inference (default) | `./scripts/run_phase.sh phase7` | [ZH](./docs/phases/phase7.md) / [EN](./docs/phases/phase7.en.md) |
 
 ## Main Entry Points
 
@@ -126,7 +136,9 @@ If you want to go through the whole teaching flow in order:
 | `miniort_optimize_model` | graph before/after optimization | phase4 walkthrough |
 | `miniort_compare_providers` | default provider vs CPU-only | phase5 walkthrough |
 | `miniort_detect_yolov8n` | final detections and output files | demo output |
-| `miniort_run_gpt` | GPT-2 text generation and inference | understanding GPT model execution |
+| `miniort_run_gpt` (GPT-2) | GPT-2 text generation and KV-cache inference | understanding GPT-2 execution |
+| `miniort_run_qwen` (Qwen) | Qwen KV-cache inference | understanding Qwen execution |
+| `tools/chat_web_demo.py` (Qwen) | simple chat webpage backed by `miniort_run_qwen` | quick Qwen chat demo |
 
 ## Download Models
 
@@ -146,6 +158,34 @@ This will download the GPT-2 model to the `models/gpt2/` directory and the addit
 - `./scripts/run_phase.sh phase6-kv`
 
 Please download the models first (see above).
+
+## Qwen Entry (Optional)
+
+The Qwen flow is an optional teaching track (not part of the default phase1~6 path in `run_phase.sh`).
+
+- Bring-up doc: `docs/phase7_qwen_inference_bringup.md`
+- Example config: `examples/qwen2_5_0_5b/kv_generate.cfg`
+
+Notes:
+
+- Qwen ONNX/weight files are large, so model binaries (for example `.onnx` / `.safetensors`) are ignored by default via `.gitignore`.
+- Prepare model assets locally and export ONNX before running.
+
+Common scripts:
+
+- baseline export: `scripts/export_qwen_onnx.py`
+- KV prefill/decode export: `scripts/export_qwen_kv_onnx.py`
+- INT8 quantization: `scripts/export_qwen_int8_onnx.py`
+
+Run examples:
+
+```bash
+# phase7 (default KV-cache path)
+./scripts/run_phase.sh phase7
+
+# direct binary call (KV-cache config)
+./build_local/miniort_run_qwen --config examples/qwen2_5_0_5b/kv_generate.cfg
+```
 
 ## Repository Layout
 

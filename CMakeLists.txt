@@ -209,6 +209,12 @@ if(MINIORT_BUILD_RUNTIME_TOOLS)
 
   target_link_libraries(miniort_run_gpt PRIVATE miniort_runtime)
 
+  add_executable(miniort_run_qwen
+    tools/run_gpt.cc
+  )
+
+  target_link_libraries(miniort_run_qwen PRIVATE miniort_runtime)
+
   add_executable(miniort_memory_trace
     tools/memory_trace.cc
   )

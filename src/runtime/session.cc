@@ -11,6 +11,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "miniort/runtime/profiling.h"
@@ -179,11 +180,16 @@ Session::Session(Graph graph, std::vector<std::shared_ptr<const ExecutionProvide
   for (const auto& provider : providers_) {
     KernelRegistry provider_registry;
     provider->RegisterKernels(provider_registry);
+    std::unordered_set<std::string> supported_ops;
+    supported_ops.reserve(provider_registry.Entries().size());
     for (const auto& [op_type, fn] : provider_registry.Entries()) {
+      (void)fn;
+      supported_ops.insert(op_type);
       if (!kernel_registry_.Has(op_type)) {
         kernel_registry_.Register(op_type, fn);
       }
     }
+    provider_supported_ops_.push_back(std::move(supported_ops));
   }
   AssignExecutionProviders();
   ValidateAssignmentSummary();
@@ -248,11 +254,9 @@ std::string Session::ResolveExecutionProviderForNode(const Node& node) const {
       break;
   }
 
-  for (const auto& provider : providers_) {
-    KernelRegistry provider_registry;
-    provider->RegisterKernels(provider_registry);
-    if (provider_registry.Has(node.op_type)) {
-      return std::string(provider->Name());
+  for (std::size_t i = 0; i < providers_.size(); ++i) {
+    if (i < provider_supported_ops_.size() && provider_supported_ops_[i].contains(node.op_type)) {
+      return std::string(providers_[i]->Name());
     }
   }
   return "<unassigned>";

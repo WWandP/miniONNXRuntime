@@ -197,6 +197,13 @@ std::vector<std::int64_t> ParseTokenIds(const std::string& tokens_arg) {
   return token_ids;
 }
 
+std::string ResolveProgramName(char* argv0) {
+  if (argv0 == nullptr || argv0[0] == '\0') {
+    return "miniort_run_gpt";
+  }
+  return std::filesystem::path(argv0).filename().string();
+}
+
 miniort::Tensor MakeTokenTensor(const miniort::Value& input, const std::vector<std::int64_t>& token_ids) {
   miniort::Tensor tensor;
   tensor.name = input.name;
@@ -206,10 +213,14 @@ miniort::Tensor MakeTokenTensor(const miniort::Value& input, const std::vector<s
   return tensor;
 }
 
-Options ParseArgs(int argc, char* argv[]) {
+Options ParseArgs(int argc, char* argv[], const std::string& program_name) {
   if (argc < 2) {
     throw std::runtime_error(
-        "usage: miniort_run_gpt [model.onnx] [--config path] (--tokens 1,2,3 | --prompt \"text\" | --prompt-file path) [--model-dir path] [--start-node N] [--max-nodes N] [--top-k N] [--generate N] [--kv-cache] [--kv-cache-prefill-model path] [--kv-cache-decode-model path] [--strict] [--verbose] [--quiet]");
+        "usage: " + program_name +
+        " [model.onnx] [--config path] (--tokens 1,2,3 | --prompt \"text\" | --prompt-file path)"
+        " [--model-dir path] [--start-node N] [--max-nodes N] [--top-k N] [--generate N]"
+        " [--kv-cache] [--kv-cache-prefill-model path] [--kv-cache-decode-model path]"
+        " [--strict] [--verbose] [--quiet]");
   }
 
   Options options;
@@ -286,10 +297,10 @@ Options ParseArgs(int argc, char* argv[]) {
   }
 
   if (!options.prompt.empty() && !options.tokens.empty()) {
-    throw std::runtime_error("miniort_run_gpt requires exactly one of --tokens, --prompt, or --prompt-file");
+    throw std::runtime_error(program_name + " requires exactly one of --tokens, --prompt, or --prompt-file");
   }
   if (options.tokens.empty() == options.prompt.empty()) {
-    throw std::runtime_error("miniort_run_gpt requires exactly one of --tokens, --prompt, or --prompt-file");
+    throw std::runtime_error(program_name + " requires exactly one of --tokens, --prompt, or --prompt-file");
   }
   if (options.model_path.empty() && !options.kv_cache) {
     options.model_path = (std::filesystem::path(options.model_dir) / "model.sim.onnx").string();
@@ -391,7 +402,8 @@ void AccumulateSummary(const miniort::RunSummary& src, miniort::RunSummary& dst)
 
 int main(int argc, char* argv[]) {
   try {
-    const auto options = ParseArgs(argc, argv);
+    const auto program_name = ResolveProgramName(argv != nullptr ? argv[0] : nullptr);
+    const auto options = ParseArgs(argc, argv, program_name);
     const auto prefill_model_path =
         options.kv_cache ? options.kv_cache_prefill_model_path : options.model_path;
     const auto decode_model_path = options.kv_cache ? options.kv_cache_decode_model_path : std::string{};

@@ -1,10 +1,11 @@
 # miniONNXRuntime
 
 一个面向教学的 ONNX Runtime 迷你实现。
-它现在围绕两条主线展开：
+它现在围绕三条主线展开：
 
 - `yolov8n.onnx`：看视觉模型如何被解析、优化、执行，以及如何做基础内存优化
 - `gpt2` ONNX 图族：看文本模型如何做 prompt 编码、greedy 生成、provider 执行和 `KV cache`
+- `qwen2.5-0.5b` ONNX 图族：看更大文本模型如何做 baseline / KV cache 推理与 provider 路径对比
 
 ![miniONNXRuntime banner](./assets/readme_banner.png)
 
@@ -88,6 +89,9 @@ cmake --build build_local -j4
 
 # phase6-kv: 跑 GPT-2 KV cache + macOS provider
 ./scripts/run_phase.sh phase6-kv
+
+# phase7: 跑 Qwen KV cache（默认）
+./scripts/run_phase.sh phase7
 ```
 
 只想先构建和测试的话：
@@ -103,6 +107,11 @@ cmake --build build_local -j4
 ./scripts/run_phase.sh all
 ```
 
+说明：
+
+- `all` 当前覆盖默认教学主线：`phase1 -> phase5`
+- 文本模型阶段（`phase6` / `phase6-kv` / `phase7`）为可选分支，需要本地先准备模型资产
+
 ## 学习路径
 
 | Phase | 看什么 | 对应命令 | 说明文档 |
@@ -114,6 +123,7 @@ cmake --build build_local -j4
 | `phase5` | `ExecutionProvider` 抽象与 provider 对比 | `./scripts/run_phase.sh phase5` | [phase5](./docs/phases/phase5.md) / [EN](./docs/phases/phase5.en.md) |
 | `phase6` | GPT-2 macOS provider baseline | `./scripts/run_phase.sh phase6` | [phase6](./docs/phases/phase6.md) / [EN](./docs/phases/phase6.en.md) |
 | `phase6-kv` | GPT-2 KV cache + macOS provider | `./scripts/run_phase.sh phase6-kv` | [phase6](./docs/phases/phase6.md) / [EN](./docs/phases/phase6.en.md) |
+| `phase7` | Qwen KV cache 推理（默认） | `./scripts/run_phase.sh phase7` | [phase7](./docs/phases/phase7.md) / [EN](./docs/phases/phase7.en.md) |
 
 ## 主要入口
 
@@ -126,7 +136,9 @@ cmake --build build_local -j4
 | `miniort_optimize_model` | 优化前后图差异、优化后再运行 | 看 phase4 |
 | `miniort_compare_providers` | 默认 provider 和 CPU-only 的差异 | 看 phase5 |
 | `miniort_detect_yolov8n` | 最终检测结果和输出文件 | 看 demo 效果 |
-| `miniort_run_gpt` | GPT-2文本生成和推理 | 看GPT模型执行 |
+| `miniort_run_gpt`（GPT-2） | GPT-2 文本生成与 KV cache 推理 | 看 GPT-2 文本模型执行 |
+| `miniort_run_qwen`（Qwen） | Qwen KV cache 推理 | 看 Qwen 文本模型执行 |
+| `tools/chat_web_demo.py`（Qwen） | 简单聊天网页 + 后端调用 `miniort_run_qwen` | 快速演示 Qwen 对话效果 |
 
 ## 下载模型
 
@@ -146,6 +158,34 @@ cmake --build build_local -j4
 - `./scripts/run_phase.sh phase6-kv`
 
 请先下载模型（见上文）。
+
+## Qwen 入口（可选）
+
+Qwen 相关流程是可选教学分支（当前不在 `run_phase.sh` 的 phase1~6 主线中）。
+
+- 参考文档：`docs/phase7_qwen_inference_bringup.md`
+- 示例配置：`examples/qwen2_5_0_5b/kv_generate.cfg`
+
+注意事项：
+
+- Qwen ONNX/权重文件体积较大，仓库默认通过 `.gitignore` 忽略模型二进制（如 `.onnx` / `.safetensors`）。
+- 你需要在本地自行准备模型资产并导出 ONNX。
+
+常用脚本：
+
+- baseline 导出：`scripts/export_qwen_onnx.py`
+- KV 双图导出：`scripts/export_qwen_kv_onnx.py`
+- INT8 量化：`scripts/export_qwen_int8_onnx.py`
+
+运行示例：
+
+```bash
+# phase7（默认 KV cache）
+./scripts/run_phase.sh phase7
+
+# 直接调用二进制（KV cache 配置）
+./build_local/miniort_run_qwen --config examples/qwen2_5_0_5b/kv_generate.cfg
+```
 
 ## 仓库结构
 

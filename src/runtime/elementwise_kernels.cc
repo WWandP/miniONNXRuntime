@@ -92,9 +92,6 @@ void RegisterElementwiseKernels(KernelRegistry& registry) {
           const auto& lhs = RequireTensor(context, node.inputs.at(0));
           const auto& rhs = RequireTensor(context, node.inputs.at(1));
           const auto output_shape = ComputeBroadcastShape(lhs.shape, rhs.shape, op_type);
-          const auto output_strides = ComputeStrides(output_shape);
-          const auto lhs_strides = ComputeStrides(lhs.shape);
-          const auto rhs_strides = ComputeStrides(rhs.shape);
 
           Tensor output;
           const auto element_count = GetElementCount(output_shape);
@@ -102,27 +99,71 @@ void RegisterElementwiseKernels(KernelRegistry& registry) {
             const auto& lhs_data = RequireInt64Data(lhs, op_type);
             const auto& rhs_data = RequireInt64Data(rhs, op_type);
             output = MakeInt64Output(node.outputs.at(0), output_shape, context);
-            for (std::size_t i = 0; i < element_count; ++i) {
-              const auto output_index = UnravelIndex(i, output_shape, output_strides);
-              const auto lhs_offset = ComputeBroadcastOffset(output_index, lhs.shape, lhs_strides);
-              const auto rhs_offset = ComputeBroadcastOffset(output_index, rhs.shape, rhs_strides);
-              output.int64_data[i] = eval_int(lhs_data[lhs_offset], rhs_data[rhs_offset]);
+
+            if (lhs.shape == rhs.shape) {
+              for (std::size_t i = 0; i < element_count; ++i) {
+                output.int64_data[i] = eval_int(lhs_data[i], rhs_data[i]);
+              }
+            } else if (lhs.shape.empty() && !lhs_data.empty()) {
+              const auto scalar = lhs_data.front();
+              for (std::size_t i = 0; i < element_count; ++i) {
+                output.int64_data[i] = eval_int(scalar, rhs_data[i]);
+              }
+            } else if (rhs.shape.empty() && !rhs_data.empty()) {
+              const auto scalar = rhs_data.front();
+              for (std::size_t i = 0; i < element_count; ++i) {
+                output.int64_data[i] = eval_int(lhs_data[i], scalar);
+              }
+            } else {
+              const auto output_strides = ComputeStrides(output_shape);
+              const auto lhs_strides = ComputeStrides(lhs.shape);
+              const auto rhs_strides = ComputeStrides(rhs.shape);
+              for (std::size_t i = 0; i < element_count; ++i) {
+                const auto output_index = UnravelIndex(i, output_shape, output_strides);
+                const auto lhs_offset = ComputeBroadcastOffset(output_index, lhs.shape, lhs_strides);
+                const auto rhs_offset = ComputeBroadcastOffset(output_index, rhs.shape, rhs_strides);
+                output.int64_data[i] = eval_int(lhs_data[lhs_offset], rhs_data[rhs_offset]);
+              }
             }
           } else {
             const auto* lhs_float_data = lhs.dtype == "float32" ? &RequireFloatData(lhs, op_type) : nullptr;
             const auto* lhs_int_data = lhs.dtype == "int64" ? &RequireInt64Data(lhs, op_type) : nullptr;
             const auto* rhs_float_data = rhs.dtype == "float32" ? &RequireFloatData(rhs, op_type) : nullptr;
             const auto* rhs_int_data = rhs.dtype == "int64" ? &RequireInt64Data(rhs, op_type) : nullptr;
+
+            const auto read_lhs = [&](std::size_t offset) {
+              return lhs_float_data != nullptr ? (*lhs_float_data)[offset] : static_cast<float>((*lhs_int_data)[offset]);
+            };
+            const auto read_rhs = [&](std::size_t offset) {
+              return rhs_float_data != nullptr ? (*rhs_float_data)[offset] : static_cast<float>((*rhs_int_data)[offset]);
+            };
+
             output = MakeFloatOutput(node.outputs.at(0), output_shape, context);
-            for (std::size_t i = 0; i < element_count; ++i) {
-              const auto output_index = UnravelIndex(i, output_shape, output_strides);
-              const auto lhs_offset = ComputeBroadcastOffset(output_index, lhs.shape, lhs_strides);
-              const auto rhs_offset = ComputeBroadcastOffset(output_index, rhs.shape, rhs_strides);
-              const auto lhs_value = lhs_float_data != nullptr ? (*lhs_float_data)[lhs_offset]
-                                                               : static_cast<float>((*lhs_int_data)[lhs_offset]);
-              const auto rhs_value = rhs_float_data != nullptr ? (*rhs_float_data)[rhs_offset]
-                                                               : static_cast<float>((*rhs_int_data)[rhs_offset]);
-              output.float_data[i] = eval_float(lhs_value, rhs_value);
+
+            if (lhs.shape == rhs.shape) {
+              for (std::size_t i = 0; i < element_count; ++i) {
+                output.float_data[i] = eval_float(read_lhs(i), read_rhs(i));
+              }
+            } else if (lhs.shape.empty()) {
+              const auto lhs_scalar = read_lhs(0);
+              for (std::size_t i = 0; i < element_count; ++i) {
+                output.float_data[i] = eval_float(lhs_scalar, read_rhs(i));
+              }
+            } else if (rhs.shape.empty()) {
+              const auto rhs_scalar = read_rhs(0);
+              for (std::size_t i = 0; i < element_count; ++i) {
+                output.float_data[i] = eval_float(read_lhs(i), rhs_scalar);
+              }
+            } else {
+              const auto output_strides = ComputeStrides(output_shape);
+              const auto lhs_strides = ComputeStrides(lhs.shape);
+              const auto rhs_strides = ComputeStrides(rhs.shape);
+              for (std::size_t i = 0; i < element_count; ++i) {
+                const auto output_index = UnravelIndex(i, output_shape, output_strides);
+                const auto lhs_offset = ComputeBroadcastOffset(output_index, lhs.shape, lhs_strides);
+                const auto rhs_offset = ComputeBroadcastOffset(output_index, rhs.shape, rhs_strides);
+                output.float_data[i] = eval_float(read_lhs(lhs_offset), read_rhs(rhs_offset));
+              }
             }
           }
 
@@ -284,12 +325,18 @@ void RegisterElementwiseKernels(KernelRegistry& registry) {
       auto output = MakeInt64Output(node.outputs.at(0), output_shape, context);
       const auto& x_data = RequireInt64Data(x, "Where");
       const auto& y_data = RequireInt64Data(y, "Where");
-      for (std::size_t i = 0; i < element_count; ++i) {
-        const auto output_index = UnravelIndex(i, output_shape, output_strides);
-        const auto cond_offset = ComputeBroadcastOffset(output_index, condition.shape, condition_strides);
-        const auto x_offset = ComputeBroadcastOffset(output_index, x.shape, x_strides);
-        const auto y_offset = ComputeBroadcastOffset(output_index, y.shape, y_strides);
-        output.int64_data[i] = read_condition(cond_offset) ? x_data[x_offset] : y_data[y_offset];
+      if (condition.shape == output_shape && x.shape == output_shape && y.shape == output_shape) {
+        for (std::size_t i = 0; i < element_count; ++i) {
+          output.int64_data[i] = read_condition(i) ? x_data[i] : y_data[i];
+        }
+      } else {
+        for (std::size_t i = 0; i < element_count; ++i) {
+          const auto output_index = UnravelIndex(i, output_shape, output_strides);
+          const auto cond_offset = ComputeBroadcastOffset(output_index, condition.shape, condition_strides);
+          const auto x_offset = ComputeBroadcastOffset(output_index, x.shape, x_strides);
+          const auto y_offset = ComputeBroadcastOffset(output_index, y.shape, y_strides);
+          output.int64_data[i] = read_condition(cond_offset) ? x_data[x_offset] : y_data[y_offset];
+        }
       }
       context.BindTensor(std::move(output));
     } else {
@@ -298,16 +345,24 @@ void RegisterElementwiseKernels(KernelRegistry& registry) {
       const auto* y_float_data = y.dtype == "float32" ? &RequireFloatData(y, "Where") : nullptr;
       const auto* y_int_data = y.dtype == "int64" ? &RequireInt64Data(y, "Where") : nullptr;
       auto output = MakeFloatOutput(node.outputs.at(0), output_shape, context);
-      for (std::size_t i = 0; i < element_count; ++i) {
-        const auto output_index = UnravelIndex(i, output_shape, output_strides);
-        const auto cond_offset = ComputeBroadcastOffset(output_index, condition.shape, condition_strides);
-        const auto x_offset = ComputeBroadcastOffset(output_index, x.shape, x_strides);
-        const auto y_offset = ComputeBroadcastOffset(output_index, y.shape, y_strides);
-        const auto x_value = x_float_data != nullptr ? (*x_float_data)[x_offset]
-                                                     : static_cast<float>((*x_int_data)[x_offset]);
-        const auto y_value = y_float_data != nullptr ? (*y_float_data)[y_offset]
-                                                     : static_cast<float>((*y_int_data)[y_offset]);
-        output.float_data[i] = read_condition(cond_offset) ? x_value : y_value;
+      const auto read_x = [&](std::size_t offset) {
+        return x_float_data != nullptr ? (*x_float_data)[offset] : static_cast<float>((*x_int_data)[offset]);
+      };
+      const auto read_y = [&](std::size_t offset) {
+        return y_float_data != nullptr ? (*y_float_data)[offset] : static_cast<float>((*y_int_data)[offset]);
+      };
+      if (condition.shape == output_shape && x.shape == output_shape && y.shape == output_shape) {
+        for (std::size_t i = 0; i < element_count; ++i) {
+          output.float_data[i] = read_condition(i) ? read_x(i) : read_y(i);
+        }
+      } else {
+        for (std::size_t i = 0; i < element_count; ++i) {
+          const auto output_index = UnravelIndex(i, output_shape, output_strides);
+          const auto cond_offset = ComputeBroadcastOffset(output_index, condition.shape, condition_strides);
+          const auto x_offset = ComputeBroadcastOffset(output_index, x.shape, x_strides);
+          const auto y_offset = ComputeBroadcastOffset(output_index, y.shape, y_strides);
+          output.float_data[i] = read_condition(cond_offset) ? read_x(x_offset) : read_y(y_offset);
+        }
       }
       context.BindTensor(std::move(output));
     }
