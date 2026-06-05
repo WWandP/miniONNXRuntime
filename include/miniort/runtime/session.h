@@ -55,6 +55,19 @@ struct SessionAssignmentSummary {
   std::vector<std::string> unassigned_op_types;
 };
 
+struct ProviderSegment {
+  std::size_t index{0};
+  std::string provider;
+  std::size_t start_topo{0};
+  std::size_t end_topo{0};
+  std::size_t node_count{0};
+  std::unordered_map<std::string, std::size_t> op_counts;
+  std::unordered_set<std::string> produced;
+  std::unordered_set<std::string> consumed;
+  std::unordered_set<std::string> boundary_inputs;
+  std::unordered_set<std::string> boundary_outputs;
+};
+
 class Session {
  public:
   Session(Graph graph, SessionOptions options = {});
@@ -65,12 +78,14 @@ class Session {
   KernelRegistry& kernel_registry();
   const KernelRegistry& kernel_registry() const;
   const SessionAssignmentSummary& assignment_summary() const;
+  const std::vector<ProviderSegment>& provider_segments() const;
 
   RunSummary Run(const std::unordered_map<std::string, Tensor>& feeds, ExecutionContext& context,
                  std::ostream* trace = nullptr) const;
 
  private:
   void AssignExecutionProviders();
+  std::vector<ProviderSegment> BuildProviderSegments() const;
   std::string ResolveExecutionProviderForNode(const Node& node) const;
   void ValidateAssignmentSummary() const;
   std::shared_ptr<TensorAllocator> MakeDefaultAllocator() const;
@@ -86,6 +101,7 @@ class Session {
   std::vector<std::shared_ptr<const ExecutionProvider>> providers_;
   std::vector<std::unordered_set<std::string>> provider_supported_ops_;
   SessionAssignmentSummary assignment_summary_;
+  std::vector<ProviderSegment> provider_segments_;
   std::unordered_map<std::string, std::size_t> tensor_last_use_topo_index_;
   std::unordered_map<std::string, bool> tensor_is_persistent_;
 };

@@ -248,6 +248,10 @@ const SessionAssignmentSummary& Session::assignment_summary() const {
   return assignment_summary_;
 }
 
+const std::vector<ProviderSegment>& Session::provider_segments() const {
+  return provider_segments_;
+}
+
 std::string Session::ResolveExecutionProviderForNode(const Node& node) const {
   switch (options_.provider_assignment_policy) {
     case ProviderAssignmentPolicy::kFirstMatch:
@@ -279,6 +283,65 @@ void Session::AssignExecutionProviders() {
   }
 
   assignment_summary_.unassigned_op_types.assign(unassigned_op_types.begin(), unassigned_op_types.end());
+  provider_segments_ = BuildProviderSegments();
+}
+
+std::vector<ProviderSegment> Session::BuildProviderSegments() const {
+  std::vector<ProviderSegment> segments;
+  for (std::size_t topo = 0; topo < graph_.topological_order.size(); ++topo) {
+    const auto node_index = graph_.topological_order[topo];
+    const auto& node = graph_.nodes[node_index];
+    const auto provider = node.execution_provider.empty() ? std::string("<unset>") : node.execution_provider;
+
+    if (segments.empty() || segments.back().provider != provider) {
+      ProviderSegment segment;
+      segment.index = segments.size();
+      segment.provider = provider;
+      segment.start_topo = topo;
+      segment.end_topo = topo;
+      segments.push_back(std::move(segment));
+    }
+
+    auto& segment = segments.back();
+    segment.end_topo = topo;
+    ++segment.node_count;
+    ++segment.op_counts[node.op_type];
+
+    for (const auto& input : node.inputs) {
+      if (input.empty()) {
+        continue;
+      }
+      segment.consumed.insert(input);
+      if (!segment.produced.contains(input)) {
+        segment.boundary_inputs.insert(input);
+      }
+    }
+    for (const auto& output : node.outputs) {
+      if (output.empty()) {
+        continue;
+      }
+      segment.produced.insert(output);
+    }
+  }
+
+  for (std::size_t i = 0; i < segments.size(); ++i) {
+    auto& segment = segments[i];
+    for (const auto& output : segment.produced) {
+      bool escapes = false;
+      for (std::size_t j = i + 1; j < segments.size() && !escapes; ++j) {
+        escapes = segments[j].consumed.contains(output);
+      }
+      if (!escapes) {
+        escapes = std::any_of(graph_.outputs.begin(), graph_.outputs.end(),
+                              [&output](const Value& value) { return value.name == output; });
+      }
+      if (escapes) {
+        segment.boundary_outputs.insert(output);
+      }
+    }
+  }
+
+  return segments;
 }
 
 void Session::ValidateAssignmentSummary() const {

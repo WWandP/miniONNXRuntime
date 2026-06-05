@@ -4,7 +4,6 @@
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
-#include <unordered_set>
 #include <vector>
 
 #include "miniort/loader/onnx_loader.h"
@@ -15,19 +14,6 @@ namespace {
 
 struct Options {
   std::string model_path;
-};
-
-struct ProviderSegment {
-  std::size_t index{0};
-  std::string provider;
-  std::size_t start_topo{0};
-  std::size_t end_topo{0};
-  std::size_t node_count{0};
-  std::unordered_map<std::string, std::size_t> op_counts;
-  std::unordered_set<std::string> produced;
-  std::unordered_set<std::string> consumed;
-  std::unordered_set<std::string> boundary_inputs;
-  std::unordered_set<std::string> boundary_outputs;
 };
 
 Options ParseArgs(int argc, char* argv[]) {
@@ -57,65 +43,7 @@ std::string FormatOpCounts(const std::unordered_map<std::string, std::size_t>& c
   return result;
 }
 
-std::vector<ProviderSegment> BuildProviderSegments(const miniort::Graph& graph) {
-  std::vector<ProviderSegment> segments;
-  for (std::size_t topo = 0; topo < graph.topological_order.size(); ++topo) {
-    const auto node_index = graph.topological_order[topo];
-    const auto& node = graph.nodes[node_index];
-    const auto provider = node.execution_provider.empty() ? std::string("<unset>") : node.execution_provider;
-
-    if (segments.empty() || segments.back().provider != provider) {
-      ProviderSegment segment;
-      segment.index = segments.size();
-      segment.provider = provider;
-      segment.start_topo = topo;
-      segment.end_topo = topo;
-      segments.push_back(std::move(segment));
-    }
-
-    auto& segment = segments.back();
-    segment.end_topo = topo;
-    ++segment.node_count;
-    ++segment.op_counts[node.op_type];
-
-    for (const auto& input : node.inputs) {
-      if (input.empty()) {
-        continue;
-      }
-      segment.consumed.insert(input);
-      if (!segment.produced.contains(input)) {
-        segment.boundary_inputs.insert(input);
-      }
-    }
-    for (const auto& output : node.outputs) {
-      if (output.empty()) {
-        continue;
-      }
-      segment.produced.insert(output);
-    }
-  }
-
-  for (std::size_t i = 0; i < segments.size(); ++i) {
-    auto& segment = segments[i];
-    for (const auto& output : segment.produced) {
-      bool escapes = false;
-      for (std::size_t j = i + 1; j < segments.size() && !escapes; ++j) {
-        escapes = segments[j].consumed.contains(output);
-      }
-      if (!escapes) {
-        escapes = std::any_of(graph.outputs.begin(), graph.outputs.end(),
-                              [&output](const miniort::Value& value) { return value.name == output; });
-      }
-      if (escapes) {
-        segment.boundary_outputs.insert(output);
-      }
-    }
-  }
-
-  return segments;
-}
-
-void PrintProviderSegmentSummary(const std::vector<ProviderSegment>& segments) {
+void PrintProviderSegmentSummary(const std::vector<miniort::ProviderSegment>& segments) {
   std::unordered_map<std::string, std::size_t> segment_counts_by_provider;
   std::unordered_map<std::string, std::size_t> node_counts_by_provider;
   std::unordered_map<std::string, std::size_t> max_segment_nodes_by_provider;
@@ -145,7 +73,7 @@ void PrintProviderSegmentSummary(const std::vector<ProviderSegment>& segments) {
   }
 }
 
-void PrintProviderSegments(const std::vector<ProviderSegment>& segments) {
+void PrintProviderSegments(const std::vector<miniort::ProviderSegment>& segments) {
   std::cout << "provider_segments\n";
   for (const auto& segment : segments) {
     std::cout << "  - segment[" << segment.index << "]"
@@ -174,7 +102,7 @@ int main(int argc, char* argv[]) {
 
     miniort::PrintPhaseStep(std::cout, 3, 3, "Build Provider Segments",
                             "统计连续同 provider 段和边界 tensor 数。");
-    const auto segments = BuildProviderSegments(session.graph());
+    const auto& segments = session.provider_segments();
     PrintProviderSegmentSummary(segments);
     PrintProviderSegments(segments);
     miniort::PrintPhaseResult(std::cout, "provider segment inspection complete",

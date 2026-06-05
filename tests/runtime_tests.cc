@@ -105,6 +105,35 @@ void TestAssignmentSummaryMarksSupportedAndUnsupportedOps() {
          "expected unsupported op to remain unassigned");
 }
 
+void TestProviderSegmentsFollowAssignedTopology() {
+  auto graph = MakeGraphWithOps({"Constant", "NotSupportedYet", "Identity"});
+  graph.nodes[0].outputs = {"constant_out"};
+  graph.nodes[1].inputs = {"constant_out"};
+  graph.nodes[1].outputs = {"unsupported_out"};
+  graph.nodes[2].inputs = {"unsupported_out"};
+  graph.nodes[2].outputs = {"final_out"};
+
+  miniort::Value output;
+  output.name = "final_out";
+  graph.outputs.push_back(std::move(output));
+
+  Session session(std::move(graph), {.allow_unassigned_nodes = true});
+  const auto& segments = session.provider_segments();
+
+  Expect(segments.size() == 3, "expected CPU/unassigned/CPU provider segments");
+  Expect(segments[0].provider == "CPU", "expected first segment to use CPU");
+  Expect(segments[0].start_topo == 0 && segments[0].end_topo == 0, "expected first segment topology range");
+  Expect(segments[0].boundary_outputs.contains("constant_out"), "expected first segment boundary output");
+
+  Expect(segments[1].provider == "<unassigned>", "expected second segment to be unassigned");
+  Expect(segments[1].boundary_inputs.contains("constant_out"), "expected unassigned segment boundary input");
+  Expect(segments[1].boundary_outputs.contains("unsupported_out"), "expected unassigned segment boundary output");
+
+  Expect(segments[2].provider == "CPU", "expected third segment to use CPU");
+  Expect(segments[2].boundary_inputs.contains("unsupported_out"), "expected final segment boundary input");
+  Expect(segments[2].boundary_outputs.contains("final_out"), "expected graph output as segment boundary output");
+}
+
 void TestSessionRejectsUnassignedNodesWhenConfigured() {
   auto graph = MakeGraphWithOps({"DefinitelyUnsupported"});
 
@@ -1799,6 +1828,7 @@ void TestAppleAccelerateSupportsGpt2HotPathOps() {
 int main() {
   try {
   TestAssignmentSummaryMarksSupportedAndUnsupportedOps();
+  TestProviderSegmentsFollowAssignedTopology();
   TestSessionRejectsUnassignedNodesWhenConfigured();
   TestRunInjectsAllocatorIntoExecutionContext();
   TestIdentityExecutionPassesThroughTensorData();
