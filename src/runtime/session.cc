@@ -419,15 +419,7 @@ RunSummary Session::Run(const std::unordered_map<std::string, Tensor>& feeds, Ex
       *trace << "session.run start_node=" << start_node << "\n";
     }
 
-    for (std::size_t topo_index = start_node; topo_index < graph_.topological_order.size(); ++topo_index) {
-      if (options_.max_nodes != 0 && topo_index >= end_node) {
-        if (trace != nullptr) {
-          *trace << "session.run stopped early at start_node=" << start_node
-                 << " max_nodes=" << options_.max_nodes << "\n";
-        }
-        break;
-      }
-
+    const auto run_node = [&](std::size_t topo_index) {
       const auto node_index = graph_.topological_order[topo_index];
       const auto& node = graph_.nodes[node_index];
       ++summary.provider_visited_node_counts[node.execution_provider];
@@ -525,6 +517,26 @@ RunSummary Session::Run(const std::unordered_map<std::string, Tensor>& feeds, Ex
       if (options_.after_node) {
         options_.after_node(topo_index, node, context, trace);
       }
+    };
+
+    for (const auto& segment : provider_segments_) {
+      if (segment.end_topo < start_node) {
+        continue;
+      }
+      if (segment.start_topo >= end_node) {
+        break;
+      }
+
+      const auto segment_start = std::max(segment.start_topo, start_node);
+      const auto segment_end = std::min(segment.end_topo + 1, end_node);
+      for (std::size_t topo_index = segment_start; topo_index < segment_end; ++topo_index) {
+        run_node(topo_index);
+      }
+    }
+
+    if (options_.max_nodes != 0 && end_node < graph_.topological_order.size() && trace != nullptr) {
+      *trace << "session.run stopped early at start_node=" << start_node
+             << " max_nodes=" << options_.max_nodes << "\n";
     }
 
 #if defined(MINIORT_BUILD_CUDA_EP)
