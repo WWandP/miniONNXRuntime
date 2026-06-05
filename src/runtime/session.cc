@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <iomanip>
 #include <memory>
+#include <optional>
 #include <set>
 #include <sstream>
 #include <stdexcept>
@@ -63,6 +64,27 @@ std::vector<std::int64_t> ResolveTransposePerm2D(const Node& node, const std::ve
     return {1, 0};
   }
   return {};
+}
+
+std::vector<std::int64_t> ParseConcreteShape(const TensorInfo& info) {
+  std::vector<std::int64_t> shape;
+  shape.reserve(info.shape.size());
+  for (const auto& dim : info.shape) {
+    if (dim.empty()) {
+      return {};
+    }
+    try {
+      std::size_t parsed_chars = 0;
+      const auto value = std::stoll(dim, &parsed_chars);
+      if (parsed_chars != dim.size() || value < 0) {
+        return {};
+      }
+      shape.push_back(value);
+    } catch (...) {
+      return {};
+    }
+  }
+  return shape;
 }
 
 bool TryFoldInitializerTranspose2D(Graph& graph, Node& node) {
@@ -226,6 +248,8 @@ Session::Session(Graph graph, std::vector<std::shared_ptr<const ExecutionProvide
       }
     }
   }
+
+  BuildPlannedBufferReuse();
 }
 
 Graph& Session::graph() {
@@ -252,27 +276,67 @@ const std::vector<ProviderSegment>& Session::provider_segments() const {
   return provider_segments_;
 }
 
-std::string Session::ResolveExecutionProviderForNode(const Node& node) const {
+void Session::AssignExecutionProviders() {
+  struct ProviderCapability {
+    std::string provider;
+    std::vector<std::size_t> node_indices;
+  };
+
+  auto provider_supports_node = [this](std::size_t provider_index, const Node& node) {
+    return provider_index < provider_supported_ops_.size() &&
+           provider_supported_ops_[provider_index].contains(node.op_type);
+  };
+
+  auto build_capabilities_for_provider = [&](std::size_t provider_index) {
+    std::vector<ProviderCapability> capabilities;
+    ProviderCapability current;
+    current.provider = std::string(providers_[provider_index]->Name());
+
+    const auto flush_current = [&]() {
+      if (!current.node_indices.empty()) {
+        capabilities.push_back(std::move(current));
+        current = ProviderCapability{.provider = std::string(providers_[provider_index]->Name())};
+      }
+    };
+
+    for (const auto node_index : graph_.topological_order) {
+      const auto& node = graph_.nodes[node_index];
+      const bool available = node.execution_provider.empty();
+      if (available && provider_supports_node(provider_index, node)) {
+        current.node_indices.push_back(node_index);
+      } else {
+        flush_current();
+      }
+    }
+    flush_current();
+    return capabilities;
+  };
+
   switch (options_.provider_assignment_policy) {
     case ProviderAssignmentPolicy::kFirstMatch:
       break;
   }
 
-  for (std::size_t i = 0; i < providers_.size(); ++i) {
-    if (i < provider_supported_ops_.size() && provider_supported_ops_[i].contains(node.op_type)) {
-      return std::string(providers_[i]->Name());
+  for (auto& node : graph_.nodes) {
+    node.execution_provider.clear();
+  }
+
+  for (std::size_t provider_index = 0; provider_index < providers_.size(); ++provider_index) {
+    for (const auto& capability : build_capabilities_for_provider(provider_index)) {
+      for (const auto node_index : capability.node_indices) {
+        graph_.nodes[node_index].execution_provider = capability.provider;
+      }
     }
   }
-  return "<unassigned>";
-}
 
-void Session::AssignExecutionProviders() {
   assignment_summary_ = {};
   assignment_summary_.total_nodes = graph_.nodes.size();
   std::set<std::string> unassigned_op_types;
 
   for (auto& node : graph_.nodes) {
-    node.execution_provider = ResolveExecutionProviderForNode(node);
+    if (node.execution_provider.empty()) {
+      node.execution_provider = "<unassigned>";
+    }
     if (node.execution_provider == "<unassigned>") {
       ++assignment_summary_.unassigned_nodes;
       unassigned_op_types.insert(node.op_type);
@@ -374,6 +438,99 @@ std::shared_ptr<TensorAllocator> Session::MakeDefaultAllocator() const {
   return nullptr;
 }
 
+void Session::BuildPlannedBufferReuse() {
+  planned_reuse_source_to_target_.clear();
+  if (!options_.planned_memory_reuse) {
+    return;
+  }
+
+  struct TensorLifetime {
+    std::string name;
+    std::string dtype;
+    std::size_t elements{0};
+    std::size_t producer_topo{0};
+    std::size_t last_use_topo{0};
+  };
+
+  auto tensor_info_for_name = [this](const std::string& name) -> const TensorInfo* {
+    if (const auto it = graph_.value_infos.find(name); it != graph_.value_infos.end()) {
+      return &it->second;
+    }
+    if (const auto it = graph_.initializers.find(name); it != graph_.initializers.end()) {
+      return &it->second.info;
+    }
+    for (const auto& value : graph_.inputs) {
+      if (value.name == name) {
+        return &value.info;
+      }
+    }
+    for (const auto& value : graph_.outputs) {
+      if (value.name == name) {
+        return &value.info;
+      }
+    }
+    return nullptr;
+  };
+
+  auto make_lifetime = [&](const std::string& name, std::size_t producer_topo) -> std::optional<TensorLifetime> {
+    if (name.empty() || tensor_is_persistent_.contains(name)) {
+      return std::nullopt;
+    }
+    const auto last_use_it = tensor_last_use_topo_index_.find(name);
+    if (last_use_it == tensor_last_use_topo_index_.end()) {
+      return std::nullopt;
+    }
+    const auto* info = tensor_info_for_name(name);
+    if (info == nullptr || (info->dtype != "float32" && info->dtype != "int64")) {
+      return std::nullopt;
+    }
+    const auto shape = ParseConcreteShape(*info);
+    if (shape.empty() && !info->shape.empty()) {
+      return std::nullopt;
+    }
+    return TensorLifetime{.name = name,
+                          .dtype = info->dtype,
+                          .elements = GetElementCount(shape),
+                          .producer_topo = producer_topo,
+                          .last_use_topo = last_use_it->second};
+  };
+
+  std::vector<TensorLifetime> produced_tensors;
+  for (std::size_t topo = 0; topo < graph_.topological_order.size(); ++topo) {
+    const auto& node = graph_.nodes[graph_.topological_order[topo]];
+    for (const auto& output : node.outputs) {
+      if (auto lifetime = make_lifetime(output, topo); lifetime.has_value()) {
+        produced_tensors.push_back(std::move(*lifetime));
+      }
+    }
+  }
+
+  std::vector<TensorLifetime> free_candidates;
+  std::unordered_set<std::string> added_candidates;
+  for (const auto& target : produced_tensors) {
+    for (const auto& candidate : produced_tensors) {
+      if (candidate.last_use_topo < target.producer_topo && added_candidates.insert(candidate.name).second) {
+        free_candidates.push_back(candidate);
+      }
+    }
+
+    auto best_it = free_candidates.end();
+    for (auto it = free_candidates.begin(); it != free_candidates.end(); ++it) {
+      if (it->dtype != target.dtype || it->elements < target.elements) {
+        continue;
+      }
+      if (best_it == free_candidates.end() || it->elements < best_it->elements) {
+        best_it = it;
+      }
+    }
+    if (best_it == free_candidates.end()) {
+      continue;
+    }
+    planned_reuse_source_to_target_[best_it->name] = target.name;
+    free_candidates.erase(best_it);
+  }
+}
+
 RunSummary Session::Run(const std::unordered_map<std::string, Tensor>& feeds, ExecutionContext& context,
                         std::ostream* trace) const {
   TimingMap timings;
@@ -383,6 +540,8 @@ RunSummary Session::Run(const std::unordered_map<std::string, Tensor>& feeds, Ex
     {
       ScopedTimer timer("session.load_initializers", trace, &timings["session.load_initializers"]);
       context.LoadInitializers(graph_);
+      context.SetPlannedBufferReuse(options_.planned_memory_reuse ? planned_reuse_source_to_target_
+                                                                  : std::unordered_map<std::string, std::string>{});
     }
 
     {

@@ -42,7 +42,7 @@ inline Tensor MakeFloatOutput(const std::string& name, const std::vector<std::in
   tensor.dtype = "float32";
   tensor.shape = shape;
   tensor.is_placeholder = false;
-  tensor.float_data = context.AcquireFloatBuffer(GetElementCount(shape));
+  tensor.float_data = context.AcquireFloatBufferForTensor(name, GetElementCount(shape));
   tensor.float_data.resize(GetElementCount(shape));
   return tensor;
 }
@@ -54,7 +54,7 @@ inline Tensor MakeInt64Output(const std::string& name, const std::vector<std::in
   tensor.dtype = "int64";
   tensor.shape = shape;
   tensor.is_placeholder = false;
-  tensor.int64_data = context.AcquireInt64Buffer(GetElementCount(shape));
+  tensor.int64_data = context.AcquireInt64BufferForTensor(name, GetElementCount(shape));
   tensor.int64_data.resize(GetElementCount(shape));
   return tensor;
 }
@@ -68,10 +68,10 @@ inline Tensor MakeOutputLikeWithReusedStorage(const std::string& name, const Ten
   tensor.is_placeholder = false;
   const auto element_count = GetElementCount(tensor.shape);
   if (tensor.dtype == "float32") {
-    tensor.float_data = context.AcquireFloatBuffer(element_count);
+    tensor.float_data = context.AcquireFloatBufferForTensor(name, element_count);
     tensor.float_data.resize(element_count);
   } else if (tensor.dtype == "int64") {
-    tensor.int64_data = context.AcquireInt64Buffer(element_count);
+    tensor.int64_data = context.AcquireInt64BufferForTensor(name, element_count);
     tensor.int64_data.resize(element_count);
   }
   return tensor;
@@ -86,10 +86,10 @@ inline Tensor MakeTensorWithReusedStorage(const std::string& name, const std::st
   tensor.is_placeholder = false;
   const auto element_count = GetElementCount(shape);
   if (dtype == "float32") {
-    tensor.float_data = context.AcquireFloatBuffer(element_count);
+    tensor.float_data = context.AcquireFloatBufferForTensor(name, element_count);
     tensor.float_data.resize(element_count);
   } else if (dtype == "int64") {
-    tensor.int64_data = context.AcquireInt64Buffer(element_count);
+    tensor.int64_data = context.AcquireInt64BufferForTensor(name, element_count);
     tensor.int64_data.resize(element_count);
   }
   return tensor;
@@ -126,7 +126,7 @@ inline Tensor MakeTensorFromDataWithReusedStorage(const std::string& name, const
   if (tensor.dtype == "int32") {
     tensor.dtype = "int64";
     if (!source.int32_data.empty()) {
-      tensor.int64_data = context.AcquireInt64Buffer(source.int32_data.size());
+      tensor.int64_data = context.AcquireInt64BufferForTensor(name, source.int32_data.size());
       tensor.int64_data.resize(source.int32_data.size());
       std::transform(source.int32_data.begin(), source.int32_data.end(), tensor.int64_data.begin(),
                      [](std::int32_t value) { return static_cast<std::int64_t>(value); });
@@ -134,7 +134,7 @@ inline Tensor MakeTensorFromDataWithReusedStorage(const std::string& name, const
     }
     if (!source.raw_data.empty() && source.raw_data.size() % sizeof(std::int32_t) == 0) {
       const auto count = source.raw_data.size() / sizeof(std::int32_t);
-      tensor.int64_data = context.AcquireInt64Buffer(count);
+      tensor.int64_data = context.AcquireInt64BufferForTensor(name, count);
       tensor.int64_data.resize(count);
       for (std::size_t i = 0; i < count; ++i) {
         std::int32_t value = 0;
@@ -150,15 +150,15 @@ inline Tensor MakeTensorFromDataWithReusedStorage(const std::string& name, const
   }
 
   if (source.dtype == "float32" && !source.float_data.empty()) {
-    tensor.float_data = context.AcquireFloatBuffer(source.float_data.size());
+    tensor.float_data = context.AcquireFloatBufferForTensor(name, source.float_data.size());
     tensor.float_data.resize(source.float_data.size());
     std::copy(source.float_data.begin(), source.float_data.end(), tensor.float_data.begin());
   } else if (source.dtype == "int64" && !source.int64_data.empty()) {
-    tensor.int64_data = context.AcquireInt64Buffer(source.int64_data.size());
+    tensor.int64_data = context.AcquireInt64BufferForTensor(name, source.int64_data.size());
     tensor.int64_data.resize(source.int64_data.size());
     std::copy(source.int64_data.begin(), source.int64_data.end(), tensor.int64_data.begin());
   } else if (source.dtype == "int32" && !source.int32_data.empty()) {
-    tensor.int64_data = context.AcquireInt64Buffer(source.int32_data.size());
+    tensor.int64_data = context.AcquireInt64BufferForTensor(name, source.int32_data.size());
     tensor.int64_data.resize(source.int32_data.size());
     std::transform(source.int32_data.begin(), source.int32_data.end(), tensor.int64_data.begin(),
                    [](std::int32_t value) { return static_cast<std::int64_t>(value); });

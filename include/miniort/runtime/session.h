@@ -27,6 +27,7 @@ struct SessionOptions {
   bool allow_unassigned_nodes{true};
   bool auto_bind_placeholder_inputs{true};
   bool evict_dead_tensors{false};
+  bool planned_memory_reuse{false};
   std::size_t start_node{0};
   std::size_t max_nodes{0};
   ProviderAssignmentPolicy provider_assignment_policy{ProviderAssignmentPolicy::kFirstMatch};
@@ -86,9 +87,9 @@ class Session {
  private:
   void AssignExecutionProviders();
   std::vector<ProviderSegment> BuildProviderSegments() const;
-  std::string ResolveExecutionProviderForNode(const Node& node) const;
   void ValidateAssignmentSummary() const;
   std::shared_ptr<TensorAllocator> MakeDefaultAllocator() const;
+  void BuildPlannedBufferReuse();
   void MaybeBindPlaceholderInputs(ExecutionContext& context, std::ostream* trace) const;
   void EvictDeadTensors(std::size_t topo_index, const Node& node, ExecutionContext& context, std::ostream* trace,
                         RunSummary& summary) const;
@@ -104,6 +105,7 @@ class Session {
   std::vector<ProviderSegment> provider_segments_;
   std::unordered_map<std::string, std::size_t> tensor_last_use_topo_index_;
   std::unordered_map<std::string, bool> tensor_is_persistent_;
+  std::unordered_map<std::string, std::string> planned_reuse_source_to_target_;
 };
 
 void PrintSessionAssignmentSummary(const SessionAssignmentSummary& summary, std::ostream& os);

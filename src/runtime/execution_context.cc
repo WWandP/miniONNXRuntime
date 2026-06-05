@@ -31,7 +31,7 @@ ExecutionContext::ExecutionContext(std::shared_ptr<TensorAllocator> allocator)
 
 void ExecutionContext::BindTensor(const Tensor& tensor) {
   if (auto it = tensors_.find(tensor.name); it != tensors_.end()) {
-    RecycleTensorStorage(std::move(it->second));
+    RecycleTensorStorage(tensor.name, std::move(it->second));
     it->second = tensor;
     return;
   }
@@ -40,7 +40,7 @@ void ExecutionContext::BindTensor(const Tensor& tensor) {
 
 void ExecutionContext::BindTensor(Tensor&& tensor) {
   if (auto it = tensors_.find(tensor.name); it != tensors_.end()) {
-    RecycleTensorStorage(std::move(it->second));
+    RecycleTensorStorage(tensor.name, std::move(it->second));
     it->second = std::move(tensor);
     return;
   }
@@ -52,7 +52,7 @@ bool ExecutionContext::EraseTensor(const std::string& name) {
   if (it == tensors_.end()) {
     return false;
   }
-  RecycleTensorStorage(std::move(it->second));
+  RecycleTensorStorage(name, std::move(it->second));
   tensors_.erase(it);
   return true;
 }
@@ -142,6 +142,53 @@ std::vector<std::int64_t> ExecutionContext::AcquireInt64Buffer(std::size_t eleme
   std::vector<std::int64_t> buffer;
   buffer.reserve(element_count);
   return buffer;
+}
+
+std::vector<float> ExecutionContext::AcquireFloatBufferForTensor(const std::string& name,
+                                                                 std::size_t element_count) {
+  if (const auto it = planned_float_buffers_.find(name); it != planned_float_buffers_.end() &&
+                                                         it->second.capacity() >= element_count) {
+    std::vector<float> buffer = std::move(it->second);
+    planned_float_buffers_.erase(it);
+    buffer.clear();
+    buffer.reserve(element_count);
+    return buffer;
+  }
+  return AcquireFloatBuffer(element_count);
+}
+
+std::vector<std::int64_t> ExecutionContext::AcquireInt64BufferForTensor(const std::string& name,
+                                                                        std::size_t element_count) {
+  if (const auto it = planned_int64_buffers_.find(name); it != planned_int64_buffers_.end() &&
+                                                          it->second.capacity() >= element_count) {
+    std::vector<std::int64_t> buffer = std::move(it->second);
+    planned_int64_buffers_.erase(it);
+    buffer.clear();
+    buffer.reserve(element_count);
+    return buffer;
+  }
+  return AcquireInt64Buffer(element_count);
+}
+
+void ExecutionContext::SetPlannedBufferReuse(std::unordered_map<std::string, std::string> source_to_target) {
+  planned_reuse_source_to_target_ = std::move(source_to_target);
+  planned_float_buffers_.clear();
+  planned_int64_buffers_.clear();
+}
+
+void ExecutionContext::RecycleTensorStorage(const std::string& name, Tensor&& tensor) {
+  const auto reuse_it = planned_reuse_source_to_target_.find(name);
+  if (reuse_it != planned_reuse_source_to_target_.end()) {
+    const auto& target = reuse_it->second;
+    if (!tensor.float_data.empty()) {
+      planned_float_buffers_[target] = std::move(tensor.float_data);
+    }
+    if (!tensor.int64_data.empty()) {
+      planned_int64_buffers_[target] = std::move(tensor.int64_data);
+    }
+    return;
+  }
+  RecycleTensorStorage(std::move(tensor));
 }
 
 void ExecutionContext::RecycleTensorStorage(Tensor&& tensor) {

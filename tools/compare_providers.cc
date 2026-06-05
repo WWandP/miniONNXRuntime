@@ -27,6 +27,8 @@ struct Options {
   std::size_t repeat{1};
   std::size_t warmup{0};
   bool allow_missing{false};
+  bool evict_dead_tensors{false};
+  bool planned_memory_reuse{false};
 };
 
 struct LatencyStats {
@@ -40,7 +42,8 @@ struct LatencyStats {
 Options ParseArgs(int argc, char* argv[]) {
   if (argc < 4) {
     throw std::runtime_error(
-        "usage: miniort_compare_providers <model.onnx> --image path [--repeat N] [--warmup N] [--allow-missing]");
+        "usage: miniort_compare_providers <model.onnx> --image path [--repeat N] [--warmup N] [--allow-missing] "
+        "[--evict-dead-tensors] [--planned-memory-reuse]");
   }
 
   Options options;
@@ -61,6 +64,15 @@ Options ParseArgs(int argc, char* argv[]) {
     }
     if (arg == "--allow-missing") {
       options.allow_missing = true;
+      continue;
+    }
+    if (arg == "--evict-dead-tensors") {
+      options.evict_dead_tensors = true;
+      continue;
+    }
+    if (arg == "--planned-memory-reuse") {
+      options.planned_memory_reuse = true;
+      options.evict_dead_tensors = true;
       continue;
     }
     throw std::runtime_error("unknown argument: " + arg);
@@ -154,6 +166,8 @@ int main(int argc, char* argv[]) {
     session_options.auto_bind_placeholder_inputs = true;
     session_options.allow_missing_kernels = options.allow_missing;
     session_options.allow_unassigned_nodes = options.allow_missing;
+    session_options.evict_dead_tensors = options.evict_dead_tensors;
+    session_options.planned_memory_reuse = options.planned_memory_reuse;
 
     miniort::PrintPhaseStep(std::cout, 3, 4, "Create Sessions",
                             "分别构造默认 provider 路径和 CPU-only 路径。");
@@ -175,6 +189,8 @@ int main(int argc, char* argv[]) {
     std::cout << "  warmup=" << options.warmup << "\n";
     std::cout << "  repeat=" << options.repeat << "\n";
     std::cout << "  allow_missing=" << (options.allow_missing ? "true" : "false") << "\n";
+    std::cout << "  evict_dead_tensors=" << (options.evict_dead_tensors ? "true" : "false") << "\n";
+    std::cout << "  planned_memory_reuse=" << (options.planned_memory_reuse ? "true" : "false") << "\n";
     std::cout << "  mixed_ms=" << mixed_stats.mean_ms << "\n";
     std::cout << "  cpu_only_ms=" << cpu_stats.mean_ms << "\n";
     std::cout << "  delta_ms=" << delta_ms << "\n";

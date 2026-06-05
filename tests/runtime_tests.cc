@@ -8,6 +8,7 @@
 
 #include "miniort/model/graph.h"
 #include "miniort/runtime/cuda_execution_provider.h"
+#include "miniort/runtime/cpu_tensor_allocator.h"
 #include "miniort/runtime/cpu_execution_provider.h"
 #include "miniort/runtime/execution_context.h"
 #include "miniort/runtime/tensor.h"
@@ -22,6 +23,107 @@ using miniort::ProviderAssignmentPolicy;
 using miniort::Session;
 using miniort::SessionAssignmentSummary;
 using miniort::SessionOptions;
+
+class SingleOpExecutionProvider : public miniort::ExecutionProvider {
+ public:
+  SingleOpExecutionProvider(std::string name, std::vector<std::string> ops)
+      : name_(std::move(name)), ops_(std::move(ops)) {}
+
+  std::string_view Name() const override {
+    return name_;
+  }
+
+  void RegisterKernels(miniort::KernelRegistry& registry) const override {
+    for (const auto& op : ops_) {
+      registry.Register(op, [](const Node& node, miniort::ExecutionContext& context, std::ostream*) {
+        if (node.outputs.empty()) {
+          return;
+        }
+        miniort::Tensor output;
+        output.name = node.outputs.front();
+        output.dtype = "float32";
+        output.shape = {};
+        output.float_data = {0.0f};
+        context.BindTensor(std::move(output));
+      });
+    }
+  }
+
+  std::shared_ptr<miniort::TensorAllocator> CreateTensorAllocator() const override {
+    return nullptr;
+  }
+
+ private:
+  std::string name_;
+  std::vector<std::string> ops_;
+};
+
+class PlannedReuseExecutionProvider : public miniort::ExecutionProvider {
+ public:
+  PlannedReuseExecutionProvider(const float** first_ptr, const float** reused_ptr)
+      : first_ptr_(first_ptr), reused_ptr_(reused_ptr) {}
+
+  std::string_view Name() const override {
+    return "PlannedReuseEP";
+  }
+
+  void RegisterKernels(miniort::KernelRegistry& registry) const override {
+    registry.Register("MakeA", [this](const Node& node, miniort::ExecutionContext& context, std::ostream*) {
+      miniort::Tensor output;
+      output.name = node.outputs.front();
+      output.dtype = "float32";
+      output.shape = {4};
+      output.float_data = context.AcquireFloatBufferForTensor(output.name, 4);
+      output.float_data = {1.f, 2.f, 3.f, 4.f};
+      *first_ptr_ = output.float_data.data();
+      context.BindTensor(std::move(output));
+    });
+    registry.Register("UseA", [](const Node& node, miniort::ExecutionContext& context, std::ostream*) {
+      const auto* input = context.FindTensor(node.inputs.front());
+      if (input == nullptr) {
+        throw std::runtime_error("missing input");
+      }
+      miniort::Tensor output;
+      output.name = node.outputs.front();
+      output.dtype = "float32";
+      output.shape = {4};
+      output.float_data = context.AcquireFloatBufferForTensor(output.name, 4);
+      output.float_data = input->float_data;
+      context.BindTensor(std::move(output));
+    });
+    registry.Register("MakeC", [this](const Node& node, miniort::ExecutionContext& context, std::ostream*) {
+      miniort::Tensor output;
+      output.name = node.outputs.front();
+      output.dtype = "float32";
+      output.shape = {4};
+      output.float_data = context.AcquireFloatBufferForTensor(output.name, 4);
+      output.float_data = {5.f, 6.f, 7.f, 8.f};
+      *reused_ptr_ = output.float_data.data();
+      context.BindTensor(std::move(output));
+    });
+    registry.Register("UseC", [](const Node& node, miniort::ExecutionContext& context, std::ostream*) {
+      const auto* input = context.FindTensor(node.inputs.front());
+      if (input == nullptr) {
+        throw std::runtime_error("missing input");
+      }
+      miniort::Tensor output;
+      output.name = node.outputs.front();
+      output.dtype = "float32";
+      output.shape = {4};
+      output.float_data = context.AcquireFloatBufferForTensor(output.name, 4);
+      output.float_data = input->float_data;
+      context.BindTensor(std::move(output));
+    });
+  }
+
+  std::shared_ptr<miniort::TensorAllocator> CreateTensorAllocator() const override {
+    return std::make_shared<miniort::CpuTensorAllocator>();
+  }
+
+ private:
+  const float** first_ptr_;
+  const float** reused_ptr_;
+};
 
 Session MakeCpuSession(Graph graph, SessionOptions options = {}) {
   std::vector<std::shared_ptr<const miniort::ExecutionProvider>> providers;
@@ -132,6 +234,67 @@ void TestProviderSegmentsFollowAssignedTopology() {
   Expect(segments[2].provider == "CPU", "expected third segment to use CPU");
   Expect(segments[2].boundary_inputs.contains("unsupported_out"), "expected final segment boundary input");
   Expect(segments[2].boundary_outputs.contains("final_out"), "expected graph output as segment boundary output");
+}
+
+void TestProviderCentricAssignmentBuildsMultipleCapabilities() {
+  auto graph = MakeGraphWithOps({"Identity", "Constant", "Identity"});
+
+  std::vector<std::shared_ptr<const miniort::ExecutionProvider>> providers;
+  providers.push_back(std::make_shared<SingleOpExecutionProvider>("TestEP", std::vector<std::string>{"Identity"}));
+  providers.push_back(std::make_shared<miniort::CpuExecutionProvider>());
+
+  Session session(std::move(graph), std::move(providers), {.allow_unassigned_nodes = false});
+  Expect(session.graph().nodes[0].execution_provider == "TestEP", "expected first Identity to assign to TestEP");
+  Expect(session.graph().nodes[1].execution_provider == "CPU", "expected Constant to assign to CPU");
+  Expect(session.graph().nodes[2].execution_provider == "TestEP", "expected second Identity to assign to TestEP");
+
+  const auto& segments = session.provider_segments();
+  Expect(segments.size() == 3, "expected TestEP/CPU/TestEP provider segments");
+  Expect(segments[0].provider == "TestEP" && segments[0].node_count == 1, "expected first TestEP capability segment");
+  Expect(segments[1].provider == "CPU" && segments[1].node_count == 1, "expected CPU segment");
+  Expect(segments[2].provider == "TestEP" && segments[2].node_count == 1, "expected second TestEP capability segment");
+}
+
+void TestPlannedMemoryReuseReusesDeadTensorStorage() {
+  Graph graph;
+  graph.name = "planned_reuse_graph";
+  graph.nodes = {
+      {.name = "make_a", .op_type = "MakeA", .outputs = {"a"}},
+      {.name = "use_a", .op_type = "UseA", .inputs = {"a"}, .outputs = {"b"}},
+      {.name = "make_c", .op_type = "MakeC", .outputs = {"c"}},
+      {.name = "use_c", .op_type = "UseC", .inputs = {"c"}, .outputs = {"d"}},
+  };
+  graph.topological_order = {0, 1, 2, 3};
+  for (std::size_t i = 0; i < graph.nodes.size(); ++i) {
+    graph.node_name_to_index[graph.nodes[i].name] = i;
+    ++graph.op_type_histogram[graph.nodes[i].op_type];
+  }
+  for (const auto& name : {"a", "b", "c", "d"}) {
+    graph.value_infos[name] = miniort::TensorInfo{.shape = {"4"}, .dtype = "float32"};
+  }
+  graph.outputs.push_back(miniort::Value{.name = "d", .info = graph.value_infos.at("d")});
+
+  const float* first_ptr = nullptr;
+  const float* reused_ptr = nullptr;
+  std::vector<std::shared_ptr<const miniort::ExecutionProvider>> providers;
+  providers.push_back(std::make_shared<PlannedReuseExecutionProvider>(&first_ptr, &reused_ptr));
+
+  SessionOptions options;
+  options.allow_unassigned_nodes = false;
+  options.evict_dead_tensors = true;
+  options.planned_memory_reuse = true;
+  Session session(std::move(graph), std::move(providers), options);
+
+  miniort::ExecutionContext context;
+  const auto summary = session.Run({}, context, nullptr);
+  Expect(summary.executed_nodes == 4, "expected planned reuse graph to execute");
+  Expect(summary.released_tensors >= 2, "expected intermediate tensors to be evicted");
+  Expect(first_ptr != nullptr, "expected first allocation pointer");
+  Expect(reused_ptr != nullptr, "expected reused allocation pointer");
+  Expect(first_ptr == reused_ptr, "expected planned reuse to give C the storage released by A");
+  const auto* output = context.FindTensor("d");
+  Expect(output != nullptr, "expected final output");
+  Expect(output->float_data == std::vector<float>({5.f, 6.f, 7.f, 8.f}), "unexpected final output");
 }
 
 void TestSessionRejectsUnassignedNodesWhenConfigured() {
@@ -1829,6 +1992,8 @@ int main() {
   try {
   TestAssignmentSummaryMarksSupportedAndUnsupportedOps();
   TestProviderSegmentsFollowAssignedTopology();
+  TestProviderCentricAssignmentBuildsMultipleCapabilities();
+  TestPlannedMemoryReuseReusesDeadTensorStorage();
   TestSessionRejectsUnassignedNodesWhenConfigured();
   TestRunInjectsAllocatorIntoExecutionContext();
   TestIdentityExecutionPassesThroughTensorData();

@@ -70,7 +70,8 @@ class CudaBufferPool {
       return {};
     }
 
-    const auto it = free_buffers_.lower_bound(bytes);
+    const auto rounded_bytes = RoundBytes(bytes);
+    const auto it = free_buffers_.lower_bound(rounded_bytes);
     if (it != free_buffers_.end()) {
       Allocation allocation{it->second, it->first};
       free_buffers_.erase(it);
@@ -78,8 +79,8 @@ class CudaBufferPool {
     }
 
     void* data = nullptr;
-    CheckCuda(cudaMalloc(&data, bytes), "cudaMalloc");
-    return {data, bytes};
+    CheckCuda(cudaMalloc(&data, rounded_bytes), "cudaMalloc");
+    return {data, rounded_bytes};
   }
 
   void Release(void* data, std::size_t bytes) noexcept {
@@ -98,6 +99,12 @@ class CudaBufferPool {
   CudaBufferPool() = default;
 
   friend CudaBufferPool& GetCudaBufferPool();
+
+  static constexpr std::size_t kAlignment = 256;
+
+  static std::size_t RoundBytes(std::size_t bytes) {
+    return ((bytes + kAlignment - 1) / kAlignment) * kAlignment;
+  }
 
   std::multimap<std::size_t, void*> free_buffers_;
 };
