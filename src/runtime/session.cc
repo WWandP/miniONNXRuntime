@@ -392,6 +392,12 @@ RunSummary Session::Run(const std::unordered_map<std::string, Tensor>& feeds, Ex
         options_.before_node(topo_index, node, context, trace);
       }
 
+#if defined(MINIORT_BUILD_CUDA_EP)
+      if (node.execution_provider != "CUDA") {
+        MaterializeCudaInputsForNode(node, context);
+      }
+#endif
+
       const auto* kernel = kernel_registry_.Lookup(node.op_type);
       if (kernel != nullptr) {
         const auto node_start = Clock::now();
@@ -457,6 +463,24 @@ RunSummary Session::Run(const std::unordered_map<std::string, Tensor>& feeds, Ex
         options_.after_node(topo_index, node, context, trace);
       }
     }
+
+#if defined(MINIORT_BUILD_CUDA_EP)
+    if (graph_.outputs.empty()) {
+      std::vector<std::string> tensor_names;
+      tensor_names.reserve(context.tensors().size());
+      for (const auto& [name, tensor] : context.tensors()) {
+        (void)tensor;
+        tensor_names.push_back(name);
+      }
+      for (const auto& name : tensor_names) {
+        MaterializeCudaTensor(name, context);
+      }
+    } else {
+      for (const auto& output : graph_.outputs) {
+        MaterializeCudaTensor(output.name, context);
+      }
+    }
+#endif
 
   }
 

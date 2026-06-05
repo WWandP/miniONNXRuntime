@@ -8,8 +8,8 @@ MODELS_DIR="${MODELS_DIR:-$ROOT_DIR/models}"
 # Existing GPT-2 zip file id used by this repo.
 GPT2_ZIP_FILE_ID="18MEDHiReBKk1nXuJrvSYNNCID-kJ5wiG"
 
-# Existing additional model zip file id used by this repo.
-ADDITIONAL_ZIP_FILE_ID="15kO6Yn8Spo90hYBVLTB3a0CauordZSav"
+# YOLO model used by the default vision phases.
+YOLOV8N_ONNX_URL="${YOLOV8N_ONNX_URL:-https://huggingface.co/cabelo/yolov8/resolve/main/yolov8n.onnx}"
 
 # User-provided Qwen folder link.
 QWEN_GDRIVE_FOLDER_URL="https://drive.google.com/drive/folders/1Fa_pBaL6ZbxDt4bNij5c87_cH0sIX3XK?usp=drive_link"
@@ -29,6 +29,25 @@ download_gdrive_file() {
   curl -fL "https://drive.google.com/uc?export=download&id=${file_id}" -o "$output_path"
 }
 
+download_yolo() {
+  mkdir -p "$MODELS_DIR"
+  log "Downloading YOLOv8n ONNX model..."
+  curl -fL "$YOLOV8N_ONNX_URL" -o "$MODELS_DIR/yolov8n.onnx"
+  log "YOLOv8n model downloaded to $MODELS_DIR/yolov8n.onnx"
+}
+
+download_gpt2() {
+  mkdir -p "$MODELS_DIR/gpt2"
+
+  log "Downloading GPT-2 model archive..."
+  download_gdrive_file "$GPT2_ZIP_FILE_ID" "$MODELS_DIR/gpt2/gpt2_model.zip"
+
+  log "Extracting GPT-2 model archive..."
+  unzip -o "$MODELS_DIR/gpt2/gpt2_model.zip" -d "$MODELS_DIR/gpt2/"
+  rm -f "$MODELS_DIR/gpt2/gpt2_model.zip"
+  log "GPT-2 model downloaded to $MODELS_DIR/gpt2"
+}
+
 ensure_qwen_folder() {
   mkdir -p "$QWEN_DIR"
 
@@ -46,27 +65,44 @@ ensure_qwen_folder() {
   warn "And place files under: $QWEN_DIR"
 }
 
+usage() {
+  cat <<EOF
+usage:
+  ./scripts/download_models.sh [yolo|gpt2|qwen|all]
+
+environment overrides:
+  MODELS_DIR=/path/to/models
+  YOLOV8N_ONNX_URL=https://...
+EOF
+}
+
 main() {
-  mkdir -p "$MODELS_DIR"
+  local target="${1:-all}"
 
-  log "Downloading GPT-2 model archive..."
-  mkdir -p "$MODELS_DIR/gpt2"
-  download_gdrive_file "$GPT2_ZIP_FILE_ID" "$MODELS_DIR/gpt2/gpt2_model.zip"
-
-  log "Extracting GPT-2 model archive..."
-  unzip -o "$MODELS_DIR/gpt2/gpt2_model.zip" -d "$MODELS_DIR/gpt2/"
-  rm -f "$MODELS_DIR/gpt2/gpt2_model.zip"
-  log "GPT-2 model downloaded to $MODELS_DIR/gpt2"
-
-  log "Downloading additional model archive..."
-  download_gdrive_file "$ADDITIONAL_ZIP_FILE_ID" "$MODELS_DIR/additional_model.zip"
-
-  log "Extracting additional model archive..."
-  unzip -o "$MODELS_DIR/additional_model.zip" -d "$MODELS_DIR/"
-  rm -f "$MODELS_DIR/additional_model.zip"
-  log "Additional model extracted to $MODELS_DIR"
-
-  ensure_qwen_folder
+  case "$target" in
+    yolo)
+      download_yolo
+      ;;
+    gpt2)
+      download_gpt2
+      ;;
+    qwen)
+      ensure_qwen_folder
+      ;;
+    all)
+      download_yolo
+      download_gpt2
+      ensure_qwen_folder
+      ;;
+    -h|--help|help)
+      usage
+      ;;
+    *)
+      printf '[download_models][error] unknown target: %s\n' "$target" >&2
+      usage
+      exit 1
+      ;;
+  esac
 
   log "Done."
 }

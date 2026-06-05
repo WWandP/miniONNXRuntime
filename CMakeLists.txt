@@ -12,6 +12,7 @@ option(MINIORT_BUILD_DETECT_TOOL "Build yolov8n detect demo tool" ON)
 option(MINIORT_BUILD_OPTIMIZER_TOOLS "Build graph optimizer demo tool" OFF)
 option(MINIORT_BUILD_TESTS "Build runtime tests" ON)
 option(MINIORT_BUILD_CUDA_EP "Build CUDA execution provider" OFF)
+option(MINIORT_BUILD_CUDNN "Build CUDA Conv with cuDNN when available" ON)
 
 set(MINIORT_THIRD_PARTY_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party")
 set(MINIORT_ONNX_DIR "${MINIORT_THIRD_PARTY_DIR}/onnx")
@@ -147,6 +148,28 @@ if(MINIORT_BUILD_RUNTIME_TOOLS OR MINIORT_BUILD_DETECT_TOOL OR MINIORT_BUILD_TES
     target_compile_definitions(miniort_runtime PUBLIC MINIORT_BUILD_CUDA_EP=1)
   endif()
 
+  if(MINIORT_BUILD_CUDA_EP AND MINIORT_BUILD_CUDNN)
+    find_path(CUDNN_INCLUDE_DIR
+      NAMES cudnn.h
+      PATHS /usr/include /usr/local/cuda/include
+      PATH_SUFFIXES x86_64-linux-gnu
+    )
+    find_library(CUDNN_LIBRARY
+      NAMES cudnn
+      PATHS /usr/lib /usr/local/cuda/lib64
+      PATH_SUFFIXES x86_64-linux-gnu
+    )
+
+    if(CUDNN_INCLUDE_DIR AND CUDNN_LIBRARY)
+      target_compile_definitions(miniort_runtime PUBLIC MINIORT_BUILD_CUDNN=1)
+      target_include_directories(miniort_runtime PRIVATE "${CUDNN_INCLUDE_DIR}")
+      target_link_libraries(miniort_runtime PUBLIC "${CUDNN_LIBRARY}")
+      message(STATUS "cuDNN enabled: include=${CUDNN_INCLUDE_DIR} library=${CUDNN_LIBRARY}")
+    else()
+      message(STATUS "cuDNN not found; CUDA Conv will use MiniORT im2col fallback")
+    endif()
+  endif()
+
   target_link_libraries(miniort_runtime
     PUBLIC
       miniort_model
@@ -226,6 +249,12 @@ if(MINIORT_BUILD_RUNTIME_TOOLS)
   )
 
   target_link_libraries(miniort_compare_providers PRIVATE miniort_runtime)
+
+  add_executable(miniort_provider_segments
+    tools/provider_segments.cc
+  )
+
+  target_link_libraries(miniort_provider_segments PRIVATE miniort_runtime)
 endif()
 
 if(MINIORT_BUILD_OPTIMIZER_TOOLS)

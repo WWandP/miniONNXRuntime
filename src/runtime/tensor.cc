@@ -63,7 +63,7 @@ bool HasConcreteShape(const std::vector<std::int64_t>& shape) {
 }
 
 bool HasAnyData(const Tensor& tensor) {
-  return !tensor.float_data.empty() || !tensor.int64_data.empty();
+  return !tensor.float_data.empty() || !tensor.int64_data.empty() || tensor.cuda_data != nullptr;
 }
 
 std::string FormatRuntimeShape(const std::vector<std::int64_t>& shape) {
@@ -98,6 +98,9 @@ std::string FormatTensorSummary(const Tensor& tensor) {
   }
   if (!tensor.int64_data.empty()) {
     oss << " int64_data=" << tensor.int64_data.size();
+  }
+  if (tensor.cuda_data != nullptr) {
+    oss << " cuda_bytes=" << tensor.cuda_bytes;
   }
   return oss.str();
 }
