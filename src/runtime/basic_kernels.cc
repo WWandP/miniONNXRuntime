@@ -28,14 +28,19 @@ void RegisterBasicKernels(KernelRegistry& registry) {
     const auto& tensor_attr = *attr_it->second.tensor;
     for (const auto& output_name : node.outputs) {
       if (const auto* existing = context.FindTensor(output_name);
-          existing != nullptr && existing->is_initializer && HasAnyData(*existing)) {
+          existing != nullptr && ((existing->is_initializer && HasAnyData(*existing)) ||
+                                  (existing->is_constant && existing->producer_graph == context.CurrentGraph() &&
+                                   (HasAnyData(*existing) ||
+                                    (HasConcreteShape(existing->shape) && GetElementCount(existing->shape) == 0))))) {
         if (trace != nullptr) {
-          *trace << "    kernel Constant reused initializer " << output_name << "\n";
+          *trace << "    kernel Constant reused existing tensor " << output_name << "\n";
         }
         continue;
       }
 
       Tensor tensor = MakeTensorFromDataWithReusedStorage(output_name, tensor_attr, context);
+      tensor.producer_graph = context.CurrentGraph();
+      tensor.is_constant = true;
       if (tensor.is_placeholder && (!HasConcreteShape(tensor.shape) || GetElementCount(tensor.shape) == 0)) {
         tensor.is_placeholder = true;
       }

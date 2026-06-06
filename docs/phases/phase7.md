@@ -11,6 +11,15 @@
 ./scripts/run_phase.sh phase7
 ```
 
+CUDA 构建运行：
+
+```bash
+MINIORT_BUILD_CUDA_EP=ON CMAKE_BUILD_TYPE=Release BUILD_DIR=build_cuda_release \
+  ./scripts/run_phase.sh phase7
+```
+
+开启 CUDA EP 后会走当前 CUDA provider 路径；默认 `build_local` 则是普通 CPU/default 路径。
+
 ## 输出重点
 
 - `last_token_topk`

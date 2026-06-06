@@ -11,6 +11,9 @@ from pathlib import Path
 import numpy as np
 import onnxruntime as ort
 
+if hasattr(ort, "preload_dlls"):
+    ort.preload_dlls(directory="")
+
 
 DEFAULT_PROMPT_TOKENS = [40, 2883, 6155, 351, 616, 13779, 3290]
 
@@ -43,7 +46,8 @@ def make_session(path: Path, args: argparse.Namespace) -> ort.InferenceSession:
     if args.threads is not None:
         options.intra_op_num_threads = args.threads
         options.inter_op_num_threads = 1
-    return ort.InferenceSession(path.as_posix(), sess_options=options, providers=["CPUExecutionProvider"])
+    providers = args.provider if args.provider else ["CPUExecutionProvider"]
+    return ort.InferenceSession(path.as_posix(), sess_options=options, providers=providers)
 
 
 def select_greedy(logits: np.ndarray) -> int:
@@ -100,6 +104,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--warmup", type=int, default=1)
     parser.add_argument("--repeat", type=int, default=3)
     parser.add_argument("--threads", type=int, default=None)
+    parser.add_argument("--provider", action="append", help="Provider order. Can be passed multiple times.")
     parser.add_argument("--disable-graph-opt", action="store_true")
     parser.add_argument("--tokens", default=",".join(str(token) for token in DEFAULT_PROMPT_TOKENS))
     return parser.parse_args()

@@ -4,6 +4,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <iostream>
+#include <memory>
 #include <numeric>
 #include <sstream>
 #include <stdexcept>
@@ -22,16 +23,31 @@ namespace {
 
 using Clock = std::chrono::steady_clock;
 
+#if defined(MINIORT_BENCHMARK_QWEN_KV)
+constexpr const char* kBenchmarkName = "miniort_qwen_kv_benchmark";
+constexpr const char* kDefaultPrefillModel = "models/qwen2_5_0_5b_instruct/model.kv_prefill.onnx";
+constexpr const char* kDefaultDecodeModel = "models/qwen2_5_0_5b_instruct/model.kv_decode.onnx";
+constexpr const char* kDefaultTokens = "108386";
+constexpr std::size_t kDefaultGenerate = 8;
+#else
+constexpr const char* kBenchmarkName = "miniort_gpt2_kv_benchmark";
+constexpr const char* kDefaultPrefillModel = "models/gpt2/model.kv_prefill.onnx";
+constexpr const char* kDefaultDecodeModel = "models/gpt2/model.kv_decode.onnx";
+constexpr const char* kDefaultTokens = "40,2883,6155,351,616,13779,3290";
+constexpr std::size_t kDefaultGenerate = 48;
+#endif
+
 struct Options {
-  std::string prefill_model{"models/gpt2/model.kv_prefill.onnx"};
-  std::string decode_model{"models/gpt2/model.kv_decode.onnx"};
-  std::string tokens{"40,2883,6155,351,616,13779,3290"};
-  std::size_t generate{48};
+  std::string prefill_model{kDefaultPrefillModel};
+  std::string decode_model{kDefaultDecodeModel};
+  std::string tokens{kDefaultTokens};
+  std::size_t generate{kDefaultGenerate};
   std::size_t warmup{1};
   std::size_t repeat{3};
   bool strict{true};
   bool graph_opt{false};
   bool shared_context{false};
+  bool prepare_cuda_initializers{true};
   bool print_steps{false};
   bool print_cache_residency{false};
   bool trace_measured{false};
@@ -131,6 +147,8 @@ Options ParseArgs(int argc, char* argv[]) {
       options.graph_opt = true;
     } else if (arg == "--shared-context") {
       options.shared_context = true;
+    } else if (arg == "--no-prepare-cuda-initializers") {
+      options.prepare_cuda_initializers = false;
     } else if (arg == "--print-steps") {
       options.print_steps = true;
     } else if (arg == "--print-cache-residency") {
@@ -255,6 +273,17 @@ int main(int argc, char* argv[]) {
     miniort::Session decode_session(std::move(decode_graph), session_options);
     const auto prompt_tokens = ParseTokenIds(options.tokens);
 
+    double prepare_cuda_initializers_ms = 0.0;
+    std::size_t prepared_prefill_initializers = 0;
+    std::size_t prepared_decode_initializers = 0;
+    std::unique_ptr<miniort::ExecutionContext> prefill_prepare_context;
+    if (options.prepare_cuda_initializers) {
+      prefill_prepare_context = std::make_unique<miniort::ExecutionContext>();
+      const auto prepare_start = Clock::now();
+      prepared_prefill_initializers = prefill_session.PrepareCudaInitializers(*prefill_prepare_context);
+      prepare_cuda_initializers_ms = ElapsedMs(prepare_start, Clock::now());
+    }
+
     std::vector<double> prefill_runs;
     std::vector<double> decode_step_runs;
     std::vector<double> total_runs;
@@ -273,9 +302,13 @@ int main(int argc, char* argv[]) {
       }
     }
 
-    std::cout << "miniort_gpt2_kv_benchmark\n";
+    std::cout << kBenchmarkName << "\n";
     std::cout << "graph_opt=" << (options.graph_opt ? "enabled" : "disabled") << "\n";
     std::cout << "shared_context=" << (options.shared_context ? "enabled" : "disabled") << "\n";
+    std::cout << "prepare_cuda_initializers=" << (options.prepare_cuda_initializers ? "enabled" : "disabled") << "\n";
+    std::cout << "prepared_prefill_initializers=" << prepared_prefill_initializers << "\n";
+    std::cout << "prepared_decode_initializers=" << prepared_decode_initializers << "\n";
+    std::cout << "prepare_cuda_initializers_ms=" << prepare_cuda_initializers_ms << "\n";
     std::cout << "warmup=" << options.warmup << "\n";
     std::cout << "repeat=" << options.repeat << "\n";
     std::cout << "prompt_tokens=" << prompt_tokens.size() << "\n";

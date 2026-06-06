@@ -5,6 +5,7 @@
 namespace miniort {
 
 class ExecutionContext;
+struct Graph;
 struct Node;
 
 class CudaExecutionProvider final : public ExecutionProvider {
@@ -17,5 +18,6 @@ class CudaExecutionProvider final : public ExecutionProvider {
 bool IsCudaExecutionProviderAvailable();
 void MaterializeCudaInputsForNode(const Node& node, ExecutionContext& context);
 void MaterializeCudaTensor(const std::string& name, ExecutionContext& context);
+std::size_t PrepareCudaInitializersForGraph(const Graph& graph, ExecutionContext& context);
 
 }  // namespace miniort

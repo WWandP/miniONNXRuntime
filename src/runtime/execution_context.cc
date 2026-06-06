@@ -100,6 +100,10 @@ const std::unordered_map<std::string, Tensor>& ExecutionContext::tensors() const
   return tensors_;
 }
 
+const Graph* ExecutionContext::CurrentGraph() const {
+  return graph_;
+}
+
 void ExecutionContext::LoadInitializers(const Graph& graph) {
   if (graph_ != nullptr && graph_ != &graph) {
     for (auto it = tensors_.begin(); it != tensors_.end();) {

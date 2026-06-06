@@ -48,6 +48,7 @@ models/gpt2/*
 docs/
 !docs/
 docs/*
+!docs/optimization_summary.md
 !docs/phases/
 !docs/phases/*.md
 models/gpt2/model.kv_prefill.onnx

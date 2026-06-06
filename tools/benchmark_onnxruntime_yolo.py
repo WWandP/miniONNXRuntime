@@ -6,6 +6,9 @@ import numpy as np
 import onnxruntime as ort
 from PIL import Image
 
+if hasattr(ort, "preload_dlls"):
+    ort.preload_dlls(directory="")
+
 
 def percentile(values, pct):
     if not values:

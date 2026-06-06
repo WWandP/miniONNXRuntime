@@ -660,6 +660,11 @@ void RegisterShapeKernels(KernelRegistry& registry) {
 
     const auto emit_slice = [&](auto& output_data, const auto& input_data) {
       output_data.resize(GetElementCount(output_shape));
+      if (data.shape.size() == 1 && slice_steps.size() == 1 && slice_steps[0] == 1) {
+        const auto start = static_cast<std::size_t>(slice_starts[0]);
+        std::copy_n(input_data.begin() + static_cast<std::ptrdiff_t>(start), output_data.size(), output_data.begin());
+        return;
+      }
       for (std::size_t i = 0; i < output_data.size(); ++i) {
         const auto output_index = UnravelIndex(i, output_shape, output_strides);
         auto input_index = output_index;

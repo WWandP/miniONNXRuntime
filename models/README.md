@@ -1,61 +1,128 @@
 # Model Assets
 
-这个目录放的是本地模型资产，但不是所有文件都会进 git。
+This directory is the local model cache. Large model files are intentionally not
+committed to git.
 
-当前约定：
-
-- YOLO 演示模型：
-  - `models/yolov8n.onnx`
-- GPT-2 文本模型目录：
-  - `models/gpt2/`
-
-`models/gpt2/` 里的大文件不会提交到仓库，默认由本地脚本下载和生成。
-
-## GPT-2 目录内容
-
-跑当前 GPT 文本链路时，通常需要这些文件：
-
-- `config.json`
-- `generation_config.json`
-- `model.safetensors`
-- `tokenizer.json`
-- `tokenizer_config.json`
-- `vocab.json`
-- `merges.txt`
-- `model.onnx`
-- `model.sim.onnx`
-
-其中：
-
-- 前 7 个来自 Hugging Face 的 `openai-community/gpt2`
-- `model.onnx` 和 `model.sim.onnx` 是本地导出产物
-
-## 获取方式
-
-推荐直接使用：
+Use this command first when setting up a new checkout:
 
 ```bash
-./scripts/fetch_gpt2.sh
+./scripts/download_models.sh status
 ```
 
-这个脚本会：
+It prints the exact files expected by the default phase scripts.
 
-1. 下载 GPT-2 原始权重和 tokenizer 文件到 `models/gpt2/`
-2. 如果当前 Python 环境已经安装 `torch`、`transformers`、`onnx`
-   - 自动导出 `models/gpt2/model.onnx`
-3. 如果额外安装了 `onnxsim`
-   - 继续生成 `models/gpt2/model.sim.onnx`
-
-如果只下载成功但没有导出成功，脚本会给出缺失依赖提示。
-
-## 当前文本链路
-
-准备好 `models/gpt2/` 后，可以直接跑：
+## Unified Download Entry
 
 ```bash
-/Volumes/ww/miniconda3/envs/norm/bin/python tools/run_gpt_text.py \
-  --prompt "The meaning of life is" \
-  --max-new-tokens 1 \
-  --cpu-only \
-  --strict
+./scripts/download_models.sh yolo
+./scripts/download_models.sh gpt2
+./scripts/download_models.sh qwen
+./scripts/download_models.sh all
+```
+
+`all` tries the three tracks in order. Text-model files are large, so it is also
+reasonable to prepare only the model track you need.
+
+## YOLOv8n
+
+Required file:
+
+```text
+models/yolov8n.onnx
+```
+
+Default command:
+
+```bash
+./scripts/download_models.sh yolo
+```
+
+## GPT-2 KV Cache
+
+Required files for `phase6-kv`:
+
+```text
+models/gpt2/model.kv_prefill.onnx
+models/gpt2/model.kv_decode.onnx
+models/gpt2/vocab.json
+models/gpt2/merges.txt
+```
+
+Default command:
+
+```bash
+./scripts/download_models.sh gpt2
+```
+
+By default this uses the repository's shared Google Drive archive of exported KV
+assets and requires `gdown`:
+
+```bash
+python -m pip install gdown
+./scripts/download_models.sh gpt2
+```
+
+If you want to regenerate from Hugging Face locally instead:
+
+```bash
+GPT2_SOURCE=hf-export EXPORT_KV_CACHE=1 ./scripts/download_models.sh gpt2
+```
+
+The local export path requires a Python environment with:
+
+```text
+torch
+transformers
+onnx
+```
+
+`onnxsim` is optional and only produces `model.sim.onnx`.
+
+## Qwen2.5-0.5B KV Cache
+
+Required files for `phase7`:
+
+```text
+models/qwen2_5_0_5b_instruct/model.kv_prefill.onnx
+models/qwen2_5_0_5b_instruct/model.kv_decode.onnx
+models/qwen2_5_0_5b_instruct/vocab.json
+models/qwen2_5_0_5b_instruct/merges.txt
+```
+
+Recommended optional tokenizer/config files:
+
+```text
+models/qwen2_5_0_5b_instruct/tokenizer.json
+models/qwen2_5_0_5b_instruct/tokenizer_config.json
+models/qwen2_5_0_5b_instruct/config.json
+models/qwen2_5_0_5b_instruct/generation_config.json
+```
+
+Default command:
+
+```bash
+./scripts/download_models.sh qwen
+```
+
+The Qwen ONNX files are large. The script supports the current shared Google
+Drive folder when `gdown` is installed:
+
+```bash
+python -m pip install gdown
+./scripts/download_models.sh qwen
+```
+
+You can also download or export the files yourself and place them in
+`models/qwen2_5_0_5b_instruct/`. To export KV ONNX files from a local Qwen
+checkpoint:
+
+```bash
+python scripts/export_qwen_kv_onnx.py \
+  --model-dir models/qwen2_5_0_5b_instruct
+```
+
+Then verify:
+
+```bash
+./scripts/download_models.sh status
 ```

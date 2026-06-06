@@ -59,16 +59,24 @@ brew install cmake protobuf git
 由于模型文件较大，无法直接上传到 GitHub。请先运行：
 
 ```bash
-./scripts/download_models.sh
+# 查看本地还缺哪些模型文件
+./scripts/download_models.sh status
+
+# 按需下载，也可以用 all 一次准备默认资产
+./scripts/download_models.sh yolo
+./scripts/download_models.sh gpt2
+./scripts/download_models.sh qwen
 ```
 
-这会下载：
+统一入口支持：
 
-- GPT-2 模型到 `models/gpt2/`
-- 其他附加模型到 `models/`
-- Qwen 相关模型到本地 `models/`（脚本会按提示使用 `gdown` 拉取）
+- YOLOv8n：下载 `models/yolov8n.onnx`
+- GPT-2 KV：准备 `models/gpt2/` 下的 prefill/decode ONNX 和 tokenizer 文件
+- Qwen2.5-0.5B KV：准备 `models/qwen2_5_0_5b_instruct/` 下的 prefill/decode ONNX 和 tokenizer 文件
 
-下载完成后即可运行相关 phase。
+Qwen ONNX 文件较大，脚本会优先使用 `gdown` 拉取当前共享文件夹；也可以手动下载或用
+`scripts/export_qwen_kv_onnx.py` 从本地 checkpoint 导出。详细文件约定见 [models/README.md](./models/README.md)。
+如果使用默认的 Google Drive 归档下载 GPT-2/Qwen，请先安装 `gdown`：`python -m pip install gdown`。
 
 ## 快速开始
 
@@ -118,6 +126,29 @@ cmake --build build_local -j4
 
 说明：`all` 当前覆盖默认主线 `phase1 -> phase5`。文本模型阶段（`phase6` / `phase6-kv` / `phase7`）需要先下载模型。
 
+如果要在 CUDA 设备上运行 phase，会使用当前 CUDA ExecutionProvider 路径，包括 2026-06-06 这组 CUDA 相关优化。示例：
+
+```bash
+MINIORT_BUILD_CUDA_EP=ON CMAKE_BUILD_TYPE=Release BUILD_DIR=build_cuda_release \
+  ./scripts/run_phase.sh phase7
+```
+
+默认不设置 `MINIORT_BUILD_CUDA_EP=ON` 时，`run_phase.sh` 使用普通 CPU/default 构建。
+
+## 2026-06-06 CUDA 相关优化
+
+这里整理了 2026-06-06 前后完成的一组 CUDA 路径优化，覆盖 YOLOv8n、GPT-2 KV-cache 和 Qwen2.5-0.5B KV-cache。下面数字来自同机本地实验，测试设备为 NVIDIA GeForce RTX 4090；ORT CPU 参考使用 ONNX Runtime 1.24.4 `CPUExecutionProvider`，ORT CUDA 参考使用 ONNX Runtime 1.23.2 `CUDAExecutionProvider`。
+
+| 模型 / 路径 | 优化重点 | MiniORT CUDA | ORT CUDA 参考 | ORT CPU 参考 |
+| --- | --- | --- | --- | --- |
+| YOLOv8n mixed CUDA | device residency、CUDA buffer pool、CUDA im2col、Concat/Split/Resize 覆盖、dead tensor eviction、planned memory reuse | `repeat=50` mean `4.96 ms`，p50 `4.99 ms` | mean `1.86 ms`，p50 `1.86 ms` | mean `12.87 ms`，p50 `12.84 ms` |
+| GPT-2 KV CUDA | KV-cache 双图、CUDA hot-path 覆盖、greedy argmax、warmed benchmark、`--graph-opt` | `generate=96` 约 `227.40 tokens/s`（generation mean `422.16 ms`，prefill mean `11.13 ms`） | 约 `438.65 tokens/s`（generation mean `218.85 ms`，prefill mean `1.80 ms`） | 约 `83.46 tokens/s`（generation mean `1150.24 ms`，prefill mean `16.54 ms`） |
+| Qwen2.5-0.5B KV CUDA | eager CUDA initializer prepare、CUDA/cuBLAS warmup、RMSNorm primitive coverage、graph-scoped Constant reuse、tail-dimension CUDA broadcast | `generate=8` 约 `61.65 tokens/s`（generation mean `129.77 ms`，prefill mean `15.16 ms`） | 约 `171.36 tokens/s`（generation mean `46.68 ms`，prefill mean `4.75 ms`） | 约 `15.45 tokens/s`（generation mean `517.85 ms`，prefill mean `52.98 ms`） |
+
+优化记录：
+
+- [2026-06-06 CUDA 相关优化](./docs/optimization_summary.md)
+
 ## 学习路径
 
 | Phase | 看什么 | 对应命令 | 说明文档 |
@@ -127,9 +158,9 @@ cmake --build build_local -j4
 | `phase3` | 完整 CPU 推理 | `./scripts/run_phase.sh phase3` | [phase3](./docs/phases/phase3.md) / [EN](./docs/phases/phase3.en.md) |
 | `phase4` | 图优化与内存观察 | `./scripts/run_phase.sh phase4-opt` / `phase4-memory` | [phase4](./docs/phases/phase4.md) / [EN](./docs/phases/phase4.en.md) |
 | `phase5` | `ExecutionProvider` 抽象与 provider 对比 | `./scripts/run_phase.sh phase5` | [phase5](./docs/phases/phase5.md) / [EN](./docs/phases/phase5.en.md) |
-| `phase6` | GPT-2 macOS provider baseline | `./scripts/run_phase.sh phase6` | [phase6](./docs/phases/phase6.md) / [EN](./docs/phases/phase6.en.md) |
-| `phase6-kv` | GPT-2 KV cache + macOS provider | `./scripts/run_phase.sh phase6-kv` | [phase6](./docs/phases/phase6.md) / [EN](./docs/phases/phase6.en.md) |
-| `phase7` | Qwen KV cache 推理（默认） | `./scripts/run_phase.sh phase7` | [phase7](./docs/phases/phase7.md) / [EN](./docs/phases/phase7.en.md) |
+| `phase6` | GPT-2 baseline 文本生成 | `./scripts/run_phase.sh phase6` | [phase6](./docs/phases/phase6.md) / [EN](./docs/phases/phase6.en.md) |
+| `phase6-kv` | GPT-2 KV cache 推理 | `./scripts/run_phase.sh phase6-kv` | [phase6](./docs/phases/phase6.md) / [EN](./docs/phases/phase6.en.md) |
+| `phase7` | Qwen KV cache 推理 | `./scripts/run_phase.sh phase7` | [phase7](./docs/phases/phase7.md) / [EN](./docs/phases/phase7.en.md) |
 
 ## 主要入口
 
@@ -148,14 +179,15 @@ cmake --build build_local -j4
 
 ## 文本模型入口（GPT / Qwen）
 
-运行前先执行 `./scripts/download_models.sh`。
+运行前先用 `./scripts/download_models.sh status` 检查本地模型文件；缺哪条线就下载哪条线。
 
 - GPT-2：`./scripts/run_phase.sh phase6` / `./scripts/run_phase.sh phase6-kv`
 - Qwen（默认 KV cache）：`./scripts/run_phase.sh phase7`
 
 Qwen 进一步说明可看：
 
-- `docs/phase7_qwen_inference_bringup.md`
+- `docs/phases/phase7.md`
+- `docs/optimization_summary.md`
 - `examples/qwen2_5_0_5b/kv_generate.cfg`
 
 运行示例：

@@ -83,6 +83,7 @@ class Session {
   const SessionAssignmentSummary& assignment_summary() const;
   const std::vector<ProviderSegment>& provider_segments() const;
 
+  std::size_t PrepareCudaInitializers(ExecutionContext& context, std::ostream* trace = nullptr) const;
   RunSummary Run(const std::unordered_map<std::string, Tensor>& feeds, ExecutionContext& context,
                  std::ostream* trace = nullptr) const;
 

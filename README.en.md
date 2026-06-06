@@ -59,16 +59,25 @@ brew install cmake protobuf git
 Since model files are large, they are not committed to GitHub. Run:
 
 ```bash
-./scripts/download_models.sh
+# check which local files are still missing
+./scripts/download_models.sh status
+
+# prepare only the assets you need, or run all
+./scripts/download_models.sh yolo
+./scripts/download_models.sh gpt2
+./scripts/download_models.sh qwen
 ```
 
-This downloads:
+The unified entry supports:
 
-- GPT-2 models to `models/gpt2/`
-- additional model assets to `models/`
-- Qwen assets into local `models/` (the script uses `gdown` when available)
+- YOLOv8n: downloads `models/yolov8n.onnx`
+- GPT-2 KV: prepares prefill/decode ONNX and tokenizer files under `models/gpt2/`
+- Qwen2.5-0.5B KV: prepares prefill/decode ONNX and tokenizer files under `models/qwen2_5_0_5b_instruct/`
 
-After download completes, you can run the related phases.
+Qwen ONNX files are large. The script uses `gdown` for the current shared folder when available; you can also place
+the files manually or export them from a local checkpoint with `scripts/export_qwen_kv_onnx.py`. See
+[models/README.md](./models/README.md) for the exact file contract.
+If you use the default Google Drive archives for GPT-2/Qwen, install `gdown` first: `python -m pip install gdown`.
 
 ## Quick Start
 
@@ -118,6 +127,33 @@ If you want to go through the whole teaching flow in order:
 
 Note: `all` currently covers the default flow `phase1 -> phase5`. Text-model phases (`phase6` / `phase6-kv` / `phase7`) require model download first.
 
+To run a phase on a CUDA device, enable the CUDA ExecutionProvider build. This uses the current CUDA path, including
+the CUDA optimizations described below:
+
+```bash
+MINIORT_BUILD_CUDA_EP=ON CMAKE_BUILD_TYPE=Release BUILD_DIR=build_cuda_release \
+  ./scripts/run_phase.sh phase7
+```
+
+Without `MINIORT_BUILD_CUDA_EP=ON`, `run_phase.sh` uses the normal CPU/default build.
+
+## 2026-06-06 CUDA 相关优化
+
+This section summarizes the CUDA-path optimizations completed around 2026-06-06, covering YOLOv8n, GPT-2 KV-cache,
+and Qwen2.5-0.5B KV-cache. These numbers were measured locally on an NVIDIA GeForce RTX 4090. The ORT CPU reference
+uses ONNX Runtime 1.24.4 with `CPUExecutionProvider`; the ORT CUDA reference uses ONNX Runtime 1.23.2 with
+`CUDAExecutionProvider`.
+
+| Model / path | Main optimizations | MiniORT CUDA | ORT CUDA reference | ORT CPU reference |
+| --- | --- | --- | --- | --- |
+| YOLOv8n mixed CUDA | device residency, CUDA buffer pool, CUDA im2col, Concat/Split/Resize coverage, dead tensor eviction, planned memory reuse | `repeat=50` mean `4.96 ms`, p50 `4.99 ms` | mean `1.86 ms`, p50 `1.86 ms` | mean `12.87 ms`, p50 `12.84 ms` |
+| GPT-2 KV CUDA | dual KV-cache graphs, CUDA hot-path coverage, greedy argmax, warmed benchmark, `--graph-opt` | `generate=96` about `227.40 tokens/s` (generation mean `422.16 ms`, prefill mean `11.13 ms`) | about `438.65 tokens/s` (generation mean `218.85 ms`, prefill mean `1.80 ms`) | about `83.46 tokens/s` (generation mean `1150.24 ms`, prefill mean `16.54 ms`) |
+| Qwen2.5-0.5B KV CUDA | eager CUDA initializer prepare, CUDA/cuBLAS warmup, RMSNorm primitive coverage, graph-scoped Constant reuse, tail-dimension CUDA broadcast | `generate=8` about `61.65 tokens/s` (generation mean `129.77 ms`, prefill mean `15.16 ms`) | about `171.36 tokens/s` (generation mean `46.68 ms`, prefill mean `4.75 ms`) | about `15.45 tokens/s` (generation mean `517.85 ms`, prefill mean `52.98 ms`) |
+
+Optimization record:
+
+- [2026-06-06 CUDA 相关优化](./docs/optimization_summary.md)
+
 ## Learning Path
 
 | Phase | Focus | Command | Read more |
@@ -127,9 +163,9 @@ Note: `all` currently covers the default flow `phase1 -> phase5`. Text-model pha
 | `phase3` | end-to-end CPU inference | `./scripts/run_phase.sh phase3` | [ZH](./docs/phases/phase3.md) / [EN](./docs/phases/phase3.en.md) |
 | `phase4` | graph optimization and memory tracing | `./scripts/run_phase.sh phase4-opt` / `phase4-memory` | [ZH](./docs/phases/phase4.md) / [EN](./docs/phases/phase4.en.md) |
 | `phase5` | `ExecutionProvider` abstraction and provider comparison | `./scripts/run_phase.sh phase5` | [ZH](./docs/phases/phase5.md) / [EN](./docs/phases/phase5.en.md) |
-| `phase6` | GPT-2 macOS provider baseline | `./scripts/run_phase.sh phase6` | [ZH](./docs/phases/phase6.md) / [EN](./docs/phases/phase6.en.md) |
-| `phase6-kv` | GPT-2 KV cache + macOS provider | `./scripts/run_phase.sh phase6-kv` | [ZH](./docs/phases/phase6.md) / [EN](./docs/phases/phase6.en.md) |
-| `phase7` | Qwen KV-cache inference (default) | `./scripts/run_phase.sh phase7` | [ZH](./docs/phases/phase7.md) / [EN](./docs/phases/phase7.en.md) |
+| `phase6` | GPT-2 baseline text generation | `./scripts/run_phase.sh phase6` | [ZH](./docs/phases/phase6.md) / [EN](./docs/phases/phase6.en.md) |
+| `phase6-kv` | GPT-2 KV-cache inference | `./scripts/run_phase.sh phase6-kv` | [ZH](./docs/phases/phase6.md) / [EN](./docs/phases/phase6.en.md) |
+| `phase7` | Qwen KV-cache inference | `./scripts/run_phase.sh phase7` | [ZH](./docs/phases/phase7.md) / [EN](./docs/phases/phase7.en.md) |
 
 ## Main Entry Points
 
@@ -148,14 +184,15 @@ Note: `all` currently covers the default flow `phase1 -> phase5`. Text-model pha
 
 ## Text Model Entry (GPT / Qwen)
 
-Run `./scripts/download_models.sh` first.
+Run `./scripts/download_models.sh status` first, then prepare only the missing model track.
 
 - GPT-2: `./scripts/run_phase.sh phase6` / `./scripts/run_phase.sh phase6-kv`
 - Qwen (default KV cache): `./scripts/run_phase.sh phase7`
 
 For more Qwen details:
 
-- `docs/phase7_qwen_inference_bringup.md`
+- `docs/phases/phase7.en.md`
+- `docs/optimization_summary.md`
 - `examples/qwen2_5_0_5b/kv_generate.cfg`
 
 Run examples:

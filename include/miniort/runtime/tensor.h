@@ -19,8 +19,10 @@ struct Tensor {
   const std::vector<std::int64_t>* external_int64_data{nullptr};
   std::shared_ptr<void> cuda_data;
   std::size_t cuda_bytes{0};
+  const void* producer_graph{nullptr};
   bool is_placeholder{false};
   bool is_initializer{false};
+  bool is_constant{false};
 };
 
 Tensor MakePlaceholderTensor(std::string name, const TensorInfo& info);

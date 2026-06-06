@@ -24,6 +24,7 @@ class ExecutionContext {
   const Tensor* FindTensor(const std::string& name) const;
   Tensor* FindTensor(const std::string& name);
   const std::unordered_map<std::string, Tensor>& tensors() const;
+  const Graph* CurrentGraph() const;
   void LoadInitializers(const Graph& graph);
   void Dump(std::ostream& os, std::size_t limit = 16) const;
   void SetAllocator(std::shared_ptr<TensorAllocator> allocator);

@@ -244,6 +244,13 @@ if(MINIORT_BUILD_RUNTIME_TOOLS)
 
   target_link_libraries(miniort_benchmark_gpt2_kv PRIVATE miniort_runtime)
 
+  add_executable(miniort_benchmark_qwen_kv
+    tools/benchmark_gpt2_kv.cc
+  )
+
+  target_compile_definitions(miniort_benchmark_qwen_kv PRIVATE MINIORT_BENCHMARK_QWEN_KV=1)
+  target_link_libraries(miniort_benchmark_qwen_kv PRIVATE miniort_runtime)
+
   add_executable(miniort_memory_trace
     tools/memory_trace.cc
   )

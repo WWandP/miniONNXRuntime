@@ -21,6 +21,16 @@ KV cache:
 ./scripts/run_phase.sh phase6-kv
 ```
 
+CUDA build:
+
+```bash
+MINIORT_BUILD_CUDA_EP=ON CMAKE_BUILD_TYPE=Release BUILD_DIR=build_cuda_release \
+  ./scripts/run_phase.sh phase6-kv
+```
+
+With CUDA EP enabled, this uses the current CUDA provider path. The default
+`build_local` path is the normal CPU/default build.
+
 ## Key Output
 
 - `last_token_topk`

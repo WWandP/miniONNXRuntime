@@ -564,6 +564,15 @@ int main(int argc, char* argv[]) {
       cache_binding = BuildCacheBinding(prefill_session->graph(), decode_graph);
       decode_session = make_session(std::move(decode_graph));
     }
+
+    std::unique_ptr<miniort::ExecutionContext> prefill_prepare_context;
+    if (options.kv_cache) {
+      prefill_prepare_context = std::make_unique<miniort::ExecutionContext>();
+      const auto prefill_prepared = prefill_session->PrepareCudaInitializers(*prefill_prepare_context);
+      if (!options.quiet && prefill_prepared != 0) {
+        std::cout << "  prepared_cuda_initializers prefill=" << prefill_prepared << "\n";
+      }
+    }
     const auto load_end = Clock::now();
 
     miniort::RunSummary summary;

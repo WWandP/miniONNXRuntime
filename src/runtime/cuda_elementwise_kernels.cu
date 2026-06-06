@@ -45,6 +45,26 @@ __global__ void BinaryScalarRightKernel(const float* lhs, float rhs_scalar, floa
   output[index] = fn(lhs[index], rhs_scalar);
 }
 
+template <typename Fn>
+__global__ void BinaryVectorLeftKernel(const float* lhs_vector, const float* rhs, float* output, std::size_t count,
+                                       std::size_t vector_size, Fn fn) {
+  const auto index = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (index >= count) {
+    return;
+  }
+  output[index] = fn(lhs_vector[index % vector_size], rhs[index]);
+}
+
+template <typename Fn>
+__global__ void BinaryVectorRightKernel(const float* lhs, const float* rhs_vector, float* output, std::size_t count,
+                                        std::size_t vector_size, Fn fn) {
+  const auto index = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (index >= count) {
+    return;
+  }
+  output[index] = fn(lhs[index], rhs_vector[index % vector_size]);
+}
+
 __global__ void MaxPool2DKernel(const float* input, float* output, std::size_t n, std::size_t c, std::size_t h_in,
                                 std::size_t w_in, std::size_t h_out, std::size_t w_out, std::size_t k_h,
                                 std::size_t k_w, std::int64_t stride_h, std::int64_t stride_w,
@@ -301,6 +321,31 @@ __global__ void LayerNormalizationKernel(const float* input, const float* scale,
   }
 }
 
+__global__ void ReduceMeanLastDimKernel(const float* input, float* output, std::size_t cols) {
+  extern __shared__ float scratch[];
+  const auto row = static_cast<std::size_t>(blockIdx.x);
+  const auto tid = static_cast<std::size_t>(threadIdx.x);
+  const auto row_base = row * cols;
+
+  float partial = 0.0f;
+  for (std::size_t i = tid; i < cols; i += blockDim.x) {
+    partial += input[row_base + i];
+  }
+  scratch[tid] = partial;
+  __syncthreads();
+
+  for (std::size_t stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+    if (tid < stride) {
+      scratch[tid] += scratch[tid + stride];
+    }
+    __syncthreads();
+  }
+
+  if (tid == 0) {
+    output[row] = scratch[0] / static_cast<float>(cols);
+  }
+}
+
 struct SigmoidFn {
   __device__ float operator()(float value) const {
     return 1.0f / (1.0f + expf(-value));
@@ -316,6 +361,18 @@ struct SiLUFn {
 struct TanhFn {
   __device__ float operator()(float value) const {
     return tanhf(value);
+  }
+};
+
+struct SqrtFn {
+  __device__ float operator()(float value) const {
+    return sqrtf(value);
+  }
+};
+
+struct SquareFn {
+  __device__ float operator()(float value) const {
+    return value * value;
   }
 };
 
@@ -383,6 +440,26 @@ cudaError_t LaunchBinaryScalarRight(const float* lhs, float rhs_scalar, float* o
   return cudaGetLastError();
 }
 
+template <typename Fn>
+cudaError_t LaunchBinaryVectorLeft(const float* lhs_vector, const float* rhs, float* output, std::size_t count,
+                                   std::size_t vector_size, Fn fn) {
+  if (count == 0) {
+    return cudaSuccess;
+  }
+  BinaryVectorLeftKernel<<<BlockCount(count), kThreadsPerBlock>>>(lhs_vector, rhs, output, count, vector_size, fn);
+  return cudaGetLastError();
+}
+
+template <typename Fn>
+cudaError_t LaunchBinaryVectorRight(const float* lhs, const float* rhs_vector, float* output, std::size_t count,
+                                    std::size_t vector_size, Fn fn) {
+  if (count == 0) {
+    return cudaSuccess;
+  }
+  BinaryVectorRightKernel<<<BlockCount(count), kThreadsPerBlock>>>(lhs, rhs_vector, output, count, vector_size, fn);
+  return cudaGetLastError();
+}
+
 }  // namespace
 
 cudaError_t LaunchCudaSigmoid(const float* input, float* output, std::size_t count) {
@@ -395,6 +472,14 @@ cudaError_t LaunchCudaSiLU(const float* input, float* output, std::size_t count)
 
 cudaError_t LaunchCudaTanh(const float* input, float* output, std::size_t count) {
   return LaunchUnary(input, output, count, TanhFn{});
+}
+
+cudaError_t LaunchCudaSqrt(const float* input, float* output, std::size_t count) {
+  return LaunchUnary(input, output, count, SqrtFn{});
+}
+
+cudaError_t LaunchCudaSquare(const float* input, float* output, std::size_t count) {
+  return LaunchUnary(input, output, count, SquareFn{});
 }
 
 cudaError_t LaunchCudaBinaryFloat(CudaBinaryFloatOp op, const float* lhs, const float* rhs, float* output,
@@ -438,6 +523,36 @@ cudaError_t LaunchCudaBinaryFloatScalarRight(CudaBinaryFloatOp op, const float* 
       return LaunchBinaryScalarRight(lhs, rhs_scalar, output, count, MulFn{});
     case CudaBinaryFloatOp::kDiv:
       return LaunchBinaryScalarRight(lhs, rhs_scalar, output, count, DivFn{});
+  }
+  return cudaErrorInvalidValue;
+}
+
+cudaError_t LaunchCudaBinaryFloatVectorLeft(CudaBinaryFloatOp op, const float* lhs_vector, const float* rhs,
+                                            float* output, std::size_t count, std::size_t vector_size) {
+  switch (op) {
+    case CudaBinaryFloatOp::kAdd:
+      return LaunchBinaryVectorLeft(lhs_vector, rhs, output, count, vector_size, AddFn{});
+    case CudaBinaryFloatOp::kSub:
+      return LaunchBinaryVectorLeft(lhs_vector, rhs, output, count, vector_size, SubFn{});
+    case CudaBinaryFloatOp::kMul:
+      return LaunchBinaryVectorLeft(lhs_vector, rhs, output, count, vector_size, MulFn{});
+    case CudaBinaryFloatOp::kDiv:
+      return LaunchBinaryVectorLeft(lhs_vector, rhs, output, count, vector_size, DivFn{});
+  }
+  return cudaErrorInvalidValue;
+}
+
+cudaError_t LaunchCudaBinaryFloatVectorRight(CudaBinaryFloatOp op, const float* lhs, const float* rhs_vector,
+                                             float* output, std::size_t count, std::size_t vector_size) {
+  switch (op) {
+    case CudaBinaryFloatOp::kAdd:
+      return LaunchBinaryVectorRight(lhs, rhs_vector, output, count, vector_size, AddFn{});
+    case CudaBinaryFloatOp::kSub:
+      return LaunchBinaryVectorRight(lhs, rhs_vector, output, count, vector_size, SubFn{});
+    case CudaBinaryFloatOp::kMul:
+      return LaunchBinaryVectorRight(lhs, rhs_vector, output, count, vector_size, MulFn{});
+    case CudaBinaryFloatOp::kDiv:
+      return LaunchBinaryVectorRight(lhs, rhs_vector, output, count, vector_size, DivFn{});
   }
   return cudaErrorInvalidValue;
 }
@@ -548,6 +663,15 @@ cudaError_t LaunchCudaLayerNormalization(const float* input, const float* scale,
   constexpr int threads = 256;
   LayerNormalizationKernel<<<static_cast<unsigned int>(rows), threads, threads * sizeof(float)>>>(
       input, scale, bias, output, normalized_size, epsilon);
+  return cudaGetLastError();
+}
+
+cudaError_t LaunchCudaReduceMeanLastDim(const float* input, float* output, std::size_t rows, std::size_t cols) {
+  if (rows == 0 || cols == 0) {
+    return cudaSuccess;
+  }
+  constexpr int threads = 256;
+  ReduceMeanLastDimKernel<<<static_cast<unsigned int>(rows), threads, threads * sizeof(float)>>>(input, output, cols);
   return cudaGetLastError();
 }
 

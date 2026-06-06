@@ -55,6 +55,8 @@ environment overrides:
   QWEN_PROMPT=你好
   QWEN_GENERATE=8
   CMAKE_BIN=/path/to/cmake
+  MINIORT_BUILD_CUDA_EP=ON
+  CMAKE_BUILD_TYPE=Release
 EOF
 }
 
@@ -71,7 +73,21 @@ require_file() {
 
 configure_build() {
   log "configuring build directory: $BUILD_DIR"
-  "$CMAKE_BIN" -S "$ROOT_DIR" -B "$BUILD_DIR" -DMINIORT_BUILD_OPTIMIZER_TOOLS=ON
+  local cmake_args=(
+    -S "$ROOT_DIR"
+    -B "$BUILD_DIR"
+    -DMINIORT_BUILD_OPTIMIZER_TOOLS=ON
+  )
+  if [[ -n "${MINIORT_BUILD_CUDA_EP:-}" ]]; then
+    cmake_args+=("-DMINIORT_BUILD_CUDA_EP=$MINIORT_BUILD_CUDA_EP")
+  fi
+  if [[ -n "${MINIORT_BUILD_CUDNN:-}" ]]; then
+    cmake_args+=("-DMINIORT_BUILD_CUDNN=$MINIORT_BUILD_CUDNN")
+  fi
+  if [[ -n "${CMAKE_BUILD_TYPE:-}" ]]; then
+    cmake_args+=("-DCMAKE_BUILD_TYPE=$CMAKE_BUILD_TYPE")
+  fi
+  "$CMAKE_BIN" "${cmake_args[@]}"
 }
 
 build_all() {

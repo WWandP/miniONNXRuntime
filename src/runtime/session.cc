@@ -276,6 +276,24 @@ const std::vector<ProviderSegment>& Session::provider_segments() const {
   return provider_segments_;
 }
 
+std::size_t Session::PrepareCudaInitializers(ExecutionContext& context, std::ostream* trace) const {
+#if defined(MINIORT_BUILD_CUDA_EP)
+  context.LoadInitializers(graph_);
+  if (!context.HasAllocator()) {
+    context.SetAllocator(MakeDefaultAllocator());
+  }
+  const auto prepared_count = PrepareCudaInitializersForGraph(graph_, context);
+  if (trace != nullptr) {
+    *trace << "prepared_cuda_initializers=" << prepared_count << "\n";
+  }
+  return prepared_count;
+#else
+  (void)context;
+  (void)trace;
+  return 0;
+#endif
+}
+
 void Session::AssignExecutionProviders() {
   struct ProviderCapability {
     std::string provider;
