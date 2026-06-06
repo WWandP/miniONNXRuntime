@@ -15,6 +15,8 @@ struct Tensor {
   std::vector<std::int64_t> shape;
   std::vector<float> float_data;
   std::vector<std::int64_t> int64_data;
+  const std::vector<float>* external_float_data{nullptr};
+  const std::vector<std::int64_t>* external_int64_data{nullptr};
   std::shared_ptr<void> cuda_data;
   std::size_t cuda_bytes{0};
   bool is_placeholder{false};

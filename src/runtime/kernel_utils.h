@@ -197,7 +197,13 @@ inline const std::vector<float>& RequireFloatData(const Tensor& tensor, const st
   if (tensor.dtype != "float32") {
     throw std::runtime_error(op_type + " requires float32 tensor data: " + tensor.name);
   }
-  if (tensor.float_data.empty() && GetElementCount(tensor.shape) != 0) {
+  if (!tensor.float_data.empty()) {
+    return tensor.float_data;
+  }
+  if (tensor.external_float_data != nullptr && !tensor.external_float_data->empty()) {
+    return *tensor.external_float_data;
+  }
+  if (GetElementCount(tensor.shape) != 0) {
     throw std::runtime_error(op_type + " requires float32 tensor data: " + tensor.name);
   }
   return tensor.float_data;
@@ -207,7 +213,13 @@ inline const std::vector<std::int64_t>& RequireInt64Data(const Tensor& tensor, c
   if (tensor.dtype != "int64") {
     throw std::runtime_error(op_type + " requires int64 tensor data: " + tensor.name);
   }
-  if (tensor.int64_data.empty() && GetElementCount(tensor.shape) != 0) {
+  if (!tensor.int64_data.empty()) {
+    return tensor.int64_data;
+  }
+  if (tensor.external_int64_data != nullptr && !tensor.external_int64_data->empty()) {
+    return *tensor.external_int64_data;
+  }
+  if (GetElementCount(tensor.shape) != 0) {
     throw std::runtime_error(op_type + " requires int64 tensor data: " + tensor.name);
   }
   return tensor.int64_data;

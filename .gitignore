@@ -27,6 +27,7 @@ cmake_install.cmake
 Makefile
 outputs/
 resume/
+profiles/
 models/gpt2/
 models/tiny-gpt2/
 !models/gpt2/

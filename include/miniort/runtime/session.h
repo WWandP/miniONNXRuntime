@@ -27,7 +27,9 @@ struct SessionOptions {
   bool allow_unassigned_nodes{true};
   bool auto_bind_placeholder_inputs{true};
   bool evict_dead_tensors{false};
+  bool evict_dead_cuda_tensors_only{false};
   bool planned_memory_reuse{false};
+  bool materialize_cuda_graph_outputs{true};
   std::size_t start_node{0};
   std::size_t max_nodes{0};
   ProviderAssignmentPolicy provider_assignment_policy{ProviderAssignmentPolicy::kFirstMatch};

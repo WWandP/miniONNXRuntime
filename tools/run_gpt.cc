@@ -1,9 +1,11 @@
 #include <algorithm>
+#include <chrono>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <memory>
+#include <optional>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -12,6 +14,8 @@
 #include <vector>
 
 #include "miniort/loader/onnx_loader.h"
+#include "miniort/optimizer/graph_optimizer.h"
+#include "miniort/runtime/cuda_execution_provider.h"
 #include "miniort/runtime/execution_context.h"
 #include "miniort/runtime/session.h"
 #include "miniort/tools/gpt2_cache_binding.h"
@@ -19,6 +23,12 @@
 #include "miniort/tools/phase_output.h"
 
 namespace {
+
+using Clock = std::chrono::steady_clock;
+
+double ElapsedMs(Clock::time_point start, Clock::time_point end) {
+  return std::chrono::duration<double, std::milli>(end - start).count();
+}
 
 struct Options {
   std::string model_path;
@@ -35,6 +45,10 @@ struct Options {
   bool strict{false};
   bool verbose{false};
   bool quiet{false};
+  bool evict_dead_tensors{true};
+  bool evict_dead_cuda_tensors_only{true};
+  bool planned_memory_reuse{false};
+  bool graph_optimization{false};
 };
 
 std::string ReadTextFile(const std::filesystem::path& path) {
@@ -148,6 +162,25 @@ void ApplyConfigEntry(Options& options, const std::string& key, const std::strin
     options.quiet = ParseBool(value);
     return;
   }
+  if (key == "evict_dead_tensors") {
+    options.evict_dead_tensors = ParseBool(value);
+    return;
+  }
+  if (key == "evict_dead_cuda_tensors_only") {
+    options.evict_dead_cuda_tensors_only = ParseBool(value);
+    return;
+  }
+  if (key == "planned_memory_reuse") {
+    options.planned_memory_reuse = ParseBool(value);
+    if (options.planned_memory_reuse) {
+      options.evict_dead_tensors = true;
+    }
+    return;
+  }
+  if (key == "graph_optimization") {
+    options.graph_optimization = ParseBool(value);
+    return;
+  }
   throw std::runtime_error("unknown config key: " + key);
 }
 
@@ -220,6 +253,8 @@ Options ParseArgs(int argc, char* argv[], const std::string& program_name) {
         " [model.onnx] [--config path] (--tokens 1,2,3 | --prompt \"text\" | --prompt-file path)"
         " [--model-dir path] [--start-node N] [--max-nodes N] [--top-k N] [--generate N]"
         " [--kv-cache] [--kv-cache-prefill-model path] [--kv-cache-decode-model path]"
+        " [--evict-dead-tensors] [--evict-all-dead-tensors] [--no-evict-dead-tensors]"
+        " [--planned-memory-reuse] [--graph-opt]"
         " [--strict] [--verbose] [--quiet]");
   }
 
@@ -293,6 +328,29 @@ Options ParseArgs(int argc, char* argv[], const std::string& program_name) {
       options.quiet = true;
       continue;
     }
+    if (arg == "--evict-dead-tensors") {
+      options.evict_dead_tensors = true;
+      options.evict_dead_cuda_tensors_only = true;
+      continue;
+    }
+    if (arg == "--evict-all-dead-tensors") {
+      options.evict_dead_tensors = true;
+      options.evict_dead_cuda_tensors_only = false;
+      continue;
+    }
+    if (arg == "--no-evict-dead-tensors") {
+      options.evict_dead_tensors = false;
+      continue;
+    }
+    if (arg == "--planned-memory-reuse") {
+      options.planned_memory_reuse = true;
+      options.evict_dead_tensors = true;
+      continue;
+    }
+    if (arg == "--graph-opt") {
+      options.graph_optimization = true;
+      continue;
+    }
     throw std::runtime_error("unknown argument: " + arg);
   }
 
@@ -358,11 +416,28 @@ void PrintTopKFromLogits(const miniort::Tensor& logits, std::size_t top_k, std::
 }
 
 std::int64_t SelectGreedyNextToken(const miniort::Tensor& logits) {
-  auto ranked = RankLastTokenLogits(logits);
-  if (ranked.empty()) {
-    throw std::runtime_error("failed to rank logits for greedy generation");
+  if (logits.dtype != "float32" || logits.float_data.empty() || logits.shape.size() != 3) {
+    throw std::runtime_error("failed to read logits for greedy generation");
   }
-  return static_cast<std::int64_t>(ranked.front().second);
+
+  const auto batch = static_cast<std::size_t>(logits.shape[0]);
+  const auto sequence = static_cast<std::size_t>(logits.shape[1]);
+  const auto vocab = static_cast<std::size_t>(logits.shape[2]);
+  if (batch == 0 || sequence == 0 || vocab == 0) {
+    throw std::runtime_error("failed to read logits shape for greedy generation");
+  }
+
+  const auto offset = (sequence - 1) * vocab;
+  std::size_t best_token = 0;
+  float best_logit = logits.float_data[offset];
+  for (std::size_t token_id = 1; token_id < vocab; ++token_id) {
+    const auto logit = logits.float_data[offset + token_id];
+    if (logit > best_logit) {
+      best_logit = logit;
+      best_token = token_id;
+    }
+  }
+  return static_cast<std::int64_t>(best_token);
 }
 
 void PrintTokenIds(const std::vector<std::int64_t>& token_ids, const std::string& label, std::ostream& os) {
@@ -436,6 +511,10 @@ int main(int argc, char* argv[]) {
     session_options.allow_missing_kernels = !options.strict;
     session_options.allow_unassigned_nodes = !options.strict;
     session_options.auto_bind_placeholder_inputs = true;
+    session_options.evict_dead_tensors = options.evict_dead_tensors;
+    session_options.evict_dead_cuda_tensors_only = options.evict_dead_cuda_tensors_only;
+    session_options.planned_memory_reuse = options.planned_memory_reuse;
+    session_options.materialize_cuda_graph_outputs = !options.kv_cache;
     session_options.start_node = options.start_node;
     session_options.max_nodes = options.max_nodes;
 
@@ -445,11 +524,30 @@ int main(int argc, char* argv[]) {
         std::cout << "  decode_model=" << decode_model_path << "\n";
       }
     }
+    const auto load_start = Clock::now();
     auto make_session = [&](miniort::Graph graph) {
       return std::make_unique<miniort::Session>(std::move(graph), session_options);
     };
+    auto optimize_graph = [&](miniort::Graph graph, const std::string& label) {
+      if (!options.graph_optimization) {
+        return graph;
+      }
+      miniort::GraphOptimizationSummary optimization_summary;
+      graph = miniort::OptimizeGraph(std::move(graph),
+                                     {.enable_constant_folding = true,
+                                      .enable_dead_node_cleanup = true,
+                                      .enable_shape_simplification = true},
+                                     nullptr,
+                                     &optimization_summary);
+      if (!options.quiet) {
+        std::cout << "  optimized_" << label << "_nodes_before=" << optimization_summary.nodes_before
+                  << " nodes_after=" << optimization_summary.nodes_after << "\n";
+      }
+      return graph;
+    };
 
     auto prefill_graph = miniort::LoadOnnxGraph(prefill_model_path, options.quiet ? nullptr : &std::cout);
+    prefill_graph = optimize_graph(std::move(prefill_graph), "prefill");
     if (prefill_graph.inputs.empty()) {
       throw std::runtime_error("graph has no runtime inputs");
     }
@@ -462,23 +560,32 @@ int main(int argc, char* argv[]) {
         throw std::runtime_error("kv-cache mode requires --kv-cache-decode-model");
       }
       auto decode_graph = miniort::LoadOnnxGraph(decode_model_path, options.quiet ? nullptr : &std::cout);
+      decode_graph = optimize_graph(std::move(decode_graph), "decode");
       cache_binding = BuildCacheBinding(prefill_session->graph(), decode_graph);
       decode_session = make_session(std::move(decode_graph));
     }
+    const auto load_end = Clock::now();
 
     miniort::RunSummary summary;
     std::vector<std::int64_t> step_tokens = token_ids;
+    double prefill_ms = 0.0;
+    double decode_total_ms = 0.0;
+    std::size_t decode_steps = 0;
 
     if (!options.quiet) {
       miniort::PrintPhaseStep(std::cout, 3, 4, "Run Generation",
                               options.kv_cache ? "先跑 prefill，再进入 decode 循环。" : "重复跑 baseline 图并做 greedy 续写。");
     }
+    const auto generation_start = Clock::now();
 
     const auto run_step = [&](miniort::Session& session, const miniort::Graph& graph,
                               std::unordered_map<std::string, miniort::Tensor>& feeds,
                               miniort::ExecutionContext& context) -> const miniort::Tensor* {
       const auto step_summary = session.Run(feeds, context, options.quiet ? nullptr : &std::cout);
       AccumulateSummary(step_summary, summary);
+      if (options.kv_cache) {
+        miniort::MaterializeCudaTensor(graph.outputs.front().name, context);
+      }
       const auto* logits = context.FindTensor(graph.outputs.front().name);
       if (logits == nullptr) {
         throw std::runtime_error("logits output was not produced");
@@ -515,7 +622,9 @@ int main(int argc, char* argv[]) {
       step_feeds.emplace(prefill_session->graph().inputs.front().name,
                          MakeTokenTensor(prefill_session->graph().inputs.front(), step_tokens));
 
+      const auto prefill_start = Clock::now();
       const auto prefill_logits = run_step(*prefill_session, prefill_session->graph(), step_feeds, context);
+      prefill_ms = ElapsedMs(prefill_start, Clock::now());
       miniort::CollectCacheState(context, cache_binding, miniort::GptCacheStateSource::kPrefill, step_feeds);
 
       if (options.generate == 0) {
@@ -531,6 +640,11 @@ int main(int argc, char* argv[]) {
         step_tokens = {next_token_id};
         step_feeds[prefill_session->graph().inputs.front().name] =
             MakeTokenTensor(prefill_session->graph().inputs.front(), step_tokens);
+        std::optional<miniort::ExecutionContext> separate_decode_context;
+        if (options.graph_optimization) {
+          separate_decode_context.emplace();
+        }
+        auto& decode_context = separate_decode_context.has_value() ? *separate_decode_context : context;
         if (options.verbose && !options.quiet) {
           std::cout << "generation_step[0] next_token_id=" << next_token_id << "\n";
         }
@@ -538,13 +652,16 @@ int main(int argc, char* argv[]) {
         for (std::size_t step = 1; step <= options.generate; ++step) {
           step_feeds[decode_session->graph().inputs.front().name] =
               MakeTokenTensor(decode_session->graph().inputs.front(), step_tokens);
-          const auto* logits = run_step(*decode_session, decode_session->graph(), step_feeds, context);
-          miniort::CollectCacheState(context, cache_binding, miniort::GptCacheStateSource::kDecode, step_feeds);
+          const auto decode_start = Clock::now();
+          const auto* logits = run_step(*decode_session, decode_session->graph(), step_feeds, decode_context);
+          decode_total_ms += ElapsedMs(decode_start, Clock::now());
+          ++decode_steps;
+          miniort::CollectCacheState(decode_context, cache_binding, miniort::GptCacheStateSource::kDecode, step_feeds);
 
           if (step == options.generate) {
             if (!options.quiet) {
               std::cout << "\nfinal_context\n";
-              context.Dump(std::cout, 12);
+              decode_context.Dump(std::cout, 12);
             }
             std::cout << "\n";
             PrintTopKFromLogits(*logits, options.top_k, std::cout);
@@ -559,6 +676,7 @@ int main(int argc, char* argv[]) {
         }
       }
     }
+    const auto generation_end = Clock::now();
 
     if (options.generate != 0) {
       std::cout << "\n";
@@ -569,6 +687,16 @@ int main(int argc, char* argv[]) {
       PrintTokenIds(input_token_ids, "\ninput_token_ids:", std::cout);
       std::cout << "\noutput_text:\n" << tokenizer->Decode(token_ids) << "\n";
     }
+    std::cout << "\ntiming_ms"
+              << " load_and_session=" << ElapsedMs(load_start, load_end)
+              << " generation=" << ElapsedMs(generation_start, generation_end);
+    if (options.kv_cache) {
+      std::cout << " prefill=" << prefill_ms
+                << " decode_total=" << decode_total_ms
+                << " decode_steps=" << decode_steps
+                << " decode_mean=" << (decode_steps == 0 ? 0.0 : decode_total_ms / static_cast<double>(decode_steps));
+    }
+    std::cout << "\n";
     if (!options.quiet) {
       miniort::PrintPhaseStep(std::cout, 4, 4, "Summarize Outputs",
                               "重点看 output_text、full_token_ids、summary 和 provider execution summary。");

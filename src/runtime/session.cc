@@ -348,6 +348,7 @@ void Session::AssignExecutionProviders() {
 
   assignment_summary_.unassigned_op_types.assign(unassigned_op_types.begin(), unassigned_op_types.end());
   provider_segments_ = BuildProviderSegments();
+
 }
 
 std::vector<ProviderSegment> Session::BuildProviderSegments() const {
@@ -699,19 +700,21 @@ RunSummary Session::Run(const std::unordered_map<std::string, Tensor>& feeds, Ex
     }
 
 #if defined(MINIORT_BUILD_CUDA_EP)
-    if (graph_.outputs.empty()) {
-      std::vector<std::string> tensor_names;
-      tensor_names.reserve(context.tensors().size());
-      for (const auto& [name, tensor] : context.tensors()) {
-        (void)tensor;
-        tensor_names.push_back(name);
-      }
-      for (const auto& name : tensor_names) {
-        MaterializeCudaTensor(name, context);
-      }
-    } else {
-      for (const auto& output : graph_.outputs) {
-        MaterializeCudaTensor(output.name, context);
+    if (options_.materialize_cuda_graph_outputs) {
+      if (graph_.outputs.empty()) {
+        std::vector<std::string> tensor_names;
+        tensor_names.reserve(context.tensors().size());
+        for (const auto& [name, tensor] : context.tensors()) {
+          (void)tensor;
+          tensor_names.push_back(name);
+        }
+        for (const auto& name : tensor_names) {
+          MaterializeCudaTensor(name, context);
+        }
+      } else {
+        for (const auto& output : graph_.outputs) {
+          MaterializeCudaTensor(output.name, context);
+        }
       }
     }
 #endif
@@ -790,9 +793,15 @@ void Session::EvictDeadTensors(std::size_t topo_index, const Node& node, Executi
     if (tensor_is_persistent_.contains(name)) {
       continue;
     }
+    if (options_.evict_dead_cuda_tensors_only) {
+      const auto* tensor = context.FindTensor(name);
+      if (tensor == nullptr || tensor->cuda_data == nullptr) {
+        continue;
+      }
+    }
     if (context.EraseTensor(name)) {
       ++released_tensors;
-      if (trace != nullptr) {
+      if (trace != nullptr && options_.verbose) {
         *trace << "    evicted dead tensor " << name << "\n";
       }
     }

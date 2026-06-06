@@ -144,6 +144,163 @@ __global__ void AddChannelBias2DKernel(float* output, const float* bias, std::si
   output[index] += bias[channel];
 }
 
+__global__ void AddGemmBiasKernel(float* output, const float* bias, std::size_t m, std::size_t n,
+                                  CudaGemmBiasKind kind, float scale) {
+  const auto index = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  const auto total = m * n;
+  if (index >= total) {
+    return;
+  }
+
+  float bias_value = 0.0f;
+  switch (kind) {
+    case CudaGemmBiasKind::kScalar:
+      bias_value = bias[0];
+      break;
+    case CudaGemmBiasKind::kColumn:
+      bias_value = bias[index % n];
+      break;
+    case CudaGemmBiasKind::kRow:
+      bias_value = bias[index / n];
+      break;
+    case CudaGemmBiasKind::kFull:
+      bias_value = bias[index];
+      break;
+  }
+  output[index] += scale * bias_value;
+}
+
+__global__ void TransposeFloatKernel(const float* input, float* output, std::size_t count, std::size_t rank,
+                                     const std::int64_t* input_strides, const std::int64_t* output_strides,
+                                     const std::int64_t* perm) {
+  const auto index = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (index >= count) {
+    return;
+  }
+
+  auto remaining = index;
+  std::size_t input_offset = 0;
+  for (std::size_t dim = 0; dim < rank; ++dim) {
+    const auto stride = static_cast<std::size_t>(output_strides[dim]);
+    const auto coord = stride == 0 ? 0 : remaining / stride;
+    if (stride != 0) {
+      remaining %= stride;
+    }
+    input_offset += coord * static_cast<std::size_t>(input_strides[perm[dim]]);
+  }
+  output[index] = input[input_offset];
+}
+
+__global__ void SoftmaxFloatKernel(const float* input, float* output, std::size_t rows, std::size_t axis_dim,
+                                   std::size_t inner) {
+  const auto row_index = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (row_index >= rows) {
+    return;
+  }
+
+  const auto outer_index = row_index / inner;
+  const auto inner_index = row_index % inner;
+  const auto base = (outer_index * axis_dim) * inner + inner_index;
+
+  float max_value = -INFINITY;
+  for (std::size_t axis_index = 0; axis_index < axis_dim; ++axis_index) {
+    max_value = fmaxf(max_value, input[base + axis_index * inner]);
+  }
+
+  float sum = 0.0f;
+  for (std::size_t axis_index = 0; axis_index < axis_dim; ++axis_index) {
+    const auto offset = base + axis_index * inner;
+    const auto value = expf(input[offset] - max_value);
+    output[offset] = value;
+    sum += value;
+  }
+
+  const auto inv_sum = 1.0f / sum;
+  for (std::size_t axis_index = 0; axis_index < axis_dim; ++axis_index) {
+    const auto offset = base + axis_index * inner;
+    output[offset] *= inv_sum;
+  }
+}
+
+__device__ std::size_t BroadcastOffset(std::size_t flat_index, std::size_t rank,
+                                       const std::int64_t* output_strides, const std::int64_t* input_shape,
+                                       const std::int64_t* input_strides) {
+  std::size_t offset = 0;
+  auto remaining = flat_index;
+  for (std::size_t dim = 0; dim < rank; ++dim) {
+    const auto output_stride = static_cast<std::size_t>(output_strides[dim]);
+    const auto coord = output_stride == 0 ? 0 : remaining / output_stride;
+    if (output_stride != 0) {
+      remaining %= output_stride;
+    }
+    if (input_shape[dim] != 1) {
+      offset += coord * static_cast<std::size_t>(input_strides[dim]);
+    }
+  }
+  return offset;
+}
+
+__global__ void WhereFloatInt64CondKernel(const std::int64_t* condition, const float* x, const float* y,
+                                          float* output, std::size_t count, std::size_t rank,
+                                          const std::int64_t* output_strides,
+                                          const std::int64_t* condition_shape,
+                                          const std::int64_t* condition_strides,
+                                          const std::int64_t* x_shape, const std::int64_t* x_strides,
+                                          const std::int64_t* y_shape, const std::int64_t* y_strides) {
+  const auto index = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (index >= count) {
+    return;
+  }
+
+  const auto condition_offset = BroadcastOffset(index, rank, output_strides, condition_shape, condition_strides);
+  const auto x_offset = BroadcastOffset(index, rank, output_strides, x_shape, x_strides);
+  const auto y_offset = BroadcastOffset(index, rank, output_strides, y_shape, y_strides);
+  output[index] = condition[condition_offset] != 0 ? x[x_offset] : y[y_offset];
+}
+
+__global__ void LayerNormalizationKernel(const float* input, const float* scale, const float* bias, float* output,
+                                         std::size_t normalized_size, float epsilon) {
+  extern __shared__ float scratch[];
+  const auto row = static_cast<std::size_t>(blockIdx.x);
+  const auto tid = static_cast<std::size_t>(threadIdx.x);
+  const auto row_base = row * normalized_size;
+
+  float partial_sum = 0.0f;
+  for (std::size_t i = tid; i < normalized_size; i += blockDim.x) {
+    partial_sum += input[row_base + i];
+  }
+  scratch[tid] = partial_sum;
+  __syncthreads();
+
+  for (std::size_t stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+    if (tid < stride) {
+      scratch[tid] += scratch[tid + stride];
+    }
+    __syncthreads();
+  }
+  const float mean = scratch[0] / static_cast<float>(normalized_size);
+
+  float partial_variance = 0.0f;
+  for (std::size_t i = tid; i < normalized_size; i += blockDim.x) {
+    const auto diff = input[row_base + i] - mean;
+    partial_variance += diff * diff;
+  }
+  scratch[tid] = partial_variance;
+  __syncthreads();
+
+  for (std::size_t stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+    if (tid < stride) {
+      scratch[tid] += scratch[tid + stride];
+    }
+    __syncthreads();
+  }
+  const float inv_stddev = rsqrtf(scratch[0] / static_cast<float>(normalized_size) + epsilon);
+
+  for (std::size_t i = tid; i < normalized_size; i += blockDim.x) {
+    output[row_base + i] = ((input[row_base + i] - mean) * inv_stddev) * scale[i] + bias[i];
+  }
+}
+
 struct SigmoidFn {
   __device__ float operator()(float value) const {
     return 1.0f / (1.0f + expf(-value));
@@ -334,6 +491,63 @@ cudaError_t LaunchCudaAddChannelBias2D(float* output, const float* bias, std::si
     return cudaSuccess;
   }
   AddChannelBias2DKernel<<<BlockCount(count), kThreadsPerBlock>>>(output, bias, n, c, h, w);
+  return cudaGetLastError();
+}
+
+cudaError_t LaunchCudaAddGemmBias(float* output, const float* bias, std::size_t m, std::size_t n,
+                                  CudaGemmBiasKind kind, float scale) {
+  const auto count = m * n;
+  if (count == 0) {
+    return cudaSuccess;
+  }
+  AddGemmBiasKernel<<<BlockCount(count), kThreadsPerBlock>>>(output, bias, m, n, kind, scale);
+  return cudaGetLastError();
+}
+
+cudaError_t LaunchCudaTransposeFloat(const float* input, float* output, std::size_t count, std::size_t rank,
+                                     const std::int64_t* input_strides, const std::int64_t* output_strides,
+                                     const std::int64_t* perm) {
+  if (count == 0) {
+    return cudaSuccess;
+  }
+  TransposeFloatKernel<<<BlockCount(count), kThreadsPerBlock>>>(input, output, count, rank, input_strides,
+                                                                output_strides, perm);
+  return cudaGetLastError();
+}
+
+cudaError_t LaunchCudaSoftmaxFloat(const float* input, float* output, std::size_t rows, std::size_t axis_dim,
+                                   std::size_t inner) {
+  if (rows == 0 || axis_dim == 0) {
+    return cudaSuccess;
+  }
+  SoftmaxFloatKernel<<<BlockCount(rows), kThreadsPerBlock>>>(input, output, rows, axis_dim, inner);
+  return cudaGetLastError();
+}
+
+cudaError_t LaunchCudaWhereFloatInt64Cond(const std::int64_t* condition, const float* x, const float* y,
+                                          float* output, std::size_t count, std::size_t rank,
+                                          const std::int64_t* output_strides,
+                                          const std::int64_t* condition_shape,
+                                          const std::int64_t* condition_strides,
+                                          const std::int64_t* x_shape, const std::int64_t* x_strides,
+                                          const std::int64_t* y_shape, const std::int64_t* y_strides) {
+  if (count == 0) {
+    return cudaSuccess;
+  }
+  WhereFloatInt64CondKernel<<<BlockCount(count), kThreadsPerBlock>>>(
+      condition, x, y, output, count, rank, output_strides, condition_shape, condition_strides, x_shape, x_strides,
+      y_shape, y_strides);
+  return cudaGetLastError();
+}
+
+cudaError_t LaunchCudaLayerNormalization(const float* input, const float* scale, const float* bias, float* output,
+                                         std::size_t rows, std::size_t normalized_size, float epsilon) {
+  if (rows == 0 || normalized_size == 0) {
+    return cudaSuccess;
+  }
+  constexpr int threads = 256;
+  LayerNormalizationKernel<<<static_cast<unsigned int>(rows), threads, threads * sizeof(float)>>>(
+      input, scale, bias, output, normalized_size, epsilon);
   return cudaGetLastError();
 }
 

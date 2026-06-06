@@ -7,6 +7,7 @@ namespace miniort {
 namespace {
 
 Tensor TensorFromValue(const Value& value) {
+  constexpr std::size_t kExternalFloatInitializerThreshold = 4096;
   Tensor tensor = MakePlaceholderTensor(value.name, value.info);
   tensor.is_initializer = value.info.is_initializer;
   tensor.is_placeholder = !value.data.has_value();
@@ -14,7 +15,11 @@ Tensor TensorFromValue(const Value& value) {
     tensor.dtype = value.data->dtype;
   }
   if (value.data.has_value() && value.data->dtype == "float32" && !value.data->float_data.empty()) {
-    tensor.float_data = value.data->float_data;
+    if (value.info.is_initializer && value.data->float_data.size() > kExternalFloatInitializerThreshold) {
+      tensor.external_float_data = &value.data->float_data;
+    } else {
+      tensor.float_data = value.data->float_data;
+    }
     tensor.is_placeholder = false;
   }
   if (value.data.has_value() && value.data->dtype == "int64" && !value.data->int64_data.empty()) {
@@ -85,6 +90,7 @@ Tensor* ExecutionContext::FindTensor(const std::string& name) {
     return nullptr;
   }
   auto tensor = TensorFromValue(init_it->second);
+  tensor.is_initializer = true;
   auto [inserted_it, inserted] = tensors_.emplace(name, std::move(tensor));
   (void)inserted;
   return &inserted_it->second;
@@ -95,6 +101,16 @@ const std::unordered_map<std::string, Tensor>& ExecutionContext::tensors() const
 }
 
 void ExecutionContext::LoadInitializers(const Graph& graph) {
+  if (graph_ != nullptr && graph_ != &graph) {
+    for (auto it = tensors_.begin(); it != tensors_.end();) {
+      if (it->second.is_initializer && graph.initializers.contains(it->first)) {
+        RecycleTensorStorage(it->first, std::move(it->second));
+        it = tensors_.erase(it);
+      } else {
+        ++it;
+      }
+    }
+  }
   graph_ = &graph;
 }
 
@@ -121,6 +137,7 @@ const Tensor* ExecutionContext::MaterializeInitializer(const std::string& name) 
   }
 
   auto tensor = TensorFromValue(init_it->second);
+  tensor.is_initializer = true;
   auto [inserted_it, inserted] = tensors_.emplace(name, std::move(tensor));
   (void)inserted;
   return &inserted_it->second;

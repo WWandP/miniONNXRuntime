@@ -6,12 +6,20 @@
 #include <cudnn.h>
 #endif
 
+#include <algorithm>
+#include <cmath>
+#include <cstddef>
+#include <cstdlib>
+#include <iostream>
+#include <limits>
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <functional>
+#include <set>
 #include <unordered_map>
 #include <vector>
 
@@ -206,6 +214,28 @@ std::mutex& GetCudaInitializerCacheMutex() {
   return mutex;
 }
 
+struct CudaInitializerCacheStats {
+  std::size_t hits{0};
+  std::size_t misses{0};
+  std::size_t inserted{0};
+  std::size_t copied_bytes{0};
+
+  ~CudaInitializerCacheStats() {
+    if (std::getenv("MINIORT_CUDA_INIT_CACHE_STATS") == nullptr) {
+      return;
+    }
+    std::cerr << "cuda_initializer_cache hits=" << hits
+              << " misses=" << misses
+              << " inserted=" << inserted
+              << " copied_bytes=" << copied_bytes << "\n";
+  }
+};
+
+CudaInitializerCacheStats& GetCudaInitializerCacheStats() {
+  static CudaInitializerCacheStats stats;
+  return stats;
+}
+
 bool TryBindCachedCudaInitializer(Tensor& tensor, std::size_t bytes) {
   if (!tensor.is_initializer) {
     return false;
@@ -215,13 +245,16 @@ bool TryBindCachedCudaInitializer(Tensor& tensor, std::size_t bytes) {
   std::lock_guard<std::mutex> lock(GetCudaInitializerCacheMutex());
   const auto it = GetCudaInitializerCache().find(key);
   if (it == GetCudaInitializerCache().end()) {
+    ++GetCudaInitializerCacheStats().misses;
     return false;
   }
   if (it->second.data == nullptr || it->second.bytes < bytes) {
+    ++GetCudaInitializerCacheStats().misses;
     return false;
   }
   tensor.cuda_data = it->second.data;
   tensor.cuda_bytes = it->second.bytes;
+  ++GetCudaInitializerCacheStats().hits;
   return true;
 }
 
@@ -232,7 +265,13 @@ void CacheCudaInitializer(const Tensor& tensor, std::size_t bytes) {
 
   const auto key = MakeCudaInitializerCacheKey(tensor, bytes);
   std::lock_guard<std::mutex> lock(GetCudaInitializerCacheMutex());
-  GetCudaInitializerCache()[key] = CachedCudaInitializer{tensor.cuda_data, tensor.cuda_bytes};
+  auto [it, inserted] = GetCudaInitializerCache().insert_or_assign(
+      key, CachedCudaInitializer{tensor.cuda_data, tensor.cuda_bytes});
+  (void)it;
+  if (inserted) {
+    ++GetCudaInitializerCacheStats().inserted;
+    GetCudaInitializerCacheStats().copied_bytes += bytes;
+  }
 }
 
 Tensor MakeCudaFloatOutput(const std::string& name, const std::vector<std::int64_t>& shape) {
@@ -615,9 +654,27 @@ void ApplyGemmBias(Tensor& output, const Tensor* bias) {
   throw std::runtime_error("CUDA Gemm bias shape is not supported");
 }
 
-Tensor RunCudaMatMul(const Node& node, const Tensor& lhs, const Tensor& rhs, ExecutionContext& context) {
-  const auto& lhs_data = RequireFloatData(lhs, "CUDA MatMul");
-  const auto& rhs_data = RequireFloatData(rhs, "CUDA MatMul");
+CudaGemmBiasKind ResolveGemmBiasKind(const Tensor& bias, std::size_t m, std::size_t n) {
+  if (bias.shape.empty() && GetElementCount(bias.shape) == 1) {
+    return CudaGemmBiasKind::kScalar;
+  }
+  if (bias.shape.size() == 1 && bias.shape[0] == static_cast<std::int64_t>(n)) {
+    return CudaGemmBiasKind::kColumn;
+  }
+  if (bias.shape.size() == 1 && bias.shape[0] == static_cast<std::int64_t>(m)) {
+    return CudaGemmBiasKind::kRow;
+  }
+  if (bias.shape.size() == 2 && bias.shape[0] == static_cast<std::int64_t>(m) &&
+      bias.shape[1] == static_cast<std::int64_t>(n)) {
+    return CudaGemmBiasKind::kFull;
+  }
+  throw std::runtime_error("CUDA Gemm bias shape is not supported");
+}
+
+Tensor RunCudaMatMul(const Node& node, Tensor& lhs, Tensor& rhs, ExecutionContext& context) {
+  if (lhs.dtype != "float32" || rhs.dtype != "float32") {
+    throw std::runtime_error("CUDA MatMul currently requires float32 tensors");
+  }
   if (lhs.shape.size() < 2 || rhs.shape.size() < 2) {
     throw std::runtime_error("CUDA MatMul currently requires rank >= 2 float32 tensors");
   }
@@ -638,7 +695,7 @@ Tensor RunCudaMatMul(const Node& node, const Tensor& lhs, const Tensor& rhs, Exe
   output_shape.push_back(static_cast<std::int64_t>(m));
   output_shape.push_back(static_cast<std::int64_t>(n));
 
-  auto output = MakeFloatOutput(node.outputs.at(0), output_shape, context);
+  auto output = MakeCudaFloatOutput(node.outputs.at(0), output_shape);
   const auto output_batch_strides = ComputeStrides(output_batch_shape);
   const auto lhs_full_strides = ComputeStrides(lhs.shape);
   const auto rhs_full_strides = ComputeStrides(rhs.shape);
@@ -648,13 +705,38 @@ Tensor RunCudaMatMul(const Node& node, const Tensor& lhs, const Tensor& rhs, Exe
   const std::size_t rhs_matrix_elements = k * n;
   const std::size_t out_matrix_elements = m * n;
 
-  DeviceBuffer lhs_device(lhs_matrix_elements * sizeof(float));
-  DeviceBuffer rhs_device(rhs_matrix_elements * sizeof(float));
-  DeviceBuffer out_device(out_matrix_elements * sizeof(float));
+  DeviceBuffer output_device(batch_count * out_matrix_elements * sizeof(float));
+  const auto* lhs_data = CudaFloatData(lhs, "CUDA MatMul");
+  const auto* rhs_data = CudaFloatData(rhs, "CUDA MatMul");
+  auto* output_ptr = static_cast<float*>(output_device.data());
   const auto handle = GetCublasHandle();
 
   const float alpha = 1.0f;
   const float beta = 0.0f;
+
+  auto resolve_batch_stride = [&](const std::vector<std::int64_t>& batch_shape,
+                                  std::size_t matrix_elements) -> std::optional<long long> {
+    if (batch_shape == output_batch_shape) {
+      return static_cast<long long>(matrix_elements);
+    }
+    if (batch_shape.empty() || GetElementCount(batch_shape) == 1) {
+      return 0;
+    }
+    return std::nullopt;
+  };
+
+  const auto lhs_stride = resolve_batch_stride(lhs_batch_shape, lhs_matrix_elements);
+  const auto rhs_stride = resolve_batch_stride(rhs_batch_shape, rhs_matrix_elements);
+  if (batch_count > 1 && lhs_stride.has_value() && rhs_stride.has_value()) {
+    CheckCublas(cublasSgemmStridedBatched(
+                    handle, CUBLAS_OP_N, CUBLAS_OP_N, static_cast<int>(n), static_cast<int>(m), static_cast<int>(k),
+                    &alpha, rhs_data, static_cast<int>(n), *rhs_stride, lhs_data, static_cast<int>(k), *lhs_stride,
+                    &beta, output_ptr, static_cast<int>(n), static_cast<long long>(out_matrix_elements),
+                    static_cast<int>(batch_count)),
+                "cublasSgemmStridedBatched");
+    BindCudaFloatOutput(output, std::move(output_device));
+    return output;
+  }
 
   for (std::size_t batch = 0; batch < batch_count; ++batch) {
     const auto batch_index = UnravelIndex(batch, output_batch_shape, output_batch_strides);
@@ -666,32 +748,23 @@ Tensor RunCudaMatMul(const Node& node, const Tensor& lhs, const Tensor& rhs, Exe
     const auto rhs_base = rhs_batch_shape.empty() ? 0 : rhs_batch_offset;
     const auto output_base = batch * out_matrix_elements;
 
-    CheckCuda(cudaMemcpy(lhs_device.data(), lhs_data.data() + lhs_base, lhs_matrix_elements * sizeof(float),
-                         cudaMemcpyHostToDevice),
-              "cudaMemcpy H2D lhs");
-    CheckCuda(cudaMemcpy(rhs_device.data(), rhs_data.data() + rhs_base, rhs_matrix_elements * sizeof(float),
-                         cudaMemcpyHostToDevice),
-              "cudaMemcpy H2D rhs");
-
     // cuBLAS assumes column-major storage. Using swapped operands maps our
     // row-major MatMul into an equivalent column-major GEMM.
     CheckCublas(cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N, static_cast<int>(n), static_cast<int>(m),
-                            static_cast<int>(k), &alpha, static_cast<const float*>(rhs_device.data()),
-                            static_cast<int>(n), static_cast<const float*>(lhs_device.data()), static_cast<int>(k),
-                            &beta, static_cast<float*>(out_device.data()), static_cast<int>(n)),
+                            static_cast<int>(k), &alpha, rhs_data + rhs_base, static_cast<int>(n),
+                            lhs_data + lhs_base, static_cast<int>(k), &beta, output_ptr + output_base,
+                            static_cast<int>(n)),
                 "cublasSgemm");
-
-    CheckCuda(cudaMemcpy(output.float_data.data() + output_base, out_device.data(), out_matrix_elements * sizeof(float),
-                         cudaMemcpyDeviceToHost),
-              "cudaMemcpy D2H output");
   }
 
+  BindCudaFloatOutput(output, std::move(output_device));
   return output;
 }
 
-Tensor RunCudaGemm(const Node& node, const Tensor& a, const Tensor& b, const Tensor* c, ExecutionContext& context) {
-  const auto& a_data = RequireFloatData(a, "CUDA Gemm");
-  const auto& b_data = RequireFloatData(b, "CUDA Gemm");
+Tensor RunCudaGemm(const Node& node, Tensor& a, Tensor& b, Tensor* c, ExecutionContext& context) {
+  if (a.dtype != "float32" || b.dtype != "float32") {
+    throw std::runtime_error("CUDA Gemm currently requires float32 tensors");
+  }
   if (a.shape.size() != 2 || b.shape.size() != 2) {
     throw std::runtime_error("CUDA Gemm currently only supports 2D float32 tensors");
   }
@@ -715,52 +788,68 @@ Tensor RunCudaGemm(const Node& node, const Tensor& a, const Tensor& b, const Ten
     throw std::runtime_error("CUDA Gemm inner dimensions do not match");
   }
 
-  auto output = MakeFloatOutput(node.outputs.at(0),
-                                {static_cast<std::int64_t>(m), static_cast<std::int64_t>(n)},
-                                context);
+  auto output = MakeCudaFloatOutput(node.outputs.at(0), {static_cast<std::int64_t>(m), static_cast<std::int64_t>(n)});
 
   const std::size_t a_elements = a_rows * a_cols;
   const std::size_t b_elements = b_rows * b_cols;
   const std::size_t out_elements = m * n;
 
-  DeviceBuffer a_device(a_elements * sizeof(float));
-  DeviceBuffer b_device(b_elements * sizeof(float));
   DeviceBuffer out_device(out_elements * sizeof(float));
   const auto handle = GetCublasHandle();
-
-  CheckCuda(cudaMemcpy(a_device.data(), a_data.data(), a_elements * sizeof(float), cudaMemcpyHostToDevice),
-            "cudaMemcpy H2D Gemm A");
-  CheckCuda(cudaMemcpy(b_device.data(), b_data.data(), b_elements * sizeof(float), cudaMemcpyHostToDevice),
-            "cudaMemcpy H2D Gemm B");
+  (void)a_elements;
+  (void)b_elements;
+  const auto* a_device = CudaFloatData(a, "CUDA Gemm");
+  const auto* b_device = CudaFloatData(b, "CUDA Gemm");
 
   const auto op_a = trans_a ? CUBLAS_OP_T : CUBLAS_OP_N;
   const auto op_b = trans_b ? CUBLAS_OP_T : CUBLAS_OP_N;
 
   // Map row-major Gemm to column-major cuBLAS by swapping A/B and output axes.
   CheckCublas(cublasSgemm(handle, op_b, op_a, static_cast<int>(n), static_cast<int>(m),
-                          static_cast<int>(k_a), &alpha, static_cast<const float*>(b_device.data()),
-                          static_cast<int>(b_cols), static_cast<const float*>(a_device.data()),
+                          static_cast<int>(k_a), &alpha, b_device, static_cast<int>(b_cols), a_device,
                           static_cast<int>(a_cols), &beta, static_cast<float*>(out_device.data()),
                           static_cast<int>(n)),
               "cublasSgemm Gemm");
 
-  CheckCuda(cudaMemcpy(output.float_data.data(), out_device.data(), out_elements * sizeof(float),
-                       cudaMemcpyDeviceToHost),
-            "cudaMemcpy D2H Gemm output");
-
   if (c != nullptr) {
-    if (bias_scale != 1.0f) {
-      Tensor scaled_bias = *c;
-      scaled_bias.float_data = c->float_data;
-      for (auto& value : scaled_bias.float_data) {
-        value *= bias_scale;
-      }
-      ApplyGemmBias(output, &scaled_bias);
-    } else {
-      ApplyGemmBias(output, c);
-    }
+    const auto bias_kind = ResolveGemmBiasKind(*c, m, n);
+    CheckCuda(LaunchCudaAddGemmBias(static_cast<float*>(out_device.data()), CudaFloatData(*c, "CUDA Gemm bias"),
+                                    m, n, bias_kind, bias_scale),
+              "Gemm bias kernel launch");
   }
 
+  BindCudaFloatOutput(output, std::move(out_device));
+  return output;
+}
+
+Tensor RunCudaLayerNormalization(const Node& node, Tensor& input, Tensor& scale, Tensor& bias) {
+  if (input.dtype != "float32" || scale.dtype != "float32" || bias.dtype != "float32") {
+    throw std::runtime_error("CUDA LayerNormalization requires float32 tensors");
+  }
+  const auto axis = static_cast<std::size_t>(
+      NormalizeAxis(ReadIntAttribute(node, "axis", -1), input.shape.size(), "LayerNormalization"));
+  const float epsilon = ReadFloatAttribute(node, "epsilon", 1e-5f);
+
+  std::size_t rows = 1;
+  for (std::size_t i = 0; i < axis; ++i) {
+    rows *= static_cast<std::size_t>(input.shape[i]);
+  }
+  std::size_t normalized_size = 1;
+  for (std::size_t i = axis; i < input.shape.size(); ++i) {
+    normalized_size *= static_cast<std::size_t>(input.shape[i]);
+  }
+  if (GetElementCount(scale.shape) != normalized_size || GetElementCount(bias.shape) != normalized_size) {
+    throw std::runtime_error("CUDA LayerNormalization scale/bias shape mismatch");
+  }
+
+  auto output = MakeCudaFloatOutput(node.outputs.at(0), input.shape);
+  DeviceBuffer output_device(rows * normalized_size * sizeof(float));
+  CheckCuda(LaunchCudaLayerNormalization(CudaFloatData(input, "CUDA LayerNormalization"),
+                                         CudaFloatData(scale, "CUDA LayerNormalization scale"),
+                                         CudaFloatData(bias, "CUDA LayerNormalization bias"),
+                                         static_cast<float*>(output_device.data()), rows, normalized_size, epsilon),
+            "LayerNormalization kernel launch");
+  BindCudaFloatOutput(output, std::move(output_device));
   return output;
 }
 
@@ -1139,10 +1228,14 @@ Tensor RunCudaBinaryFloatOp(const Node& node, ExecutionContext& context, const s
   auto output = MakeCudaFloatOutput(node.outputs.at(0), output_shape);
 
   if (op_kind == CudaBinaryFloatOp::kDiv) {
-    const auto& rhs_data = RequireFloatData(rhs, op_name);
-    if ((rhs_count == 1 && rhs_data.front() == 0.0f) ||
-        (rhs_count > 1 && std::any_of(rhs_data.begin(), rhs_data.end(), [](float value) { return value == 0.0f; }))) {
-      throw std::runtime_error("Div divisor must not be zero");
+    auto* rhs_for_check = context.FindTensor(node.inputs.at(1));
+    if (rhs_for_check != nullptr && !rhs_for_check->float_data.empty()) {
+      const auto& rhs_data = RequireFloatData(*rhs_for_check, op_name);
+      if ((rhs_count == 1 && rhs_data.front() == 0.0f) ||
+          (rhs_count > 1 &&
+           std::any_of(rhs_data.begin(), rhs_data.end(), [](float value) { return value == 0.0f; }))) {
+        throw std::runtime_error("Div divisor must not be zero");
+      }
     }
   }
 
@@ -1205,14 +1298,18 @@ Tensor RunCudaConcat(const Node& node, ExecutionContext& context) {
     throw std::runtime_error("Concat requires at least one input");
   }
 
+  const auto dtype = inputs.front()->dtype;
+  if (dtype != "float32" && dtype != "int64") {
+    throw std::runtime_error("CUDA Concat currently supports float32/int64 only");
+  }
   const auto rank = inputs.front()->shape.size();
   auto axis = NormalizeAxis(ReadIntAttribute(node, "axis", 0), rank, "Concat");
   const auto axis_index = static_cast<std::size_t>(axis);
   std::vector<std::int64_t> output_shape = inputs.front()->shape;
   output_shape[axis_index] = 0;
   for (const auto* input : inputs) {
-    if (input->dtype != "float32") {
-      throw std::runtime_error("CUDA Concat currently supports float32 only");
+    if (input->dtype != dtype) {
+      throw std::runtime_error("CUDA Concat input dtypes must match");
     }
     if (input->shape.size() != rank) {
       throw std::runtime_error("CUDA Concat rank mismatch");
@@ -1237,6 +1334,33 @@ Tensor RunCudaConcat(const Node& node, ExecutionContext& context) {
     inner *= static_cast<std::size_t>(output_shape[i]);
   }
   const auto output_axis = static_cast<std::size_t>(output_shape[axis_index]);
+
+  if (dtype == "int64") {
+    Tensor output;
+    output.name = node.outputs.at(0);
+    output.dtype = "int64";
+    output.shape = output_shape;
+    output.is_placeholder = false;
+    const auto output_count = GetElementCount(output_shape);
+    output.int64_data = context.AcquireInt64BufferForTensor(output.name, output_count);
+    output.int64_data.resize(output_count);
+
+    for (std::size_t outer_index = 0; outer_index < outer; ++outer_index) {
+      std::size_t axis_offset = 0;
+      for (const auto* input : inputs) {
+        const auto& input_data = RequireInt64Data(*input, "CUDA Concat");
+        const auto input_axis = static_cast<std::size_t>(input->shape[axis_index]);
+        const auto copy_elements = input_axis * inner;
+        const auto input_offset = outer_index * input_axis * inner;
+        const auto output_offset = (outer_index * output_axis + axis_offset) * inner;
+        std::copy(input_data.begin() + static_cast<std::ptrdiff_t>(input_offset),
+                  input_data.begin() + static_cast<std::ptrdiff_t>(input_offset + copy_elements),
+                  output.int64_data.begin() + static_cast<std::ptrdiff_t>(output_offset));
+        axis_offset += input_axis;
+      }
+    }
+    return output;
+  }
 
   auto output = MakeCudaFloatOutput(node.outputs.at(0), output_shape);
   DeviceBuffer output_device(GetElementCount(output_shape) * sizeof(float));
@@ -1344,6 +1468,457 @@ Tensor RunCudaReshape(const Node& node, ExecutionContext& context) {
     throw std::runtime_error("CUDA Reshape currently supports float32/int64 only");
   }
 
+  return output;
+}
+
+std::vector<std::int64_t> ResolveTransposePerm(const Node& node, std::size_t rank) {
+  std::vector<std::int64_t> perm;
+  const auto perm_it = node.attributes.find("perm");
+  if (perm_it == node.attributes.end() || perm_it->second.ints.empty()) {
+    perm.resize(rank);
+    for (std::size_t i = 0; i < rank; ++i) {
+      perm[i] = static_cast<std::int64_t>(rank - 1 - i);
+    }
+  } else {
+    perm = perm_it->second.ints;
+  }
+  if (perm.size() != rank) {
+    throw std::runtime_error("Transpose perm rank mismatch");
+  }
+  std::set<std::int64_t> seen;
+  for (const auto axis : perm) {
+    if (axis < 0 || axis >= static_cast<std::int64_t>(rank) || !seen.insert(axis).second) {
+      throw std::runtime_error("Transpose perm must be a permutation of input axes");
+    }
+  }
+  return perm;
+}
+
+Tensor RunTransposeFallback(const Node& node, ExecutionContext& context) {
+  const auto& input = RequireTensor(context, node.inputs.at(0));
+  const auto perm = ResolveTransposePerm(node, input.shape.size());
+
+  Tensor output;
+  output.name = node.outputs.at(0);
+  output.dtype = input.dtype;
+  output.shape.resize(input.shape.size());
+  for (std::size_t i = 0; i < perm.size(); ++i) {
+    output.shape[i] = input.shape[static_cast<std::size_t>(perm[i])];
+  }
+  output.is_placeholder = false;
+
+  const auto input_strides = ComputeStrides(input.shape);
+  const auto output_strides = ComputeStrides(output.shape);
+  const auto element_count = GetElementCount(output.shape);
+  if (input.dtype == "float32") {
+    const auto& input_data = RequireFloatData(input, "Transpose");
+    output.float_data = context.AcquireFloatBufferForTensor(output.name, element_count);
+    output.float_data.resize(element_count);
+    for (std::size_t i = 0; i < element_count; ++i) {
+      const auto output_index = UnravelIndex(i, output.shape, output_strides);
+      std::size_t input_offset = 0;
+      for (std::size_t j = 0; j < perm.size(); ++j) {
+        input_offset += static_cast<std::size_t>(output_index[j]) *
+                        input_strides[static_cast<std::size_t>(perm[j])];
+      }
+      output.float_data[i] = input_data[input_offset];
+    }
+  } else if (input.dtype == "int64") {
+    const auto& input_data = RequireInt64Data(input, "Transpose");
+    output.int64_data = context.AcquireInt64BufferForTensor(output.name, element_count);
+    output.int64_data.resize(element_count);
+    for (std::size_t i = 0; i < element_count; ++i) {
+      const auto output_index = UnravelIndex(i, output.shape, output_strides);
+      std::size_t input_offset = 0;
+      for (std::size_t j = 0; j < perm.size(); ++j) {
+        input_offset += static_cast<std::size_t>(output_index[j]) *
+                        input_strides[static_cast<std::size_t>(perm[j])];
+      }
+      output.int64_data[i] = input_data[input_offset];
+    }
+  } else {
+    throw std::runtime_error("Transpose currently supports float32/int64 only");
+  }
+  return output;
+}
+
+Tensor RunCudaTranspose(const Node& node, ExecutionContext& context) {
+  auto* input = context.FindTensor(node.inputs.at(0));
+  if (input == nullptr) {
+    throw std::runtime_error("missing Transpose input");
+  }
+  if (input->dtype != "float32") {
+    throw std::runtime_error("CUDA Transpose currently supports float32 only");
+  }
+
+  const auto rank = input->shape.size();
+  if (rank == 0 || rank > 8) {
+    throw std::runtime_error("CUDA Transpose currently supports rank 1..8 tensors");
+  }
+  for (const auto dim : input->shape) {
+    if (dim < 0) {
+      throw std::runtime_error("CUDA Transpose requires concrete non-negative dimensions");
+    }
+  }
+
+  const auto perm = ResolveTransposePerm(node, rank);
+  std::vector<std::int64_t> output_shape(rank);
+  for (std::size_t i = 0; i < rank; ++i) {
+    output_shape[i] = input->shape[static_cast<std::size_t>(perm[i])];
+  }
+
+  auto output = MakeCudaFloatOutput(node.outputs.at(0), output_shape);
+  const auto element_count = GetElementCount(output_shape);
+  DeviceBuffer output_device(element_count * sizeof(float));
+  if (element_count == 0) {
+    BindCudaFloatOutput(output, std::move(output_device));
+    return output;
+  }
+
+  const auto input_strides = ComputeStrides(input->shape);
+  const auto output_strides = ComputeStrides(output_shape);
+  std::vector<std::int64_t> metadata;
+  metadata.reserve(rank * 3);
+  metadata.insert(metadata.end(), input_strides.begin(), input_strides.end());
+  metadata.insert(metadata.end(), output_strides.begin(), output_strides.end());
+  metadata.insert(metadata.end(), perm.begin(), perm.end());
+
+  DeviceBuffer metadata_device(metadata.size() * sizeof(std::int64_t));
+  CheckCuda(cudaMemcpy(metadata_device.data(), metadata.data(), metadata.size() * sizeof(std::int64_t),
+                       cudaMemcpyHostToDevice),
+            "cudaMemcpy H2D Transpose metadata");
+  const auto* metadata_ptr = static_cast<const std::int64_t*>(metadata_device.data());
+  CheckCuda(LaunchCudaTransposeFloat(CudaFloatData(*input, "CUDA Transpose"),
+                                     static_cast<float*>(output_device.data()), element_count, rank, metadata_ptr,
+                                     metadata_ptr + rank, metadata_ptr + rank * 2),
+            "Transpose kernel launch");
+
+  BindCudaFloatOutput(output, std::move(output_device));
+  return output;
+}
+
+Tensor RunSoftmaxFallback(const Node& node, ExecutionContext& context) {
+  const auto& input = RequireTensor(context, node.inputs.at(0));
+  const auto& input_data = RequireFloatData(input, "Softmax");
+  const auto axis = static_cast<std::size_t>(
+      NormalizeAxis(ReadIntAttribute(node, "axis", 1), input.shape.size(), "Softmax"));
+
+  std::size_t outer = 1;
+  for (std::size_t i = 0; i < axis; ++i) {
+    outer *= static_cast<std::size_t>(input.shape[i]);
+  }
+  const auto axis_dim = static_cast<std::size_t>(input.shape[axis]);
+  std::size_t inner = 1;
+  for (std::size_t i = axis + 1; i < input.shape.size(); ++i) {
+    inner *= static_cast<std::size_t>(input.shape[i]);
+  }
+
+  auto output = MakeOutputLikeWithReusedStorage(node.outputs.at(0), input, context);
+  for (std::size_t outer_index = 0; outer_index < outer; ++outer_index) {
+    for (std::size_t inner_index = 0; inner_index < inner; ++inner_index) {
+      const auto row_base = (outer_index * axis_dim) * inner + inner_index;
+      float max_value = -std::numeric_limits<float>::infinity();
+      for (std::size_t axis_index = 0; axis_index < axis_dim; ++axis_index) {
+        const auto offset = row_base + axis_index * inner;
+        max_value = std::max(max_value, input_data[offset]);
+      }
+
+      float sum = 0.0f;
+      for (std::size_t axis_index = 0; axis_index < axis_dim; ++axis_index) {
+        const auto offset = row_base + axis_index * inner;
+        const auto value = std::exp(input_data[offset] - max_value);
+        output.float_data[offset] = value;
+        sum += value;
+      }
+
+      for (std::size_t axis_index = 0; axis_index < axis_dim; ++axis_index) {
+        const auto offset = row_base + axis_index * inner;
+        output.float_data[offset] /= sum;
+      }
+    }
+  }
+  return output;
+}
+
+Tensor RunCastFallback(const Node& node, ExecutionContext& context) {
+  const auto& input = RequireTensor(context, node.inputs.at(0));
+  const auto to_it = node.attributes.find("to");
+  if (to_it == node.attributes.end()) {
+    throw std::runtime_error("Cast missing to attribute");
+  }
+
+  const auto to_type = to_it->second.int_value;
+  if (to_type == 1) {
+    auto output = MakeFloatOutput(node.outputs.at(0), input.shape, context);
+    if (input.dtype == "float32") {
+      const auto& input_data = RequireFloatData(input, "Cast");
+      std::copy(input_data.begin(), input_data.end(), output.float_data.begin());
+    } else if (input.dtype == "int64") {
+      const auto& input_data = RequireInt64Data(input, "Cast");
+      for (std::size_t i = 0; i < input_data.size(); ++i) {
+        output.float_data[i] = static_cast<float>(input_data[i]);
+      }
+    } else {
+      throw std::runtime_error("Cast to float32 currently supports int64/float32 only");
+    }
+    return output;
+  }
+
+  if (to_type == 7 || to_type == 6) {
+    auto output = MakeInt64Output(node.outputs.at(0), input.shape, context);
+    if (input.dtype == "int64") {
+      const auto& input_data = RequireInt64Data(input, "Cast");
+      std::copy(input_data.begin(), input_data.end(), output.int64_data.begin());
+    } else if (input.dtype == "float32") {
+      const auto& input_data = RequireFloatData(input, "Cast");
+      for (std::size_t i = 0; i < input_data.size(); ++i) {
+        output.int64_data[i] = static_cast<std::int64_t>(input_data[i]);
+      }
+    } else {
+      throw std::runtime_error("Cast to int64 currently supports int64/float32 only");
+    }
+    return output;
+  }
+
+  if (to_type == 9) {
+    auto output = MakeInt64Output(node.outputs.at(0), input.shape, context);
+    if (input.dtype == "int64") {
+      const auto& input_data = RequireInt64Data(input, "Cast");
+      for (std::size_t i = 0; i < input_data.size(); ++i) {
+        output.int64_data[i] = input_data[i] != 0 ? 1 : 0;
+      }
+    } else if (input.dtype == "float32") {
+      const auto& input_data = RequireFloatData(input, "Cast");
+      for (std::size_t i = 0; i < input_data.size(); ++i) {
+        output.int64_data[i] = input_data[i] != 0.0f ? 1 : 0;
+      }
+    } else {
+      throw std::runtime_error("Cast to bool currently supports int64/float32 only");
+    }
+    return output;
+  }
+
+  throw std::runtime_error("Cast currently supports only float32/int32/int64/bool outputs");
+}
+
+Tensor RunCudaCast(const Node& node, ExecutionContext& context) {
+  auto* input = context.FindTensor(node.inputs.at(0));
+  if (input == nullptr) {
+    throw std::runtime_error("missing Cast input");
+  }
+  const auto to_it = node.attributes.find("to");
+  if (to_it == node.attributes.end()) {
+    throw std::runtime_error("Cast missing to attribute");
+  }
+
+  const auto to_type = to_it->second.int_value;
+  if (to_type != 1 || input->dtype != "float32") {
+    throw std::runtime_error("CUDA Cast currently supports float32 identity only");
+  }
+
+  Tensor output;
+  output.name = node.outputs.at(0);
+  output.dtype = "float32";
+  output.shape = input->shape;
+  output.is_placeholder = false;
+  output.float_data = input->float_data;
+  output.cuda_data = input->cuda_data;
+  output.cuda_bytes = input->cuda_bytes;
+  return output;
+}
+
+Tensor RunWhereFallback(const Node& node, ExecutionContext& context) {
+  const auto& condition = RequireTensor(context, node.inputs.at(0));
+  const auto& x = RequireTensor(context, node.inputs.at(1));
+  const auto& y = RequireTensor(context, node.inputs.at(2));
+  const auto output_shape = ComputeBroadcastShape(ComputeBroadcastShape(condition.shape, x.shape, "Where"),
+                                                  y.shape, "Where");
+  const auto output_strides = ComputeStrides(output_shape);
+  const auto condition_strides = ComputeStrides(condition.shape);
+  const auto x_strides = ComputeStrides(x.shape);
+  const auto y_strides = ComputeStrides(y.shape);
+  const auto element_count = GetElementCount(output_shape);
+
+  const auto* condition_int64_data = condition.dtype == "int64" ? &RequireInt64Data(condition, "Where") : nullptr;
+  const auto* condition_float_data = condition.dtype == "float32" ? &RequireFloatData(condition, "Where") : nullptr;
+  const auto read_condition = [&](std::size_t offset) {
+    if (condition_int64_data != nullptr) {
+      return (*condition_int64_data)[offset] != 0;
+    }
+    if (condition_float_data != nullptr) {
+      return (*condition_float_data)[offset] != 0.0f;
+    }
+    throw std::runtime_error("Where condition currently supports int64/float32 only");
+  };
+
+  if (x.dtype == "int64" && y.dtype == "int64") {
+    auto output = MakeInt64Output(node.outputs.at(0), output_shape, context);
+    const auto& x_data = RequireInt64Data(x, "Where");
+    const auto& y_data = RequireInt64Data(y, "Where");
+    for (std::size_t i = 0; i < element_count; ++i) {
+      const auto output_index = UnravelIndex(i, output_shape, output_strides);
+      const auto cond_offset = ComputeBroadcastOffset(output_index, condition.shape, condition_strides);
+      const auto x_offset = ComputeBroadcastOffset(output_index, x.shape, x_strides);
+      const auto y_offset = ComputeBroadcastOffset(output_index, y.shape, y_strides);
+      output.int64_data[i] = read_condition(cond_offset) ? x_data[x_offset] : y_data[y_offset];
+    }
+    return output;
+  }
+
+  const auto* x_float_data = x.dtype == "float32" ? &RequireFloatData(x, "Where") : nullptr;
+  const auto* x_int_data = x.dtype == "int64" ? &RequireInt64Data(x, "Where") : nullptr;
+  const auto* y_float_data = y.dtype == "float32" ? &RequireFloatData(y, "Where") : nullptr;
+  const auto* y_int_data = y.dtype == "int64" ? &RequireInt64Data(y, "Where") : nullptr;
+  auto output = MakeFloatOutput(node.outputs.at(0), output_shape, context);
+  const auto read_x = [&](std::size_t offset) {
+    return x_float_data != nullptr ? (*x_float_data)[offset] : static_cast<float>((*x_int_data)[offset]);
+  };
+  const auto read_y = [&](std::size_t offset) {
+    return y_float_data != nullptr ? (*y_float_data)[offset] : static_cast<float>((*y_int_data)[offset]);
+  };
+  for (std::size_t i = 0; i < element_count; ++i) {
+    const auto output_index = UnravelIndex(i, output_shape, output_strides);
+    const auto cond_offset = ComputeBroadcastOffset(output_index, condition.shape, condition_strides);
+    const auto x_offset = ComputeBroadcastOffset(output_index, x.shape, x_strides);
+    const auto y_offset = ComputeBroadcastOffset(output_index, y.shape, y_strides);
+    output.float_data[i] = read_condition(cond_offset) ? read_x(x_offset) : read_y(y_offset);
+  }
+  return output;
+}
+
+std::vector<std::int64_t> PadShapeForBroadcast(const std::vector<std::int64_t>& shape, std::size_t rank) {
+  if (shape.size() > rank) {
+    throw std::runtime_error("broadcast rank mismatch");
+  }
+  std::vector<std::int64_t> padded(rank, 1);
+  std::copy(shape.begin(), shape.end(), padded.begin() + static_cast<std::ptrdiff_t>(rank - shape.size()));
+  return padded;
+}
+
+std::vector<std::int64_t> PadStridesForBroadcast(const std::vector<std::int64_t>& shape,
+                                                 const std::vector<std::size_t>& strides, std::size_t rank) {
+  if (shape.size() > rank || strides.size() != shape.size()) {
+    throw std::runtime_error("broadcast stride rank mismatch");
+  }
+  std::vector<std::int64_t> padded(rank, 0);
+  for (std::size_t i = 0; i < shape.size(); ++i) {
+    const auto target = rank - shape.size() + i;
+    padded[target] = shape[i] == 1 ? 0 : static_cast<std::int64_t>(strides[i]);
+  }
+  return padded;
+}
+
+Tensor RunCudaWhere(const Node& node, ExecutionContext& context) {
+  auto* condition = context.FindTensor(node.inputs.at(0));
+  auto* x = context.FindTensor(node.inputs.at(1));
+  auto* y = context.FindTensor(node.inputs.at(2));
+  if (condition == nullptr || x == nullptr || y == nullptr) {
+    throw std::runtime_error("missing Where input");
+  }
+  if (condition->dtype != "int64" || x->dtype != "float32" || y->dtype != "float32") {
+    throw std::runtime_error("CUDA Where currently supports int64 condition with float32 branches only");
+  }
+
+  const auto output_shape =
+      ComputeBroadcastShape(ComputeBroadcastShape(condition->shape, x->shape, "Where"), y->shape, "Where");
+  const auto rank = output_shape.size();
+  if (rank == 0 || rank > 8) {
+    throw std::runtime_error("CUDA Where currently supports rank 1..8 tensors");
+  }
+  for (const auto dim : output_shape) {
+    if (dim < 0) {
+      throw std::runtime_error("CUDA Where requires concrete non-negative dimensions");
+    }
+  }
+
+  const auto& condition_data = RequireInt64Data(*condition, "CUDA Where");
+  auto output = MakeCudaFloatOutput(node.outputs.at(0), output_shape);
+  const auto element_count = GetElementCount(output_shape);
+  DeviceBuffer output_device(element_count * sizeof(float));
+  if (element_count == 0) {
+    BindCudaFloatOutput(output, std::move(output_device));
+    return output;
+  }
+
+  DeviceBuffer condition_device(condition_data.size() * sizeof(std::int64_t));
+  CheckCuda(cudaMemcpy(condition_device.data(), condition_data.data(), condition_data.size() * sizeof(std::int64_t),
+                       cudaMemcpyHostToDevice),
+            "cudaMemcpy H2D Where condition");
+
+  const auto output_strides_size_t = ComputeStrides(output_shape);
+  const auto condition_strides = ComputeStrides(condition->shape);
+  const auto x_strides = ComputeStrides(x->shape);
+  const auto y_strides = ComputeStrides(y->shape);
+  std::vector<std::int64_t> output_strides(rank);
+  std::transform(output_strides_size_t.begin(), output_strides_size_t.end(), output_strides.begin(),
+                 [](std::size_t value) { return static_cast<std::int64_t>(value); });
+  const auto condition_shape = PadShapeForBroadcast(condition->shape, rank);
+  const auto x_shape = PadShapeForBroadcast(x->shape, rank);
+  const auto y_shape = PadShapeForBroadcast(y->shape, rank);
+  const auto condition_padded_strides = PadStridesForBroadcast(condition->shape, condition_strides, rank);
+  const auto x_padded_strides = PadStridesForBroadcast(x->shape, x_strides, rank);
+  const auto y_padded_strides = PadStridesForBroadcast(y->shape, y_strides, rank);
+
+  std::vector<std::int64_t> metadata;
+  metadata.reserve(rank * 7);
+  metadata.insert(metadata.end(), output_strides.begin(), output_strides.end());
+  metadata.insert(metadata.end(), condition_shape.begin(), condition_shape.end());
+  metadata.insert(metadata.end(), condition_padded_strides.begin(), condition_padded_strides.end());
+  metadata.insert(metadata.end(), x_shape.begin(), x_shape.end());
+  metadata.insert(metadata.end(), x_padded_strides.begin(), x_padded_strides.end());
+  metadata.insert(metadata.end(), y_shape.begin(), y_shape.end());
+  metadata.insert(metadata.end(), y_padded_strides.begin(), y_padded_strides.end());
+
+  DeviceBuffer metadata_device(metadata.size() * sizeof(std::int64_t));
+  CheckCuda(cudaMemcpy(metadata_device.data(), metadata.data(), metadata.size() * sizeof(std::int64_t),
+                       cudaMemcpyHostToDevice),
+            "cudaMemcpy H2D Where metadata");
+  const auto* metadata_ptr = static_cast<const std::int64_t*>(metadata_device.data());
+  CheckCuda(LaunchCudaWhereFloatInt64Cond(
+                static_cast<const std::int64_t*>(condition_device.data()), CudaFloatData(*x, "CUDA Where x"),
+                CudaFloatData(*y, "CUDA Where y"), static_cast<float*>(output_device.data()), element_count, rank,
+                metadata_ptr, metadata_ptr + rank, metadata_ptr + rank * 2, metadata_ptr + rank * 3,
+                metadata_ptr + rank * 4, metadata_ptr + rank * 5, metadata_ptr + rank * 6),
+            "Where kernel launch");
+  BindCudaFloatOutput(output, std::move(output_device));
+  return output;
+}
+
+Tensor RunCudaSoftmax(const Node& node, ExecutionContext& context) {
+  auto* input = context.FindTensor(node.inputs.at(0));
+  if (input == nullptr) {
+    throw std::runtime_error("missing Softmax input");
+  }
+  if (input->dtype != "float32") {
+    throw std::runtime_error("CUDA Softmax currently supports float32 only");
+  }
+  if (input->shape.empty()) {
+    throw std::runtime_error("CUDA Softmax requires rank >= 1");
+  }
+  for (const auto dim : input->shape) {
+    if (dim < 0) {
+      throw std::runtime_error("CUDA Softmax requires concrete non-negative dimensions");
+    }
+  }
+
+  const auto axis = static_cast<std::size_t>(
+      NormalizeAxis(ReadIntAttribute(node, "axis", 1), input->shape.size(), "Softmax"));
+  std::size_t outer = 1;
+  for (std::size_t i = 0; i < axis; ++i) {
+    outer *= static_cast<std::size_t>(input->shape[i]);
+  }
+  const auto axis_dim = static_cast<std::size_t>(input->shape[axis]);
+  std::size_t inner = 1;
+  for (std::size_t i = axis + 1; i < input->shape.size(); ++i) {
+    inner *= static_cast<std::size_t>(input->shape[i]);
+  }
+
+  auto output = MakeCudaFloatOutput(node.outputs.at(0), input->shape);
+  DeviceBuffer output_device(GetElementCount(output.shape) * sizeof(float));
+  CheckCuda(LaunchCudaSoftmaxFloat(CudaFloatData(*input, "CUDA Softmax"),
+                                   static_cast<float*>(output_device.data()), outer * inner, axis_dim, inner),
+            "Softmax kernel launch");
+  BindCudaFloatOutput(output, std::move(output_device));
   return output;
 }
 
@@ -1600,9 +2175,12 @@ void CudaExecutionProvider::RegisterKernels(KernelRegistry& registry) const {
   });
 
   registry.Register("MatMul", [](const Node& node, ExecutionContext& context, std::ostream* trace) {
-    const auto& lhs = RequireTensor(context, node.inputs.at(0));
-    const auto& rhs = RequireTensor(context, node.inputs.at(1));
-    auto output = RunCudaMatMul(node, lhs, rhs, context);
+    auto* lhs = context.FindTensor(node.inputs.at(0));
+    auto* rhs = context.FindTensor(node.inputs.at(1));
+    if (lhs == nullptr || rhs == nullptr) {
+      throw std::runtime_error("missing MatMul input");
+    }
+    auto output = RunCudaMatMul(node, *lhs, *rhs, context);
     context.BindTensor(std::move(output));
     if (trace != nullptr) {
       *trace << "    kernel MatMul produced " << node.outputs.at(0) << " via CUDA\n";
@@ -1645,16 +2223,36 @@ void CudaExecutionProvider::RegisterKernels(KernelRegistry& registry) const {
   });
 
   registry.Register("Gemm", [](const Node& node, ExecutionContext& context, std::ostream* trace) {
-    const auto& a = RequireTensor(context, node.inputs.at(0));
-    const auto& b = RequireTensor(context, node.inputs.at(1));
-    const Tensor* c = nullptr;
-    if (node.inputs.size() > 2 && !node.inputs.at(2).empty()) {
-      c = &RequireTensor(context, node.inputs.at(2));
+    auto* a = context.FindTensor(node.inputs.at(0));
+    auto* b = context.FindTensor(node.inputs.at(1));
+    if (a == nullptr || b == nullptr) {
+      throw std::runtime_error("missing Gemm input");
     }
-    auto output = RunCudaGemm(node, a, b, c, context);
+    Tensor* c = nullptr;
+    if (node.inputs.size() > 2 && !node.inputs.at(2).empty()) {
+      c = context.FindTensor(node.inputs.at(2));
+      if (c == nullptr) {
+        throw std::runtime_error("missing Gemm bias input");
+      }
+    }
+    auto output = RunCudaGemm(node, *a, *b, c, context);
     context.BindTensor(std::move(output));
     if (trace != nullptr) {
       *trace << "    kernel Gemm produced " << node.outputs.at(0) << " via CUDA\n";
+    }
+  });
+
+  registry.Register("LayerNormalization", [](const Node& node, ExecutionContext& context, std::ostream* trace) {
+    auto* input = context.FindTensor(node.inputs.at(0));
+    auto* scale = context.FindTensor(node.inputs.at(1));
+    auto* bias = context.FindTensor(node.inputs.at(2));
+    if (input == nullptr || scale == nullptr || bias == nullptr) {
+      throw std::runtime_error("missing LayerNormalization input");
+    }
+    auto output = RunCudaLayerNormalization(node, *input, *scale, *bias);
+    context.BindTensor(std::move(output));
+    if (trace != nullptr) {
+      *trace << "    kernel LayerNormalization produced " << node.outputs.at(0) << " via CUDA\n";
     }
   });
 
@@ -1681,6 +2279,98 @@ void CudaExecutionProvider::RegisterKernels(KernelRegistry& registry) const {
     context.BindTensor(std::move(output));
     if (trace != nullptr) {
       *trace << "    kernel Reshape produced " << node.outputs.at(0) << " via CUDA\n";
+    }
+  });
+
+  registry.Register("Transpose", [](const Node& node, ExecutionContext& context, std::ostream* trace) {
+    Tensor output;
+    try {
+      output = RunCudaTranspose(node, context);
+    } catch (const CudaError& ex) {
+      MaterializeCudaTensor(node.inputs.at(0), context);
+      output = RunTransposeFallback(node, context);
+      if (trace != nullptr) {
+        *trace << "    kernel Transpose fell back to CPU reason=" << ex.what() << "\n";
+      }
+    } catch (const std::exception& ex) {
+      MaterializeCudaTensor(node.inputs.at(0), context);
+      output = RunTransposeFallback(node, context);
+      if (trace != nullptr) {
+        *trace << "    kernel Transpose fell back to CPU reason=" << ex.what() << "\n";
+      }
+    }
+    context.BindTensor(std::move(output));
+    if (trace != nullptr) {
+      *trace << "    kernel Transpose produced " << node.outputs.at(0) << " via CUDA\n";
+    }
+  });
+
+  registry.Register("Cast", [](const Node& node, ExecutionContext& context, std::ostream* trace) {
+    Tensor output;
+    try {
+      output = RunCudaCast(node, context);
+    } catch (const CudaError& ex) {
+      MaterializeCudaTensor(node.inputs.at(0), context);
+      output = RunCastFallback(node, context);
+      if (trace != nullptr) {
+        *trace << "    kernel Cast fell back to CPU reason=" << ex.what() << "\n";
+      }
+    } catch (const std::exception& ex) {
+      MaterializeCudaTensor(node.inputs.at(0), context);
+      output = RunCastFallback(node, context);
+      if (trace != nullptr) {
+        *trace << "    kernel Cast fell back to CPU reason=" << ex.what() << "\n";
+      }
+    }
+    context.BindTensor(std::move(output));
+    if (trace != nullptr) {
+      *trace << "    kernel Cast produced " << node.outputs.at(0) << " via CUDA\n";
+    }
+  });
+
+  registry.Register("Where", [](const Node& node, ExecutionContext& context, std::ostream* trace) {
+    Tensor output;
+    try {
+      output = RunCudaWhere(node, context);
+    } catch (const CudaError& ex) {
+      MaterializeCudaInputsForNode(node, context);
+      output = RunWhereFallback(node, context);
+      if (trace != nullptr) {
+        *trace << "    kernel Where fell back to CPU reason=" << ex.what() << "\n";
+      }
+    } catch (const std::exception& ex) {
+      MaterializeCudaInputsForNode(node, context);
+      output = RunWhereFallback(node, context);
+      if (trace != nullptr) {
+        *trace << "    kernel Where fell back to CPU reason=" << ex.what() << "\n";
+      }
+    }
+    context.BindTensor(std::move(output));
+    if (trace != nullptr) {
+      *trace << "    kernel Where produced " << node.outputs.at(0) << " via CUDA\n";
+    }
+  });
+
+  registry.Register("Softmax", [](const Node& node, ExecutionContext& context, std::ostream* trace) {
+    Tensor output;
+    try {
+      output = RunCudaSoftmax(node, context);
+    } catch (const CudaError& ex) {
+      MaterializeCudaTensor(node.inputs.at(0), context);
+      output = RunSoftmaxFallback(node, context);
+      if (trace != nullptr) {
+        *trace << "    kernel Softmax fell back to CPU reason=" << ex.what() << "\n";
+      }
+    } catch (const std::exception& ex) {
+      MaterializeCudaTensor(node.inputs.at(0), context);
+      output = RunSoftmaxFallback(node, context);
+      if (trace != nullptr) {
+        *trace << "    kernel Softmax fell back to CPU reason=" << ex.what() << "\n";
+      }
+    }
+    context.BindTensor(std::move(output));
+    if (trace != nullptr) {
+      *trace << "    kernel Softmax produced " << node.outputs.at(0) << " via CUDA\n";
     }
   });
 
