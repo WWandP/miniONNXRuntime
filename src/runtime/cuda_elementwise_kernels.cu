@@ -164,6 +164,18 @@ __global__ void AddChannelBias2DKernel(float* output, const float* bias, std::si
   output[index] += bias[channel];
 }
 
+__global__ void AddChannelBiasSiLU2DKernel(float* output, const float* bias, std::size_t n, std::size_t c,
+                                           std::size_t h, std::size_t w) {
+  const auto index = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  const auto total = n * c * h * w;
+  if (index >= total) {
+    return;
+  }
+  const auto channel = (index / (h * w)) % c;
+  const float value = output[index] + bias[channel];
+  output[index] = value * (1.0f / (1.0f + expf(-value)));
+}
+
 __global__ void AddGemmBiasKernel(float* output, const float* bias, std::size_t m, std::size_t n,
                                   CudaGemmBiasKind kind, float scale) {
   const auto index = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
@@ -606,6 +618,16 @@ cudaError_t LaunchCudaAddChannelBias2D(float* output, const float* bias, std::si
     return cudaSuccess;
   }
   AddChannelBias2DKernel<<<BlockCount(count), kThreadsPerBlock>>>(output, bias, n, c, h, w);
+  return cudaGetLastError();
+}
+
+cudaError_t LaunchCudaAddChannelBiasSiLU2D(float* output, const float* bias, std::size_t n, std::size_t c,
+                                           std::size_t h, std::size_t w) {
+  const auto count = n * c * h * w;
+  if (count == 0) {
+    return cudaSuccess;
+  }
+  AddChannelBiasSiLU2DKernel<<<BlockCount(count), kThreadsPerBlock>>>(output, bias, n, c, h, w);
   return cudaGetLastError();
 }
 

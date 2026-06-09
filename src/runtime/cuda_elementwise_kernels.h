@@ -51,6 +51,8 @@ cudaError_t LaunchCudaResizeNearest2D(const float* input, float* output, std::si
                                       float scale_h, float scale_w);
 cudaError_t LaunchCudaAddChannelBias2D(float* output, const float* bias, std::size_t n, std::size_t c,
                                        std::size_t h, std::size_t w);
+cudaError_t LaunchCudaAddChannelBiasSiLU2D(float* output, const float* bias, std::size_t n, std::size_t c,
+                                           std::size_t h, std::size_t w);
 cudaError_t LaunchCudaAddGemmBias(float* output, const float* bias, std::size_t m, std::size_t n,
                                   CudaGemmBiasKind kind, float scale);
 cudaError_t LaunchCudaTransposeFloat(const float* input, float* output, std::size_t count, std::size_t rank,

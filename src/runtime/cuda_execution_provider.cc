@@ -454,10 +454,31 @@ class CudnnConvolutionDescriptor {
   CudnnConvolutionDescriptor(const CudnnConvolutionDescriptor&) = delete;
   CudnnConvolutionDescriptor& operator=(const CudnnConvolutionDescriptor&) = delete;
 
-  cudnnConvolutionDescriptor_t get() const { return descriptor_; }
+ cudnnConvolutionDescriptor_t get() const { return descriptor_; }
 
  private:
   cudnnConvolutionDescriptor_t descriptor_{nullptr};
+};
+
+class CudnnActivationDescriptor {
+ public:
+  CudnnActivationDescriptor() {
+    CheckCudnn(cudnnCreateActivationDescriptor(&descriptor_), "cudnnCreateActivationDescriptor");
+  }
+
+  ~CudnnActivationDescriptor() {
+    if (descriptor_ != nullptr) {
+      (void)cudnnDestroyActivationDescriptor(descriptor_);
+    }
+  }
+
+  CudnnActivationDescriptor(const CudnnActivationDescriptor&) = delete;
+  CudnnActivationDescriptor& operator=(const CudnnActivationDescriptor&) = delete;
+
+  cudnnActivationDescriptor_t get() const { return descriptor_; }
+
+ private:
+  cudnnActivationDescriptor_t descriptor_{nullptr};
 };
 #endif
 
@@ -881,7 +902,7 @@ Tensor RunCudaLayerNormalization(const Node& node, Tensor& input, Tensor& scale,
 
 #ifdef MINIORT_BUILD_CUDNN
 Tensor RunCudnnConv2D(const Node& node, Tensor& input, Tensor& weight, Tensor* bias,
-                      const Conv2DParams& params, ExecutionContext& context) {
+                      const Conv2DParams& params, ExecutionContext& context, bool apply_silu = false) {
   if (params.pad_top != params.pad_bottom || params.pad_left != params.pad_right) {
     throw CudaError("cuDNN Conv only handles symmetric padding in this path");
   }
@@ -897,7 +918,9 @@ Tensor RunCudnnConv2D(const Node& node, Tensor& input, Tensor& weight, Tensor* b
   CudnnTensorDescriptor input_desc;
   CudnnFilterDescriptor weight_desc;
   CudnnTensorDescriptor output_desc;
+  CudnnTensorDescriptor bias_desc;
   CudnnConvolutionDescriptor conv_desc;
+  CudnnActivationDescriptor activation_desc;
   const auto handle = GetCudnnHandle();
 
   CheckCudnn(cudnnSetTensor4dDescriptor(input_desc.get(), CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT,
@@ -912,6 +935,9 @@ Tensor RunCudnnConv2D(const Node& node, Tensor& input, Tensor& weight, Tensor* b
                                         static_cast<int>(params.n), static_cast<int>(params.c_out),
                                         static_cast<int>(params.h_out), static_cast<int>(params.w_out)),
              "cudnnSetTensor4dDescriptor output");
+  CheckCudnn(cudnnSetTensor4dDescriptor(bias_desc.get(), CUDNN_TENSOR_NCHW, CUDNN_DATA_FLOAT, 1,
+                                        static_cast<int>(params.c_out), 1, 1),
+             "cudnnSetTensor4dDescriptor bias");
   CheckCudnn(cudnnSetConvolution2dDescriptor(conv_desc.get(), static_cast<int>(params.pad_top),
                                              static_cast<int>(params.pad_left), static_cast<int>(params.stride_h),
                                              static_cast<int>(params.stride_w), static_cast<int>(params.dilation_h),
@@ -920,6 +946,14 @@ Tensor RunCudnnConv2D(const Node& node, Tensor& input, Tensor& weight, Tensor* b
              "cudnnSetConvolution2dDescriptor");
   CheckCudnn(cudnnSetConvolutionMathType(conv_desc.get(), CUDNN_DEFAULT_MATH),
              "cudnnSetConvolutionMathType");
+  CheckCudnn(cudnnSetActivationDescriptor(activation_desc.get(),
+                                          apply_silu ? CUDNN_ACTIVATION_SWISH : CUDNN_ACTIVATION_IDENTITY,
+                                          CUDNN_NOT_PROPAGATE_NAN, 0.0),
+             "cudnnSetActivationDescriptor");
+  if (apply_silu) {
+    CheckCudnn(cudnnSetActivationDescriptorSwishBeta(activation_desc.get(), 1.0),
+               "cudnnSetActivationDescriptorSwishBeta");
+  }
 
   const auto plan =
       GetOrCreateCudnnConvPlan(handle, input_desc, weight_desc, conv_desc, output_desc, params);
@@ -927,17 +961,27 @@ Tensor RunCudnnConv2D(const Node& node, Tensor& input, Tensor& weight, Tensor* b
 
   const float alpha = 1.0f;
   const float beta = 0.0f;
-  CheckCudnn(cudnnConvolutionForward(handle, &alpha, input_desc.get(), CudaFloatData(input, "cuDNN Conv"),
-                                     weight_desc.get(), CudaFloatData(weight, "cuDNN Conv"), conv_desc.get(),
-                                     plan.algorithm, workspace.data(),
-                                     plan.workspace_size, &beta, output_desc.get(), output_device.data()),
-             "cudnnConvolutionForward");
-
+  const float alpha2 = 0.0f;
   if (bias != nullptr) {
-    CheckCuda(LaunchCudaAddChannelBias2D(static_cast<float*>(output_device.data()), CudaFloatData(*bias, "cuDNN Conv"),
-                                         params.n, params.c_out, static_cast<std::size_t>(params.h_out),
-                                         static_cast<std::size_t>(params.w_out)),
-              "Conv bias kernel launch");
+    CheckCudnn(cudnnConvolutionBiasActivationForward(
+                   handle, &alpha, input_desc.get(), CudaFloatData(input, "cuDNN Conv"), weight_desc.get(),
+                   CudaFloatData(weight, "cuDNN Conv"), conv_desc.get(), plan.algorithm, workspace.data(),
+                   plan.workspace_size, &alpha2, output_desc.get(), output_device.data(), bias_desc.get(),
+                   CudaFloatData(*bias, "cuDNN Conv"), activation_desc.get(), output_desc.get(),
+                   output_device.data()),
+               apply_silu ? "cudnnConvolutionBiasActivationForward ConvSiLU"
+                          : "cudnnConvolutionBiasActivationForward Conv");
+  } else {
+    CheckCudnn(cudnnConvolutionForward(handle, &alpha, input_desc.get(), CudaFloatData(input, "cuDNN Conv"),
+                                       weight_desc.get(), CudaFloatData(weight, "cuDNN Conv"), conv_desc.get(),
+                                       plan.algorithm, workspace.data(), plan.workspace_size, &beta, output_desc.get(),
+                                       output_device.data()),
+               "cudnnConvolutionForward");
+    if (apply_silu) {
+      CheckCudnn(cudnnActivationForward(handle, activation_desc.get(), &alpha, output_desc.get(), output_device.data(),
+                                        &beta, output_desc.get(), output_device.data()),
+                 "cudnnActivationForward ConvSiLU");
+    }
   }
   output.float_data.clear();
   BindCudaFloatOutput(output, std::move(output_device));
@@ -947,11 +991,13 @@ Tensor RunCudnnConv2D(const Node& node, Tensor& input, Tensor& weight, Tensor* b
 #endif
 
 Tensor RunCudaConv2DIm2Col(const Node& node, Tensor& input, Tensor& weight, Tensor* bias,
-                           const Conv2DParams& params, ExecutionContext& context) {
-  auto output = MakeFloatOutput(node.outputs.at(0),
-                                {static_cast<std::int64_t>(params.n), static_cast<std::int64_t>(params.c_out),
-                                 params.h_out, params.w_out},
-                                context);
+                           const Conv2DParams& params, ExecutionContext& context, bool apply_silu = false) {
+  const std::vector<std::int64_t> output_shape = {static_cast<std::int64_t>(params.n),
+                                                  static_cast<std::int64_t>(params.c_out),
+                                                  params.h_out,
+                                                  params.w_out};
+  auto output = params.n == 1 ? MakeCudaFloatOutput(node.outputs.at(0), output_shape)
+                              : MakeFloatOutput(node.outputs.at(0), output_shape, context);
 
   const auto input_hw = params.h_in * params.w_in;
   const auto output_hw = static_cast<std::size_t>(params.h_out) * static_cast<std::size_t>(params.w_out);
@@ -967,7 +1013,8 @@ Tensor RunCudaConv2DIm2Col(const Node& node, Tensor& input, Tensor& weight, Tens
   for (std::size_t batch = 0; batch < params.n; ++batch) {
     const auto* batch_input =
         CudaFloatData(input, "CUDA Conv") + batch * params.c_in * input_hw;
-    auto* batch_output = output.float_data.data() + batch * params.c_out * output_hw;
+    auto* batch_output =
+        params.n == 1 ? nullptr : output.float_data.data() + batch * params.c_out * output_hw;
 
     CheckCuda(LaunchCudaIm2Col2D(batch_input, static_cast<float*>(columns_device.data()), params.c_in, params.h_in,
                                  params.w_in, static_cast<std::size_t>(params.h_out),
@@ -984,10 +1031,18 @@ Tensor RunCudaConv2DIm2Col(const Node& node, Tensor& input, Tensor& weight, Tens
                 "cublasSgemm Conv");
 
     if (bias != nullptr && params.n == 1) {
-      CheckCuda(LaunchCudaAddChannelBias2D(static_cast<float*>(output_device.data()), CudaFloatData(*bias, "CUDA Conv"),
-                                           1, params.c_out, static_cast<std::size_t>(params.h_out),
-                                           static_cast<std::size_t>(params.w_out)),
-                "Conv bias kernel launch");
+      if (apply_silu) {
+        CheckCuda(LaunchCudaAddChannelBiasSiLU2D(static_cast<float*>(output_device.data()),
+                                                 CudaFloatData(*bias, "CUDA Conv"), 1, params.c_out,
+                                                 static_cast<std::size_t>(params.h_out),
+                                                 static_cast<std::size_t>(params.w_out)),
+                  "ConvSiLU bias+activation kernel launch");
+      } else {
+        CheckCuda(LaunchCudaAddChannelBias2D(static_cast<float*>(output_device.data()), CudaFloatData(*bias, "CUDA Conv"),
+                                             1, params.c_out, static_cast<std::size_t>(params.h_out),
+                                             static_cast<std::size_t>(params.w_out)),
+                  "Conv bias kernel launch");
+      }
     }
 
     if (params.n != 1) {
@@ -1002,14 +1057,14 @@ Tensor RunCudaConv2DIm2Col(const Node& node, Tensor& input, Tensor& weight, Tens
         const float bias_value = bias_data[oc];
         auto* output_plane = batch_output + oc * output_hw;
         for (std::size_t i = 0; i < output_hw; ++i) {
-          output_plane[i] += bias_value;
+          const float value = output_plane[i] + bias_value;
+          output_plane[i] = apply_silu ? value * (1.0f / (1.0f + std::exp(-value))) : value;
         }
       }
     }
   }
 
   if (params.n == 1) {
-    output.float_data.clear();
     BindCudaFloatOutput(output, std::move(output_device));
   }
 
@@ -1017,7 +1072,7 @@ Tensor RunCudaConv2DIm2Col(const Node& node, Tensor& input, Tensor& weight, Tens
 }
 
 Tensor RunCudaConv2D(const Node& node, const Tensor& input, const Tensor& weight, Tensor* bias,
-                     ExecutionContext& context) {
+                     ExecutionContext& context, bool apply_silu = false) {
   auto* input_tensor = context.FindTensor(node.inputs.at(0));
   auto* weight_tensor = context.FindTensor(node.inputs.at(1));
   if (input_tensor == nullptr || weight_tensor == nullptr) {
@@ -1026,11 +1081,25 @@ Tensor RunCudaConv2D(const Node& node, const Tensor& input, const Tensor& weight
   const auto params = ResolveConv2DParams(node, *input_tensor, *weight_tensor, bias);
 #ifdef MINIORT_BUILD_CUDNN
   try {
-    return RunCudnnConv2D(node, *input_tensor, *weight_tensor, bias, params, context);
+    return RunCudnnConv2D(node, *input_tensor, *weight_tensor, bias, params, context, apply_silu);
   } catch (const CudaError&) {
   }
 #endif
-  return RunCudaConv2DIm2Col(node, *input_tensor, *weight_tensor, bias, params, context);
+  return RunCudaConv2DIm2Col(node, *input_tensor, *weight_tensor, bias, params, context, apply_silu);
+}
+
+Tensor RunCudaConv2DSiLU(const Node& node, const Tensor& input, const Tensor& weight, Tensor* bias,
+                         ExecutionContext& context) {
+  if (bias != nullptr) {
+    return RunCudaConv2D(node, input, weight, bias, context, true);
+  }
+  auto output = RunCudaConv2D(node, input, weight, bias, context, false);
+  const auto element_count = GetElementCount(output.shape);
+  CheckCuda(LaunchCudaSiLU(MutableCudaFloatData(output, "CUDA ConvSiLU"),
+                           MutableCudaFloatData(output, "CUDA ConvSiLU"),
+                           element_count),
+            "ConvSiLU SiLU kernel launch");
+  return output;
 }
 
 Tensor RunMaxPoolFallback(const Node& node, const Tensor& input, ExecutionContext& context) {
@@ -2487,6 +2556,24 @@ void CudaExecutionProvider::RegisterKernels(KernelRegistry& registry) const {
     context.BindTensor(std::move(output));
     if (trace != nullptr) {
       *trace << "    kernel Conv produced " << node.outputs.at(0) << " via CUDA\n";
+    }
+  });
+
+  registry.Register("ConvSiLU", [](const Node& node, ExecutionContext& context, std::ostream* trace) {
+    const auto& input = RequireTensor(context, node.inputs.at(0));
+    const auto& weight = RequireTensor(context, node.inputs.at(1));
+    Tensor* bias = nullptr;
+    if (node.inputs.size() > 2 && !node.inputs.at(2).empty()) {
+      bias = context.FindTensor(node.inputs.at(2));
+      if (bias == nullptr) {
+        throw std::runtime_error("missing ConvSiLU bias input");
+      }
+    }
+
+    auto output = RunCudaConv2DSiLU(node, input, weight, bias, context);
+    context.BindTensor(std::move(output));
+    if (trace != nullptr) {
+      *trace << "    kernel ConvSiLU produced " << node.outputs.at(0) << " via CUDA\n";
     }
   });
 
