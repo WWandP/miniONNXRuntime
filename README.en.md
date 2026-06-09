@@ -137,24 +137,22 @@ MINIORT_BUILD_CUDA_EP=ON CMAKE_BUILD_TYPE=Release BUILD_DIR=build_cuda_release \
 
 Without `MINIORT_BUILD_CUDA_EP=ON`, `run_phase.sh` uses the normal CPU/default build.
 
-## 2026-06-09 Current Results
+## Current Results
 
-These numbers were measured locally on the same machine with an NVIDIA GeForce RTX 4090, using the
-`build_cuda_release` build directory. The table uses a unified `mean / p50 latency (ms)` format:
-YOLOv8n is a single image inference, while GPT-2 and Qwen report end-to-end text generation latency
-(prefill + all decode steps), excluding model load time and CUDA initializer prepare time.
-YOLOv8n now supports running the fused `ConvSiLU` graph path on CUDA; the table uses
+These numbers were measured locally on the same machine with an NVIDIA GeForce RTX 4090. YOLOv8n uses
+`mean / p50 latency (ms)`, while GPT-2 and Qwen use `tokens/s`, with generation / prefill latency kept in
+parentheses for context. YOLOv8n now supports running the fused `ConvSiLU` graph path on CUDA; the table uses
 `--optimal` as the default benchmark setup.
 
-| Model / workload | Benchmark args | MiniORT default/CUDA mean / p50 (ms) | MiniORT CPU-only mean / p50 (ms) | ORT CPU mean / p50 (ms) |
-| --- | --- | --- | --- |
-| YOLOv8n | `--optimal` | `4.219 / 4.211` | `84.089 / 82.115` | `33.679 / 36.564` |
-| GPT-2 KV cache | `--optimal` | `312.774 / 316.063` | `1098.070 / 1093.390` | `742.083 / 748.958` |
-| Qwen2.5-0.5B KV cache | `--optimal` | `188.249 / 186.674` | `526.887 / 529.762` | `568.310 / 575.832` |
+| Model / workload | Benchmark args | MiniORT CPU | MiniORT CUDA | ORT CPU | ORT CUDA |
+| --- | --- | --- | --- | --- | --- |
+| YOLOv8n | `--optimal` | `84.089 / 82.115 ms` | `4.219 / 4.211 ms` | `33.679 / 36.564 ms` | `1.86 / 1.86 ms` |
+| GPT-2 KV cache | `--optimal` | `about 27.83 tokens/s` (generation mean `1724.52 ms`, prefill mean `136.64 ms`) | `about 227.40 tokens/s` (generation mean `422.16 ms`, prefill mean `11.13 ms`) | `about 83.46 tokens/s` (generation mean `1150.24 ms`, prefill mean `16.54 ms`) | `about 438.65 tokens/s` (generation mean `218.85 ms`, prefill mean `1.80 ms`) |
+| Qwen2.5-0.5B KV cache | `--optimal` | `about 7.97 tokens/s` (generation mean `1004.04 ms`, prefill mean `110.25 ms`) | `about 61.65 tokens/s` (generation mean `129.77 ms`, prefill mean `15.16 ms`) | `about 15.45 tokens/s` (generation mean `517.85 ms`, prefill mean `52.98 ms`) | `about 171.36 tokens/s` (generation mean `46.68 ms`, prefill mean `4.75 ms`) |
 
 Optimization record:
 
-- [2026-06-06 CUDA optimizations](./docs/optimization_summary.md)
+- [CUDA optimizations](./docs/optimization_summary.md)
 
 ## Learning Path
 
