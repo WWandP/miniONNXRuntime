@@ -144,13 +144,13 @@ These numbers were measured locally on the same machine with an NVIDIA GeForce R
 YOLOv8n is a single image inference, while GPT-2 and Qwen report end-to-end text generation latency
 (prefill + all decode steps), excluding model load time and CUDA initializer prepare time.
 YOLOv8n now supports running the fused `ConvSiLU` graph path on CUDA; the table uses
-`--graph-opt + --planned-memory-reuse` as the default benchmark setup.
+`--optimal` as the default benchmark setup.
 
 | Model / workload | Benchmark args | MiniORT default/CUDA mean / p50 (ms) | MiniORT CPU-only mean / p50 (ms) | ORT CPU mean / p50 (ms) |
 | --- | --- | --- | --- |
-| YOLOv8n | `--image pic/bus.jpg --warmup 3 --repeat 20 --planned-memory-reuse --graph-opt` | `4.219 / 4.211` | `84.089 / 82.115` | `33.679 / 36.564` |
-| GPT-2 KV cache | `--generate 48 --warmup 1 --repeat 5 --graph-opt` | `312.774 / 316.063` | `1098.070 / 1093.390` | `742.083 / 748.958` |
-| Qwen2.5-0.5B KV cache | `--generate 8 --warmup 1 --repeat 5 --graph-opt` | `188.249 / 186.674` | `526.887 / 529.762` | `568.310 / 575.832` |
+| YOLOv8n | `--optimal` | `4.219 / 4.211` | `84.089 / 82.115` | `33.679 / 36.564` |
+| GPT-2 KV cache | `--optimal` | `312.774 / 316.063` | `1098.070 / 1093.390` | `742.083 / 748.958` |
+| Qwen2.5-0.5B KV cache | `--optimal` | `188.249 / 186.674` | `526.887 / 529.762` | `568.310 / 575.832` |
 
 Optimization record:
 

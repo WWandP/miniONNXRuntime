@@ -32,6 +32,7 @@ struct Options {
   bool planned_memory_reuse{false};
   bool graph_opt{false};
   bool profile_op_types{false};
+  bool optimal{false};
 };
 
 struct LatencyStats {
@@ -49,11 +50,19 @@ struct OpProfileEntry {
 
 using OpProfileMap = std::unordered_map<std::string, OpProfileEntry>;
 
+void ApplyOptimalPreset(Options& options) {
+  options.warmup = 3;
+  options.repeat = 20;
+  options.planned_memory_reuse = true;
+  options.evict_dead_tensors = true;
+  options.graph_opt = true;
+}
+
 Options ParseArgs(int argc, char* argv[]) {
   if (argc < 4) {
     throw std::runtime_error(
         "usage: miniort_compare_providers <model.onnx> --image path [--repeat N] [--warmup N] [--allow-missing] "
-        "[--evict-dead-tensors] [--planned-memory-reuse] [--graph-opt] [--profile-op-types]");
+        "[--evict-dead-tensors] [--planned-memory-reuse] [--graph-opt] [--profile-op-types] [--optimal]");
   }
 
   Options options;
@@ -91,6 +100,11 @@ Options ParseArgs(int argc, char* argv[]) {
     }
     if (arg == "--profile-op-types") {
       options.profile_op_types = true;
+      continue;
+    }
+    if (arg == "--optimal") {
+      options.optimal = true;
+      ApplyOptimalPreset(options);
       continue;
     }
     throw std::runtime_error("unknown argument: " + arg);

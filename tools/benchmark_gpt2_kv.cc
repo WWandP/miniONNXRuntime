@@ -51,7 +51,14 @@ struct Options {
   bool print_steps{false};
   bool print_cache_residency{false};
   bool trace_measured{false};
+  bool optimal{false};
 };
+
+void ApplyOptimalPreset(Options& options) {
+  options.warmup = 1;
+  options.repeat = 5;
+  options.graph_opt = true;
+}
 
 double ElapsedMs(Clock::time_point start, Clock::time_point end) {
   return std::chrono::duration<double, std::milli>(end - start).count();
@@ -155,6 +162,9 @@ Options ParseArgs(int argc, char* argv[]) {
       options.print_cache_residency = true;
     } else if (arg == "--trace-measured") {
       options.trace_measured = true;
+    } else if (arg == "--optimal") {
+      options.optimal = true;
+      ApplyOptimalPreset(options);
     } else {
       throw std::runtime_error("unknown argument: " + arg);
     }
