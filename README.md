@@ -147,6 +147,14 @@ YOLOv8n 当前已经支持 `ConvSiLU` 融合图走 CUDA；表中使用 `--graph-
 | GPT-2 KV cache | `--generate 48 --warmup 1 --repeat 5 --graph-opt` | `312.774 / 316.063` | `1098.070 / 1093.390` |
 | Qwen2.5-0.5B KV cache | `--generate 8 --warmup 1 --repeat 5 --graph-opt` | `188.249 / 186.674` | `526.887 / 529.762` |
 
+为了保留和标准版 ONNX Runtime 的历史对比，下面继续保留 2026-06-06 这组参考数据。这里的 GPT-2 / Qwen 仍按当时常用的 tokens/s 与 generation/prefill 拆分口径展示，便于和之前的记录对照。
+
+| 模型 / 路径 | 优化重点 | MiniORT CUDA | ORT CUDA 参考 | ORT CPU 参考 |
+| --- | --- | --- | --- | --- |
+| YOLOv8n mixed CUDA | device residency、CUDA buffer pool、CUDA im2col、Concat/Split/Resize 覆盖、dead tensor eviction、planned memory reuse | `repeat=50` mean `4.96 ms`，p50 `4.99 ms` | mean `1.86 ms`，p50 `1.86 ms` | mean `12.87 ms`，p50 `12.84 ms` |
+| GPT-2 KV CUDA | KV-cache 双图、CUDA hot-path 覆盖、greedy argmax、warmed benchmark、`--graph-opt` | `generate=96` 约 `227.40 tokens/s`（generation mean `422.16 ms`，prefill mean `11.13 ms`） | 约 `438.65 tokens/s`（generation mean `218.85 ms`，prefill mean `1.80 ms`） | 约 `83.46 tokens/s`（generation mean `1150.24 ms`，prefill mean `16.54 ms`） |
+| Qwen2.5-0.5B KV CUDA | eager CUDA initializer prepare、CUDA/cuBLAS warmup、RMSNorm primitive coverage、graph-scoped Constant reuse、tail-dimension CUDA broadcast | `generate=8` 约 `61.65 tokens/s`（generation mean `129.77 ms`，prefill mean `15.16 ms`） | 约 `171.36 tokens/s`（generation mean `46.68 ms`，prefill mean `4.75 ms`） | 约 `15.45 tokens/s`（generation mean `517.85 ms`，prefill mean `52.98 ms`） |
+
 优化记录：
 
 - [2026-06-06 CUDA 相关优化](./docs/optimization_summary.md)
