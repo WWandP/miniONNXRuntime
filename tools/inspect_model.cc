@@ -9,6 +9,7 @@
 
 #include "miniort/loader/onnx_loader.h"
 #include "miniort/model/graph.h"
+#include "miniort/optimizer/graph_optimizer.h"
 #include "miniort/runtime/session.h"
 #include "miniort/tools/phase_output.h"
 
@@ -108,17 +109,82 @@ void PrintNodeAttributes(const miniort::Node& node) {
 
 struct Options {
   std::string model_path;
+  bool graph_opt{false};
 };
 
 Options ParseArgs(int argc, char* argv[]) {
   if (argc < 2) {
-    throw std::runtime_error("usage: miniort_inspect <model.onnx>");
+    throw std::runtime_error("usage: miniort_inspect <model.onnx> [--graph-opt]");
   }
 
   Options options;
   options.model_path = argv[1];
+  for (int i = 2; i < argc; ++i) {
+    const std::string arg = argv[i];
+    if (arg == "--graph-opt") {
+      options.graph_opt = true;
+      continue;
+    }
+    throw std::runtime_error("unknown argument: " + arg);
+  }
 
   return options;
+}
+
+std::string ReadShapeKey(const miniort::Graph& graph, const std::string& value_name) {
+  const auto initializer_it = graph.initializers.find(value_name);
+  if (initializer_it != graph.initializers.end() && initializer_it->second.data.has_value()) {
+    return FormatTensorShape(initializer_it->second.data->shape);
+  }
+  const auto value_info_it = graph.value_infos.find(value_name);
+  if (value_info_it != graph.value_infos.end()) {
+    return miniort::FormatShape(value_info_it->second.shape);
+  }
+  return "[]";
+}
+
+std::string ReadIntsAttributeKey(const miniort::Node& node, const std::string& name,
+                                 const std::vector<std::int64_t>& default_values) {
+  const auto it = node.attributes.find(name);
+  if (it == node.attributes.end()) {
+    return FormatVectorPreview(default_values, default_values.size());
+  }
+  return FormatAttributeValue(it->second);
+}
+
+void PrintConvShapeSummary(const miniort::Graph& graph) {
+  std::unordered_map<std::string, std::size_t> groups;
+  for (const auto& node : graph.nodes) {
+    if ((node.op_type != "Conv" && node.op_type != "ConvSiLU") || node.inputs.size() < 2) {
+      continue;
+    }
+    const auto input_shape = ReadShapeKey(graph, node.inputs.at(0));
+    const auto weight_shape = ReadShapeKey(graph, node.inputs.at(1));
+    const auto output_shape = node.outputs.empty() ? "[]" : ReadShapeKey(graph, node.outputs.at(0));
+    const auto strides = ReadIntsAttributeKey(node, "strides", {1, 1});
+    const auto pads = ReadIntsAttributeKey(node, "pads", {0, 0, 0, 0});
+    const auto key = "op=" + node.op_type + " input=" + input_shape +
+                     " weight=" + weight_shape + " output=" + output_shape +
+                     " strides=" + strides + " pads=" + pads;
+    ++groups[key];
+  }
+  if (groups.empty()) {
+    return;
+  }
+
+  std::vector<std::pair<std::string, std::size_t>> entries(groups.begin(), groups.end());
+  std::sort(entries.begin(), entries.end(), [](const auto& lhs, const auto& rhs) {
+    if (lhs.second != rhs.second) {
+      return lhs.second > rhs.second;
+    }
+    return lhs.first < rhs.first;
+  });
+
+  std::cout << "conv_shape_summary:\n";
+  for (const auto& [key, count] : entries) {
+    std::cout << "  - count=" << count << " " << key << "\n";
+  }
+  std::cout << "\n";
 }
 
 void PrintGraphSummary(const miniort::Graph& graph, const miniort::SessionAssignmentSummary& assignment_summary) {
@@ -177,6 +243,7 @@ void PrintGraphSummary(const miniort::Graph& graph, const miniort::SessionAssign
     std::cout << "  - " << op_type << ": " << count << "\n";
   }
   std::cout << "\n";
+  PrintConvShapeSummary(graph);
 
   std::cout << "initializers_preview: first " << kShowInitializers << "\n";
   std::size_t initializer_index = 0;
@@ -214,6 +281,14 @@ int main(int argc, char* argv[]) {
                               "只看模型图结构，不进入完整推理执行。");
     miniort::PrintPhaseStep(std::cout, 1, 3, "Load ONNX Graph", options.model_path);
     auto graph = miniort::LoadOnnxGraph(options.model_path);
+    if (options.graph_opt) {
+      graph = miniort::OptimizeGraph(std::move(graph),
+                                     {.enable_constant_folding = true,
+                                      .enable_dead_node_cleanup = true,
+                                      .enable_shape_simplification = true},
+                                     nullptr,
+                                     nullptr);
+    }
     miniort::PrintPhaseStep(std::cout, 2, 3, "Assign Execution Providers",
                             "构造 Session，查看节点当前会落到哪个 provider。");
     const miniort::Session session(graph);

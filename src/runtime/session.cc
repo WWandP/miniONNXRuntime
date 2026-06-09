@@ -640,8 +640,10 @@ RunSummary Session::Run(const std::unordered_map<std::string, Tensor>& feeds, Ex
           (*kernel)(node, context, kernel_trace);
           ++summary.executed_nodes;
           ++summary.provider_executed_node_counts[node.execution_provider];
+          ++summary.op_executed_node_counts[node.op_type];
           node_kernel_time_ms = DurationMs(node_start, Clock::now());
           AddTiming(timings, "kernel." + node.op_type, node_kernel_time_ms);
+          summary.op_kernel_time_ms[node.op_type] += node_kernel_time_ms;
         } catch (const std::exception& ex) {
           if (!options_.allow_missing_kernels) {
             throw;

@@ -1174,6 +1174,46 @@ void TestConvExecutionProducesExpectedOutput() {
   }
 }
 
+void TestMaxPool5x5Pad2ExecutionProducesExpectedOutput() {
+  auto graph = MakeGraphWithOps({"MaxPool"});
+  graph.nodes[0].inputs = {"x"};
+  graph.nodes[0].attributes["kernel_shape"].kind = miniort::AttributeValue::Kind::kInts;
+  graph.nodes[0].attributes["kernel_shape"].ints = {5, 5};
+  graph.nodes[0].attributes["strides"].kind = miniort::AttributeValue::Kind::kInts;
+  graph.nodes[0].attributes["strides"].ints = {1, 1};
+  graph.nodes[0].attributes["pads"].kind = miniort::AttributeValue::Kind::kInts;
+  graph.nodes[0].attributes["pads"].ints = {2, 2, 2, 2};
+
+  miniort::Tensor x;
+  x.name = "x";
+  x.dtype = "float32";
+  x.shape = {1, 1, 4, 4};
+  x.float_data = {
+      1.f, 2.f, 3.f, 4.f,
+      5.f, 6.f, 7.f, 8.f,
+      9.f, 10.f, 11.f, 12.f,
+      13.f, 14.f, 15.f, 16.f,
+  };
+
+  Session session = MakeCpuSession(std::move(graph), SessionOptions{});
+  miniort::ExecutionContext context;
+  std::unordered_map<std::string, miniort::Tensor> feeds;
+  feeds.emplace(x.name, x);
+
+  const auto summary = session.Run(feeds, context, nullptr);
+  Expect(summary.executed_nodes == 1, "expected MaxPool graph to execute one node");
+  const auto* output = context.FindTensor("out_0");
+  Expect(output != nullptr, "expected MaxPool output tensor");
+  Expect(output->shape == std::vector<std::int64_t>({1, 1, 4, 4}), "expected MaxPool output shape [1,1,4,4]");
+  const std::vector<float> expected = {
+      11.f, 12.f, 12.f, 12.f,
+      15.f, 16.f, 16.f, 16.f,
+      15.f, 16.f, 16.f, 16.f,
+      15.f, 16.f, 16.f, 16.f,
+  };
+  Expect(output->float_data == expected, "unexpected MaxPool 5x5 output");
+}
+
 void TestGemmExecutionProducesExpectedOutput() {
   auto graph = MakeGraphWithOps({"Gemm"});
   graph.nodes[0].inputs = {"a", "b", "c"};
@@ -1286,6 +1326,140 @@ void TestConvSiLUExecutionProducesExpectedOutput() {
   }
 }
 
+void TestPointwiseConvSiLUExecutionProducesExpectedOutput() {
+  auto graph = MakeGraphWithOps({"ConvSiLU"});
+  graph.nodes[0].inputs = {"x", "w", "b"};
+
+  miniort::Tensor x;
+  x.name = "x";
+  x.dtype = "float32";
+  x.shape = {1, 2, 7, 17};
+  x.float_data.resize(2 * 7 * 17);
+  for (std::size_t i = 0; i < x.float_data.size(); ++i) {
+    x.float_data[i] = static_cast<float>((static_cast<int>(i % 13) - 6) * 0.125f);
+  }
+
+  miniort::Tensor w;
+  w.name = "w";
+  w.dtype = "float32";
+  w.shape = {9, 2, 1, 1};
+  w.float_data.resize(9 * 2);
+  for (std::size_t i = 0; i < w.float_data.size(); ++i) {
+    w.float_data[i] = static_cast<float>((static_cast<int>(i % 7) - 3) * 0.2f);
+  }
+
+  miniort::Tensor b;
+  b.name = "b";
+  b.dtype = "float32";
+  b.shape = {9};
+  b.float_data.resize(9);
+  for (std::size_t i = 0; i < b.float_data.size(); ++i) {
+    b.float_data[i] = static_cast<float>((static_cast<int>(i) - 4) * 0.1f);
+  }
+
+  Session session = MakeCpuSession(std::move(graph), SessionOptions{});
+  miniort::ExecutionContext context;
+  std::unordered_map<std::string, miniort::Tensor> feeds;
+  feeds.emplace(x.name, x);
+  feeds.emplace(w.name, w);
+  feeds.emplace(b.name, b);
+
+  const auto summary = session.Run(feeds, context, nullptr);
+  Expect(summary.executed_nodes == 1, "expected pointwise ConvSiLU graph to execute one node");
+  const auto* output = context.FindTensor("out_0");
+  Expect(output != nullptr, "expected pointwise ConvSiLU output tensor");
+  Expect(output->shape == std::vector<std::int64_t>({1, 9, 7, 17}),
+         "expected pointwise ConvSiLU output shape [1,9,7,17]");
+
+  const std::size_t hw = 7 * 17;
+  auto silu = [](float v) { return v * (1.0f / (1.0f + std::exp(-v))); };
+  for (std::size_t oc = 0; oc < 9; ++oc) {
+    for (std::size_t i = 0; i < hw; ++i) {
+      float value = b.float_data[oc];
+      value += x.float_data[i] * w.float_data[oc * 2];
+      value += x.float_data[hw + i] * w.float_data[oc * 2 + 1];
+      const auto actual = output->float_data[oc * hw + i];
+      Expect(std::fabs(actual - silu(value)) < 1e-5f, "unexpected pointwise ConvSiLU output value");
+    }
+  }
+}
+
+void TestConv3x3Stride2Pad1SiLUExecutionProducesExpectedOutput() {
+  auto graph = MakeGraphWithOps({"ConvSiLU"});
+  graph.nodes[0].inputs = {"x", "w", "b"};
+  graph.nodes[0].attributes["pads"].kind = miniort::AttributeValue::Kind::kInts;
+  graph.nodes[0].attributes["pads"].ints = {1, 1, 1, 1};
+  graph.nodes[0].attributes["strides"].kind = miniort::AttributeValue::Kind::kInts;
+  graph.nodes[0].attributes["strides"].ints = {2, 2};
+
+  miniort::Tensor x;
+  x.name = "x";
+  x.dtype = "float32";
+  x.shape = {1, 2, 5, 6};
+  x.float_data.resize(2 * 5 * 6);
+  for (std::size_t i = 0; i < x.float_data.size(); ++i) {
+    x.float_data[i] = static_cast<float>((static_cast<int>(i % 17) - 8) * 0.0625f);
+  }
+
+  miniort::Tensor w;
+  w.name = "w";
+  w.dtype = "float32";
+  w.shape = {3, 2, 3, 3};
+  w.float_data.resize(3 * 2 * 3 * 3);
+  for (std::size_t i = 0; i < w.float_data.size(); ++i) {
+    w.float_data[i] = static_cast<float>((static_cast<int>(i % 11) - 5) * 0.075f);
+  }
+
+  miniort::Tensor b;
+  b.name = "b";
+  b.dtype = "float32";
+  b.shape = {3};
+  b.float_data = {-0.2f, 0.05f, 0.25f};
+
+  Session session = MakeCpuSession(std::move(graph), SessionOptions{});
+  miniort::ExecutionContext context;
+  std::unordered_map<std::string, miniort::Tensor> feeds;
+  feeds.emplace(x.name, x);
+  feeds.emplace(w.name, w);
+  feeds.emplace(b.name, b);
+
+  const auto summary = session.Run(feeds, context, nullptr);
+  Expect(summary.executed_nodes == 1, "expected 3x3 ConvSiLU graph to execute one node");
+  const auto* output = context.FindTensor("out_0");
+  Expect(output != nullptr, "expected 3x3 ConvSiLU output tensor");
+  Expect(output->shape == std::vector<std::int64_t>({1, 3, 3, 3}),
+         "expected 3x3 ConvSiLU output shape [1,3,3,3]");
+
+  auto silu = [](float v) { return v * (1.0f / (1.0f + std::exp(-v))); };
+  for (std::size_t oc = 0; oc < 3; ++oc) {
+    for (std::size_t oh = 0; oh < 3; ++oh) {
+      for (std::size_t ow = 0; ow < 3; ++ow) {
+        float value = b.float_data[oc];
+        for (std::size_t ic = 0; ic < 2; ++ic) {
+          for (std::size_t kh = 0; kh < 3; ++kh) {
+            const auto ih = static_cast<std::int64_t>(oh) * 2 + static_cast<std::int64_t>(kh) - 1;
+            if (ih < 0 || ih >= 5) {
+              continue;
+            }
+            for (std::size_t kw = 0; kw < 3; ++kw) {
+              const auto iw = static_cast<std::int64_t>(ow) * 2 + static_cast<std::int64_t>(kw) - 1;
+              if (iw < 0 || iw >= 6) {
+                continue;
+              }
+              const auto input_index = ic * 5 * 6 + static_cast<std::size_t>(ih) * 6 + static_cast<std::size_t>(iw);
+              const auto weight_index = ((oc * 2 + ic) * 3 + kh) * 3 + kw;
+              value += x.float_data[input_index] * w.float_data[weight_index];
+            }
+          }
+        }
+        const auto output_index = oc * 3 * 3 + oh * 3 + ow;
+        Expect(std::fabs(output->float_data[output_index] - silu(value)) < 1e-5f,
+               "unexpected 3x3 ConvSiLU output value");
+      }
+    }
+  }
+}
+
 void TestTanhExecutionProducesExpectedOutput() {
   auto graph = MakeGraphWithOps({"Tanh"});
   graph.nodes[0].inputs = {"x"};
@@ -1374,6 +1548,49 @@ void TestConcatExecutionProducesExpectedOutput() {
   Expect(output->shape == std::vector<std::int64_t>({2, 3}), "expected Concat output shape [2,3]");
   const std::vector<float> expected = {1.f, 2.f, 5.f, 3.f, 4.f, 6.f};
   Expect(output->float_data == expected, "unexpected Concat output");
+}
+
+void TestResizeNearest2xExecutionProducesExpectedOutput() {
+  auto graph = MakeGraphWithOps({"Resize"});
+  graph.nodes[0].inputs = {"x", "", "scales"};
+  graph.nodes[0].attributes["mode"].kind = miniort::AttributeValue::Kind::kString;
+  graph.nodes[0].attributes["mode"].string_value = "nearest";
+  graph.nodes[0].attributes["coordinate_transformation_mode"].kind = miniort::AttributeValue::Kind::kString;
+  graph.nodes[0].attributes["coordinate_transformation_mode"].string_value = "asymmetric";
+  graph.nodes[0].attributes["nearest_mode"].kind = miniort::AttributeValue::Kind::kString;
+  graph.nodes[0].attributes["nearest_mode"].string_value = "floor";
+
+  miniort::Tensor x;
+  x.name = "x";
+  x.dtype = "float32";
+  x.shape = {1, 1, 2, 3};
+  x.float_data = {1.f, 2.f, 3.f,
+                  4.f, 5.f, 6.f};
+
+  miniort::Tensor scales;
+  scales.name = "scales";
+  scales.dtype = "float32";
+  scales.shape = {4};
+  scales.float_data = {1.f, 1.f, 2.f, 2.f};
+
+  Session session = MakeCpuSession(std::move(graph), SessionOptions{});
+  miniort::ExecutionContext context;
+  std::unordered_map<std::string, miniort::Tensor> feeds;
+  feeds.emplace(x.name, x);
+  feeds.emplace(scales.name, scales);
+
+  const auto summary = session.Run(feeds, context, nullptr);
+  Expect(summary.executed_nodes == 1, "expected Resize graph to execute one node");
+  const auto* output = context.FindTensor("out_0");
+  Expect(output != nullptr, "expected Resize output tensor");
+  Expect(output->shape == std::vector<std::int64_t>({1, 1, 4, 6}), "expected Resize output shape [1,1,4,6]");
+  const std::vector<float> expected = {
+      1.f, 1.f, 2.f, 2.f, 3.f, 3.f,
+      1.f, 1.f, 2.f, 2.f, 3.f, 3.f,
+      4.f, 4.f, 5.f, 5.f, 6.f, 6.f,
+      4.f, 4.f, 5.f, 5.f, 6.f, 6.f,
+  };
+  Expect(output->float_data == expected, "unexpected Resize nearest 2x output");
 }
 
 void TestTransposeExecutionProducesExpectedOutput() {
@@ -2296,12 +2513,16 @@ int main() {
     TestCudaMaxPoolExecutionProducesExpectedOutput();
 #endif
     TestConvExecutionProducesExpectedOutput();
+    TestMaxPool5x5Pad2ExecutionProducesExpectedOutput();
     TestGemmExecutionProducesExpectedOutput();
     TestSiLUExecutionProducesExpectedOutput();
     TestConvSiLUExecutionProducesExpectedOutput();
+    TestPointwiseConvSiLUExecutionProducesExpectedOutput();
+    TestConv3x3Stride2Pad1SiLUExecutionProducesExpectedOutput();
     TestTanhExecutionProducesExpectedOutput();
     TestSqueezeExecutionProducesExpectedOutput();
     TestConcatExecutionProducesExpectedOutput();
+    TestResizeNearest2xExecutionProducesExpectedOutput();
     TestTransposeExecutionProducesExpectedOutput();
     TestSessionFoldsInitializerTransposeToConstant();
     TestSoftmaxExecutionProducesExpectedOutput();

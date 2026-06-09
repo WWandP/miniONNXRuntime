@@ -7,6 +7,7 @@
 #include <functional>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <type_traits>
 #include <vector>
 
@@ -14,6 +15,34 @@
 #include "miniort/runtime/tensor.h"
 
 namespace miniort {
+
+template <typename Fn>
+inline void ParallelFor(std::size_t count, std::size_t min_items_per_thread, Fn&& fn) {
+  if (count == 0) {
+    return;
+  }
+  const auto hardware_threads = std::thread::hardware_concurrency();
+  const std::size_t max_threads = hardware_threads == 0 ? 1 : static_cast<std::size_t>(hardware_threads);
+  const std::size_t desired_threads = std::min(max_threads, (count + min_items_per_thread - 1) / min_items_per_thread);
+  if (desired_threads <= 1) {
+    fn(0, count);
+    return;
+  }
+
+  std::vector<std::thread> workers;
+  workers.reserve(desired_threads - 1);
+  const auto block_size = (count + desired_threads - 1) / desired_threads;
+  std::size_t begin = 0;
+  for (std::size_t worker = 1; worker < desired_threads; ++worker) {
+    const auto end = std::min(count, begin + block_size);
+    workers.emplace_back([begin, end, &fn]() { fn(begin, end); });
+    begin = end;
+  }
+  fn(begin, count);
+  for (auto& worker : workers) {
+    worker.join();
+  }
+}
 
 inline const Tensor& RequireTensor(const ExecutionContext& context, const std::string& name) {
   const auto* tensor = context.FindTensor(name);

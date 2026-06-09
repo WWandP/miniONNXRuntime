@@ -7,6 +7,16 @@
 #include <stdexcept>
 #include <vector>
 
+#if defined(__AVX__)
+#include <immintrin.h>
+#define MINIORT_ENABLE_AVX 1
+#endif
+
+#if defined(__SSE__) || defined(__x86_64__) || defined(_M_X64)
+#include <xmmintrin.h>
+#define MINIORT_ENABLE_SSE 1
+#endif
+
 #if defined(__APPLE__)
 #include <Accelerate/Accelerate.h>
 #endif
@@ -207,6 +217,26 @@ enum class ConvPostOp {
   kSiLU,
 };
 
+#if defined(MINIORT_ENABLE_AVX)
+inline __m256 MultiplyAdd(__m256 accum, __m256 lhs, __m256 rhs) {
+#if defined(__FMA__)
+  return _mm256_fmadd_ps(lhs, rhs, accum);
+#else
+  return _mm256_add_ps(accum, _mm256_mul_ps(lhs, rhs));
+#endif
+}
+#endif
+
+#if defined(MINIORT_ENABLE_SSE)
+inline __m128 MultiplyAdd(__m128 accum, __m128 lhs, __m128 rhs) {
+#if defined(__FMA__)
+  return _mm_fmadd_ps(lhs, rhs, accum);
+#else
+  return _mm_add_ps(accum, _mm_mul_ps(lhs, rhs));
+#endif
+}
+#endif
+
 Tensor RunConv2D(const Node& node, const Tensor& input, const Tensor& weight, const Tensor* bias,
                  ExecutionContext& context, ConvPostOp post_op = ConvPostOp::kNone) {
   const auto& input_data = RequireFloatData(input, "Conv");
@@ -294,9 +324,35 @@ Tensor RunConv2D(const Node& node, const Tensor& input, const Tensor& weight, co
         for (std::size_t ic = 0; ic < c_in; ++ic) {
           const auto* input_plane = batch_input + ic * input_hw;
           const float weight_value = weight_oc[ic];
+#if defined(MINIORT_ENABLE_AVX)
+          const auto weight_vec = _mm256_set1_ps(weight_value);
+          std::size_t i = 0;
+          for (; i + 8 <= output_hw; i += 8) {
+            const auto input_vec = _mm256_loadu_ps(input_plane + i);
+            auto output_vec = _mm256_loadu_ps(output_plane + i);
+            output_vec = MultiplyAdd(output_vec, input_vec, weight_vec);
+            _mm256_storeu_ps(output_plane + i, output_vec);
+          }
+          for (; i < output_hw; ++i) {
+            output_plane[i] += input_plane[i] * weight_value;
+          }
+#elif defined(MINIORT_ENABLE_SSE)
+          const auto weight_vec = _mm_set1_ps(weight_value);
+          std::size_t i = 0;
+          for (; i + 4 <= output_hw; i += 4) {
+            const auto input_vec = _mm_loadu_ps(input_plane + i);
+            auto output_vec = _mm_loadu_ps(output_plane + i);
+            output_vec = MultiplyAdd(output_vec, input_vec, weight_vec);
+            _mm_storeu_ps(output_plane + i, output_vec);
+          }
+          for (; i < output_hw; ++i) {
+            output_plane[i] += input_plane[i] * weight_value;
+          }
+#else
           for (std::size_t i = 0; i < output_hw; ++i) {
             output_plane[i] += input_plane[i] * weight_value;
           }
+#endif
         }
 
         if (post_op == ConvPostOp::kSiLU) {
@@ -309,6 +365,185 @@ Tensor RunConv2D(const Node& node, const Tensor& input, const Tensor& weight, co
     };
 
     const auto plane_work = c_in * output_hw;
+    std::size_t min_output_planes_per_thread = 4;
+    if (plane_work < 200000) {
+      min_output_planes_per_thread = 16;
+    } else if (plane_work < 800000) {
+      min_output_planes_per_thread = 8;
+    }
+    ParallelFor(n * c_out, min_output_planes_per_thread, run_output_planes);
+    return output;
+  }
+
+  const bool is_3x3_pad1_dilation1 =
+      k_h == 3 && k_w == 3 &&
+      dilation_h == 1 && dilation_w == 1 &&
+      pad_top == 1 && pad_left == 1 && pad_bottom == 1 && pad_right == 1 &&
+      (stride_h == 1 || stride_h == 2) && stride_h == stride_w;
+
+  if (is_3x3_pad1_dilation1) {
+    const auto run_output_planes = [&](std::size_t begin, std::size_t end) {
+      for (std::size_t plane_index = begin; plane_index < end; ++plane_index) {
+        const auto batch = plane_index / c_out;
+        const auto oc = plane_index % c_out;
+        const auto* batch_input = input_data.data() + batch * c_in * input_hw;
+        auto* batch_output = output.float_data.data() + batch * c_out * output_hw;
+        auto* output_plane = batch_output + oc * output_hw;
+        const float bias_value = bias_data != nullptr ? (*bias_data)[oc] : 0.0f;
+        std::fill_n(output_plane, output_hw, bias_value);
+
+        const auto* weight_oc = weight_data.data() + oc * c_in * kernel_hw;
+        for (std::size_t ic = 0; ic < c_in; ++ic) {
+          const auto* input_plane = batch_input + ic * input_hw;
+          const auto* weight_ic = weight_oc + ic * kernel_hw;
+          const float w00 = weight_ic[0];
+          const float w01 = weight_ic[1];
+          const float w02 = weight_ic[2];
+          const float w10 = weight_ic[3];
+          const float w11 = weight_ic[4];
+          const float w12 = weight_ic[5];
+          const float w20 = weight_ic[6];
+          const float w21 = weight_ic[7];
+          const float w22 = weight_ic[8];
+
+          const std::size_t interior_begin =
+              std::min(output_w, static_cast<std::size_t>((1 + stride_w - 1) / stride_w));
+          const std::size_t interior_end =
+              w_in >= 2 ? std::min(output_w, static_cast<std::size_t>(
+                                                 (static_cast<std::int64_t>(w_in) - 2) / stride_w + 1))
+                        : 0;
+
+          for (std::size_t oh = 0; oh < static_cast<std::size_t>(h_out); ++oh) {
+            const auto ih_base = static_cast<std::int64_t>(oh) * stride_h - 1;
+            const float* row0 = (ih_base >= 0 && ih_base < static_cast<std::int64_t>(h_in))
+                                    ? input_plane + static_cast<std::size_t>(ih_base) * w_in
+                                    : nullptr;
+            const float* row1 = (ih_base + 1 >= 0 && ih_base + 1 < static_cast<std::int64_t>(h_in))
+                                    ? input_plane + static_cast<std::size_t>(ih_base + 1) * w_in
+                                    : nullptr;
+            const float* row2 = (ih_base + 2 >= 0 && ih_base + 2 < static_cast<std::int64_t>(h_in))
+                                    ? input_plane + static_cast<std::size_t>(ih_base + 2) * w_in
+                                    : nullptr;
+            auto* output_row = output_plane + oh * output_w;
+
+            const auto add_edge = [&](std::size_t ow) {
+              const auto iw_base = static_cast<std::int64_t>(ow) * stride_w - 1;
+              const auto sample = [&](const float* row, std::int64_t iw) {
+                if (row == nullptr || iw < 0 || iw >= static_cast<std::int64_t>(w_in)) {
+                  return 0.0f;
+                }
+                return row[static_cast<std::size_t>(iw)];
+              };
+              output_row[ow] += sample(row0, iw_base) * w00 +
+                                sample(row0, iw_base + 1) * w01 +
+                                sample(row0, iw_base + 2) * w02 +
+                                sample(row1, iw_base) * w10 +
+                                sample(row1, iw_base + 1) * w11 +
+                                sample(row1, iw_base + 2) * w12 +
+                                sample(row2, iw_base) * w20 +
+                                sample(row2, iw_base + 1) * w21 +
+                                sample(row2, iw_base + 2) * w22;
+            };
+
+            for (std::size_t ow = 0; ow < interior_begin; ++ow) {
+              add_edge(ow);
+            }
+            std::size_t ow = interior_begin;
+#if defined(MINIORT_ENABLE_AVX)
+            if (stride_w == 1) {
+              const auto w00v = _mm256_set1_ps(w00);
+              const auto w01v = _mm256_set1_ps(w01);
+              const auto w02v = _mm256_set1_ps(w02);
+              const auto w10v = _mm256_set1_ps(w10);
+              const auto w11v = _mm256_set1_ps(w11);
+              const auto w12v = _mm256_set1_ps(w12);
+              const auto w20v = _mm256_set1_ps(w20);
+              const auto w21v = _mm256_set1_ps(w21);
+              const auto w22v = _mm256_set1_ps(w22);
+              for (; ow + 8 <= interior_end; ow += 8) {
+                const auto iw = ow - 1;
+                auto value = _mm256_loadu_ps(output_row + ow);
+                if (row0 != nullptr) {
+                  value = MultiplyAdd(value, _mm256_loadu_ps(row0 + iw), w00v);
+                  value = MultiplyAdd(value, _mm256_loadu_ps(row0 + iw + 1), w01v);
+                  value = MultiplyAdd(value, _mm256_loadu_ps(row0 + iw + 2), w02v);
+                }
+                if (row1 != nullptr) {
+                  value = MultiplyAdd(value, _mm256_loadu_ps(row1 + iw), w10v);
+                  value = MultiplyAdd(value, _mm256_loadu_ps(row1 + iw + 1), w11v);
+                  value = MultiplyAdd(value, _mm256_loadu_ps(row1 + iw + 2), w12v);
+                }
+                if (row2 != nullptr) {
+                  value = MultiplyAdd(value, _mm256_loadu_ps(row2 + iw), w20v);
+                  value = MultiplyAdd(value, _mm256_loadu_ps(row2 + iw + 1), w21v);
+                  value = MultiplyAdd(value, _mm256_loadu_ps(row2 + iw + 2), w22v);
+                }
+                _mm256_storeu_ps(output_row + ow, value);
+              }
+            }
+#elif defined(MINIORT_ENABLE_SSE)
+            if (stride_w == 1) {
+              const auto w00v = _mm_set1_ps(w00);
+              const auto w01v = _mm_set1_ps(w01);
+              const auto w02v = _mm_set1_ps(w02);
+              const auto w10v = _mm_set1_ps(w10);
+              const auto w11v = _mm_set1_ps(w11);
+              const auto w12v = _mm_set1_ps(w12);
+              const auto w20v = _mm_set1_ps(w20);
+              const auto w21v = _mm_set1_ps(w21);
+              const auto w22v = _mm_set1_ps(w22);
+              for (; ow + 4 <= interior_end; ow += 4) {
+                const auto iw = ow - 1;
+                auto value = _mm_loadu_ps(output_row + ow);
+                if (row0 != nullptr) {
+                  value = MultiplyAdd(value, _mm_loadu_ps(row0 + iw), w00v);
+                  value = MultiplyAdd(value, _mm_loadu_ps(row0 + iw + 1), w01v);
+                  value = MultiplyAdd(value, _mm_loadu_ps(row0 + iw + 2), w02v);
+                }
+                if (row1 != nullptr) {
+                  value = MultiplyAdd(value, _mm_loadu_ps(row1 + iw), w10v);
+                  value = MultiplyAdd(value, _mm_loadu_ps(row1 + iw + 1), w11v);
+                  value = MultiplyAdd(value, _mm_loadu_ps(row1 + iw + 2), w12v);
+                }
+                if (row2 != nullptr) {
+                  value = MultiplyAdd(value, _mm_loadu_ps(row2 + iw), w20v);
+                  value = MultiplyAdd(value, _mm_loadu_ps(row2 + iw + 1), w21v);
+                  value = MultiplyAdd(value, _mm_loadu_ps(row2 + iw + 2), w22v);
+                }
+                _mm_storeu_ps(output_row + ow, value);
+              }
+            }
+#endif
+            for (; ow < interior_end; ++ow) {
+              const auto iw = static_cast<std::size_t>(static_cast<std::int64_t>(ow) * stride_w - 1);
+              float value = output_row[ow];
+              if (row0 != nullptr) {
+                value += row0[iw] * w00 + row0[iw + 1] * w01 + row0[iw + 2] * w02;
+              }
+              if (row1 != nullptr) {
+                value += row1[iw] * w10 + row1[iw + 1] * w11 + row1[iw + 2] * w12;
+              }
+              if (row2 != nullptr) {
+                value += row2[iw] * w20 + row2[iw + 1] * w21 + row2[iw + 2] * w22;
+              }
+              output_row[ow] = value;
+            }
+            for (std::size_t ow = interior_end; ow < output_w; ++ow) {
+              add_edge(ow);
+            }
+          }
+        }
+
+        if (post_op == ConvPostOp::kSiLU) {
+          for (std::size_t i = 0; i < output_hw; ++i) {
+            const auto value = output_plane[i];
+            output_plane[i] = value * (1.0f / (1.0f + std::exp(-value)));
+          }
+        }
+      }
+    };
+
+    const auto plane_work = c_in * kernel_hw * output_hw;
     std::size_t min_output_planes_per_thread = 4;
     if (plane_work < 200000) {
       min_output_planes_per_thread = 16;
@@ -568,6 +803,56 @@ void RegisterNnKernels(KernelRegistry& registry) {
 
     const auto input_hw = h_in * w_in;
     const auto output_hw = static_cast<std::size_t>(h_out) * static_cast<std::size_t>(w_out);
+    const bool is_sppf_maxpool =
+        k_h == 5 && k_w == 5 &&
+        stride_h == 1 && stride_w == 1 &&
+        dilation_h == 1 && dilation_w == 1 &&
+        pad_top == 2 && pad_left == 2 && pad_bottom == 2 && pad_right == 2 &&
+        static_cast<std::size_t>(h_out) == h_in && static_cast<std::size_t>(w_out) == w_in;
+    if (is_sppf_maxpool) {
+      std::vector<float> horizontal_max(n * c * input_hw);
+      const auto run_planes = [&](std::size_t begin, std::size_t end) {
+        for (std::size_t plane_index = begin; plane_index < end; ++plane_index) {
+          const auto* input_plane = input_data.data() + plane_index * input_hw;
+          auto* horizontal_plane = horizontal_max.data() + plane_index * input_hw;
+          auto* output_plane = output.float_data.data() + plane_index * output_hw;
+
+          for (std::size_t h = 0; h < h_in; ++h) {
+            const auto* input_row = input_plane + h * w_in;
+            auto* horizontal_row = horizontal_plane + h * w_in;
+            for (std::size_t w = 0; w < w_in; ++w) {
+              const auto w_begin = w > 2 ? w - 2 : 0;
+              const auto w_end = std::min(w_in, w + 3);
+              float best = -std::numeric_limits<float>::infinity();
+              for (std::size_t iw = w_begin; iw < w_end; ++iw) {
+                best = std::max(best, input_row[iw]);
+              }
+              horizontal_row[w] = best;
+            }
+          }
+
+          for (std::size_t h = 0; h < h_in; ++h) {
+            auto* output_row = output_plane + h * w_in;
+            const auto h_begin = h > 2 ? h - 2 : 0;
+            const auto h_end = std::min(h_in, h + 3);
+            for (std::size_t w = 0; w < w_in; ++w) {
+              float best = -std::numeric_limits<float>::infinity();
+              for (std::size_t ih = h_begin; ih < h_end; ++ih) {
+                best = std::max(best, horizontal_plane[ih * w_in + w]);
+              }
+              output_row[w] = best;
+            }
+          }
+        }
+      };
+      ParallelFor(n * c, 4, run_planes);
+      context.BindTensor(std::move(output));
+      if (trace != nullptr) {
+        *trace << "    kernel MaxPool produced " << node.outputs.at(0) << "\n";
+      }
+      return;
+    }
+
     for (std::size_t batch = 0; batch < n; ++batch) {
       for (std::size_t channel = 0; channel < c; ++channel) {
         for (std::int64_t oh = 0; oh < h_out; ++oh) {
@@ -652,6 +937,48 @@ void RegisterNnKernels(KernelRegistry& registry) {
 
     const auto input_hw = h_in * w_in;
     const auto output_hw = static_cast<std::size_t>(h_out) * static_cast<std::size_t>(w_out);
+    const auto output_h = static_cast<std::size_t>(h_out);
+    const auto output_w = static_cast<std::size_t>(w_out);
+
+    const bool is_nearest_2x =
+        std::fabs(scales[2] - 2.0f) < 1e-6f && std::fabs(scales[3] - 2.0f) < 1e-6f &&
+        output_h == h_in * 2 && output_w == w_in * 2;
+    if (is_nearest_2x) {
+      const auto run_planes = [&](std::size_t begin, std::size_t end) {
+        for (std::size_t plane_index = begin; plane_index < end; ++plane_index) {
+          const auto batch = plane_index / c;
+          const auto channel = plane_index % c;
+          const auto* input_plane = input_data.data() + (batch * c + channel) * input_hw;
+          auto* output_plane = output.float_data.data() + (batch * c + channel) * output_hw;
+          for (std::size_t ih = 0; ih < h_in; ++ih) {
+            const auto* input_row = input_plane + ih * w_in;
+            auto* output_row0 = output_plane + (ih * 2) * output_w;
+            auto* output_row1 = output_row0 + output_w;
+            std::size_t iw = 0;
+#if defined(MINIORT_ENABLE_SSE)
+            for (; iw + 4 <= w_in; iw += 4) {
+              const auto value = _mm_loadu_ps(input_row + iw);
+              _mm_storeu_ps(output_row0 + iw * 2, _mm_unpacklo_ps(value, value));
+              _mm_storeu_ps(output_row0 + iw * 2 + 4, _mm_unpackhi_ps(value, value));
+            }
+#endif
+            for (; iw < w_in; ++iw) {
+              const float value = input_row[iw];
+              output_row0[iw * 2] = value;
+              output_row0[iw * 2 + 1] = value;
+            }
+            std::copy_n(output_row0, output_w, output_row1);
+          }
+        }
+      };
+      ParallelFor(n * c, 4, run_planes);
+      context.BindTensor(std::move(output));
+      if (trace != nullptr) {
+        *trace << "    kernel Resize produced " << node.outputs.at(0) << "\n";
+      }
+      return;
+    }
+
     for (std::size_t batch = 0; batch < n; ++batch) {
       for (std::size_t channel = 0; channel < c; ++channel) {
         for (std::int64_t oh = 0; oh < h_out; ++oh) {

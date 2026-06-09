@@ -31,6 +31,7 @@ struct Options {
   bool evict_dead_tensors{false};
   bool planned_memory_reuse{false};
   bool graph_opt{false};
+  bool profile_op_types{false};
 };
 
 struct LatencyStats {
@@ -41,11 +42,18 @@ struct LatencyStats {
   double max_ms{0.0};
 };
 
+struct OpProfileEntry {
+  double total_ms{0.0};
+  std::size_t count{0};
+};
+
+using OpProfileMap = std::unordered_map<std::string, OpProfileEntry>;
+
 Options ParseArgs(int argc, char* argv[]) {
   if (argc < 4) {
     throw std::runtime_error(
         "usage: miniort_compare_providers <model.onnx> --image path [--repeat N] [--warmup N] [--allow-missing] "
-        "[--evict-dead-tensors] [--planned-memory-reuse] [--graph-opt]");
+        "[--evict-dead-tensors] [--planned-memory-reuse] [--graph-opt] [--profile-op-types]");
   }
 
   Options options;
@@ -81,6 +89,10 @@ Options ParseArgs(int argc, char* argv[]) {
       options.graph_opt = true;
       continue;
     }
+    if (arg == "--profile-op-types") {
+      options.profile_op_types = true;
+      continue;
+    }
     throw std::runtime_error("unknown argument: " + arg);
   }
   if (options.image_path.empty()) {
@@ -92,13 +104,27 @@ Options ParseArgs(int argc, char* argv[]) {
   return options;
 }
 
-double RunOnce(miniort::Session& session, const std::unordered_map<std::string, miniort::Tensor>& feeds) {
+void AccumulateProfile(const miniort::RunSummary& summary, OpProfileMap& profile) {
+  for (const auto& [op_type, duration_ms] : summary.op_kernel_time_ms) {
+    auto& entry = profile[op_type];
+    entry.total_ms += duration_ms;
+    if (const auto count_it = summary.op_executed_node_counts.find(op_type); count_it != summary.op_executed_node_counts.end()) {
+      entry.count += count_it->second;
+    }
+  }
+}
+
+double RunOnce(miniort::Session& session, const std::unordered_map<std::string, miniort::Tensor>& feeds,
+               OpProfileMap* profile) {
   miniort::ExecutionContext context;
   const auto start = Clock::now();
   const auto summary = session.Run(feeds, context, nullptr);
   const auto end = Clock::now();
   if (summary.executed_nodes == 0) {
     throw std::runtime_error("session executed zero nodes");
+  }
+  if (profile != nullptr) {
+    AccumulateProfile(summary, *profile);
   }
   return std::chrono::duration<double, std::milli>(end - start).count();
 }
@@ -135,17 +161,45 @@ LatencyStats SummarizeSamples(std::vector<double> samples) {
 }
 
 LatencyStats RunBenchmark(miniort::Session& session, const std::unordered_map<std::string, miniort::Tensor>& feeds,
-                          std::size_t warmup, std::size_t repeat) {
+                          std::size_t warmup, std::size_t repeat, OpProfileMap* profile) {
   for (std::size_t i = 0; i < warmup; ++i) {
-    (void)RunOnce(session, feeds);
+    (void)RunOnce(session, feeds, nullptr);
   }
 
   std::vector<double> samples;
   samples.reserve(repeat);
   for (std::size_t i = 0; i < repeat; ++i) {
-    samples.push_back(RunOnce(session, feeds));
+    samples.push_back(RunOnce(session, feeds, profile));
   }
   return SummarizeSamples(std::move(samples));
+}
+
+void PrintOpProfile(const std::string& label, const OpProfileMap& profile, double measured_total_ms) {
+  if (profile.empty()) {
+    return;
+  }
+  std::vector<std::pair<std::string, OpProfileEntry>> entries;
+  entries.reserve(profile.size());
+  for (const auto& [op_type, entry] : profile) {
+    entries.emplace_back(op_type, entry);
+  }
+  std::sort(entries.begin(), entries.end(), [](const auto& lhs, const auto& rhs) {
+    if (lhs.second.total_ms == rhs.second.total_ms) {
+      return lhs.first < rhs.first;
+    }
+    return lhs.second.total_ms > rhs.second.total_ms;
+  });
+
+  std::cout << label << "_op_profile\n";
+  for (const auto& [op_type, entry] : entries) {
+    const double avg_node_ms = entry.count == 0 ? 0.0 : entry.total_ms / static_cast<double>(entry.count);
+    const double pct = measured_total_ms == 0.0 ? 0.0 : entry.total_ms / measured_total_ms * 100.0;
+    std::cout << "  - op=" << op_type
+              << " total_ms=" << entry.total_ms
+              << " count=" << entry.count
+              << " avg_node_ms=" << avg_node_ms
+              << " pct_of_measured=" << pct << "\n";
+  }
 }
 
 }  // namespace
@@ -193,8 +247,12 @@ int main(int argc, char* argv[]) {
 
     miniort::PrintPhaseStep(std::cout, 4, 4, "Run And Compare",
                             "关注 mean/p50/p95、delta_ms 和 speedup_pct。");
-    const auto mixed_stats = RunBenchmark(mixed_session, feeds, options.warmup, options.repeat);
-    const auto cpu_stats = RunBenchmark(cpu_only_session, feeds, options.warmup, options.repeat);
+    OpProfileMap mixed_profile;
+    OpProfileMap cpu_profile;
+    const auto mixed_stats = RunBenchmark(mixed_session, feeds, options.warmup, options.repeat,
+                                          options.profile_op_types ? &mixed_profile : nullptr);
+    const auto cpu_stats = RunBenchmark(cpu_only_session, feeds, options.warmup, options.repeat,
+                                        options.profile_op_types ? &cpu_profile : nullptr);
     const auto delta_ms = cpu_stats.mean_ms - mixed_stats.mean_ms;
     const auto speedup_pct = delta_ms / cpu_stats.mean_ms * 100.0;
 
@@ -206,6 +264,7 @@ int main(int argc, char* argv[]) {
     std::cout << "  evict_dead_tensors=" << (options.evict_dead_tensors ? "true" : "false") << "\n";
     std::cout << "  planned_memory_reuse=" << (options.planned_memory_reuse ? "true" : "false") << "\n";
     std::cout << "  graph_opt=" << (options.graph_opt ? "true" : "false") << "\n";
+    std::cout << "  profile_op_types=" << (options.profile_op_types ? "true" : "false") << "\n";
     std::cout << "  mixed_ms=" << mixed_stats.mean_ms << "\n";
     std::cout << "  cpu_only_ms=" << cpu_stats.mean_ms << "\n";
     std::cout << "  delta_ms=" << delta_ms << "\n";
@@ -220,6 +279,10 @@ int main(int argc, char* argv[]) {
               << " p50=" << cpu_stats.p50_ms
               << " p95=" << cpu_stats.p95_ms
               << " max=" << cpu_stats.max_ms << "\n";
+    if (options.profile_op_types) {
+      PrintOpProfile("mixed", mixed_profile, mixed_stats.mean_ms * static_cast<double>(options.repeat));
+      PrintOpProfile("cpu_only", cpu_profile, cpu_stats.mean_ms * static_cast<double>(options.repeat));
+    }
     std::cout << "metric_guide\n";
     std::cout << "  mixed_ms: default provider path average latency; CUDA/Accelerate may be used when enabled\n";
     std::cout << "  cpu_only_ms: CPU-only provider average latency for the same model and input\n";

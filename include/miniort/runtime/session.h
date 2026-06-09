@@ -48,6 +48,8 @@ struct RunSummary {
   std::unordered_map<std::string, std::size_t> provider_executed_node_counts;
   std::unordered_map<std::string, std::size_t> provider_skipped_node_counts;
   std::unordered_map<std::string, std::size_t> provider_materialized_output_counts;
+  std::unordered_map<std::string, std::size_t> op_executed_node_counts;
+  std::unordered_map<std::string, double> op_kernel_time_ms;
 };
 
 struct SessionAssignmentSummary {

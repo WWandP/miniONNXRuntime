@@ -13,6 +13,7 @@ option(MINIORT_BUILD_OPTIMIZER_TOOLS "Build graph optimizer demo tool" OFF)
 option(MINIORT_BUILD_TESTS "Build runtime tests" ON)
 option(MINIORT_BUILD_CUDA_EP "Build CUDA execution provider" OFF)
 option(MINIORT_BUILD_CUDNN "Build CUDA Conv with cuDNN when available" ON)
+option(MINIORT_ENABLE_NATIVE_CPU "Compile CPU runtime with native host ISA flags for local benchmarking" OFF)
 
 set(MINIORT_THIRD_PARTY_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party")
 set(MINIORT_ONNX_DIR "${MINIORT_THIRD_PARTY_DIR}/onnx")
@@ -143,6 +144,10 @@ if(MINIORT_BUILD_RUNTIME_TOOLS OR MINIORT_BUILD_DETECT_TOOL OR MINIORT_BUILD_TES
   )
 
   target_compile_definitions(miniort_runtime PUBLIC ONNX_ML=1)
+
+  if(MINIORT_ENABLE_NATIVE_CPU AND CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
+    target_compile_options(miniort_runtime PUBLIC -march=native)
+  endif()
 
   if(MINIORT_BUILD_CUDA_EP)
     target_compile_definitions(miniort_runtime PUBLIC MINIORT_BUILD_CUDA_EP=1)
