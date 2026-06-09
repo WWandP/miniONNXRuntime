@@ -8,6 +8,7 @@
 #include <vector>
 
 #include "miniort/loader/onnx_loader.h"
+#include "miniort/optimizer/graph_optimizer.h"
 #include "miniort/runtime/cpu_execution_provider.h"
 #include "miniort/runtime/execution_context.h"
 #include "miniort/runtime/session.h"
@@ -23,6 +24,7 @@ struct Options {
   std::size_t max_nodes{16};
   bool strict{false};
   bool cpu_only{false};
+  bool graph_opt{false};
 };
 
 miniort::Tensor MakeTokenTensor(const miniort::Value& input, const std::string& tokens_arg) {
@@ -53,7 +55,7 @@ miniort::Tensor MakeTokenTensor(const miniort::Value& input, const std::string& 
 Options ParseArgs(int argc, char* argv[]) {
   if (argc < 2) {
     throw std::runtime_error(
-        "usage: miniort_session_trace <model.onnx> [--image path] [--tokens 1,2,3] [--start-node N] [--max-nodes N] [--strict] [--cpu-only]");
+        "usage: miniort_session_trace <model.onnx> [--image path] [--tokens 1,2,3] [--start-node N] [--max-nodes N] [--strict] [--cpu-only] [--graph-opt]");
   }
 
   Options options;
@@ -84,6 +86,10 @@ Options ParseArgs(int argc, char* argv[]) {
       options.cpu_only = true;
       continue;
     }
+    if (arg == "--graph-opt") {
+      options.graph_opt = true;
+      continue;
+    }
     throw std::runtime_error("unknown argument: " + arg);
   }
 
@@ -96,6 +102,14 @@ int main(int argc, char* argv[]) {
   try {
     const auto options = ParseArgs(argc, argv);
     auto graph = miniort::LoadOnnxGraph(options.model_path, &std::cout);
+    if (options.graph_opt) {
+      graph = miniort::OptimizeGraph(std::move(graph),
+                                     {.enable_constant_folding = true,
+                                      .enable_dead_node_cleanup = true,
+                                      .enable_shape_simplification = true},
+                                     &std::cout,
+                                     nullptr);
+    }
     std::unordered_map<std::string, miniort::Tensor> feeds;
     if (!options.image_path.empty()) {
       if (graph.inputs.empty()) {

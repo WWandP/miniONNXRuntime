@@ -632,6 +632,7 @@ RunSummary Session::Run(const std::unordered_map<std::string, Tensor>& feeds, Ex
 #endif
 
       const auto* kernel = kernel_registry_.Lookup(node.op_type);
+      double node_kernel_time_ms = 0.0;
       if (kernel != nullptr) {
         const auto node_start = Clock::now();
         try {
@@ -639,19 +640,21 @@ RunSummary Session::Run(const std::unordered_map<std::string, Tensor>& feeds, Ex
           (*kernel)(node, context, kernel_trace);
           ++summary.executed_nodes;
           ++summary.provider_executed_node_counts[node.execution_provider];
-          AddTiming(timings, "kernel." + node.op_type, DurationMs(node_start, Clock::now()));
+          node_kernel_time_ms = DurationMs(node_start, Clock::now());
+          AddTiming(timings, "kernel." + node.op_type, node_kernel_time_ms);
         } catch (const std::exception& ex) {
           if (!options_.allow_missing_kernels) {
             throw;
           }
           ++summary.skipped_nodes;
           ++summary.provider_skipped_node_counts[node.execution_provider];
-        if (trace != nullptr) {
-          *trace << "    kernel execution failed for op=" << node.op_type
-                 << " provider=" << node.execution_provider
-                 << " reason=" << ex.what() << "\n";
-        }
-          AddTiming(timings, "kernel." + node.op_type, DurationMs(node_start, Clock::now()));
+          if (trace != nullptr) {
+            *trace << "    kernel execution failed for op=" << node.op_type
+                   << " provider=" << node.execution_provider
+                   << " reason=" << ex.what() << "\n";
+          }
+          node_kernel_time_ms = DurationMs(node_start, Clock::now());
+          AddTiming(timings, "kernel." + node.op_type, node_kernel_time_ms);
           MaterializeOutputsFromMetadata(node, context, trace, summary);
         }
       } else {
@@ -668,6 +671,9 @@ RunSummary Session::Run(const std::unordered_map<std::string, Tensor>& feeds, Ex
       }
 
       if (trace != nullptr && options_.verbose) {
+        if (kernel != nullptr) {
+          *trace << "    node_time_ms=" << std::fixed << std::setprecision(3) << node_kernel_time_ms << "\n";
+        }
         const auto timing_key = "kernel." + node.op_type;
         const auto timing_it = timings.find(timing_key);
         if (timing_it != timings.end()) {

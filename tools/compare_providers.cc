@@ -11,6 +11,7 @@
 #include <vector>
 
 #include "miniort/loader/onnx_loader.h"
+#include "miniort/optimizer/graph_optimizer.h"
 #include "miniort/runtime/cpu_execution_provider.h"
 #include "miniort/runtime/execution_context.h"
 #include "miniort/runtime/session.h"
@@ -29,6 +30,7 @@ struct Options {
   bool allow_missing{false};
   bool evict_dead_tensors{false};
   bool planned_memory_reuse{false};
+  bool graph_opt{false};
 };
 
 struct LatencyStats {
@@ -43,7 +45,7 @@ Options ParseArgs(int argc, char* argv[]) {
   if (argc < 4) {
     throw std::runtime_error(
         "usage: miniort_compare_providers <model.onnx> --image path [--repeat N] [--warmup N] [--allow-missing] "
-        "[--evict-dead-tensors] [--planned-memory-reuse]");
+        "[--evict-dead-tensors] [--planned-memory-reuse] [--graph-opt]");
   }
 
   Options options;
@@ -73,6 +75,10 @@ Options ParseArgs(int argc, char* argv[]) {
     if (arg == "--planned-memory-reuse") {
       options.planned_memory_reuse = true;
       options.evict_dead_tensors = true;
+      continue;
+    }
+    if (arg == "--graph-opt") {
+      options.graph_opt = true;
       continue;
     }
     throw std::runtime_error("unknown argument: " + arg);
@@ -151,6 +157,14 @@ int main(int argc, char* argv[]) {
                               "看默认 provider 路径和纯 CPU 路径的差异。");
     miniort::PrintPhaseStep(std::cout, 1, 4, "Load ONNX Graph", options.model_path);
     auto graph = miniort::LoadOnnxGraph(options.model_path, nullptr);
+    if (options.graph_opt) {
+      graph = miniort::OptimizeGraph(std::move(graph),
+                                     {.enable_constant_folding = true,
+                                      .enable_dead_node_cleanup = true,
+                                      .enable_shape_simplification = true},
+                                     nullptr,
+                                     nullptr);
+    }
     if (graph.inputs.empty()) {
       throw std::runtime_error("graph has no inputs");
     }
@@ -191,6 +205,7 @@ int main(int argc, char* argv[]) {
     std::cout << "  allow_missing=" << (options.allow_missing ? "true" : "false") << "\n";
     std::cout << "  evict_dead_tensors=" << (options.evict_dead_tensors ? "true" : "false") << "\n";
     std::cout << "  planned_memory_reuse=" << (options.planned_memory_reuse ? "true" : "false") << "\n";
+    std::cout << "  graph_opt=" << (options.graph_opt ? "true" : "false") << "\n";
     std::cout << "  mixed_ms=" << mixed_stats.mean_ms << "\n";
     std::cout << "  cpu_only_ms=" << cpu_stats.mean_ms << "\n";
     std::cout << "  delta_ms=" << delta_ms << "\n";

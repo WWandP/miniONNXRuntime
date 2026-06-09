@@ -202,8 +202,13 @@ Tensor RunGemm2D(const Node& node, const Tensor& a, const Tensor& b, const Tenso
   return output;
 }
 
+enum class ConvPostOp {
+  kNone,
+  kSiLU,
+};
+
 Tensor RunConv2D(const Node& node, const Tensor& input, const Tensor& weight, const Tensor* bias,
-                 ExecutionContext& context) {
+                 ExecutionContext& context, ConvPostOp post_op = ConvPostOp::kNone) {
   const auto& input_data = RequireFloatData(input, "Conv");
   const auto& weight_data = RequireFloatData(weight, "Conv");
   const std::vector<float>* bias_data = nullptr;
@@ -268,11 +273,81 @@ Tensor RunConv2D(const Node& node, const Tensor& input, const Tensor& weight, co
   const auto output_hw = static_cast<std::size_t>(h_out) * static_cast<std::size_t>(w_out);
   const auto kernel_hw = k_h * k_w;
   const auto output_w = static_cast<std::size_t>(w_out);
+  const bool is_pointwise_identity_spatial =
+      k_h == 1 && k_w == 1 && stride_h == 1 && stride_w == 1 &&
+      dilation_h == 1 && dilation_w == 1 &&
+      pad_top == 0 && pad_left == 0 && pad_bottom == 0 && pad_right == 0 &&
+      h_in == static_cast<std::size_t>(h_out) && w_in == static_cast<std::size_t>(w_out);
 
-  for (std::size_t batch = 0; batch < n; ++batch) {
-    const auto* batch_input = input_data.data() + batch * c_in * input_hw;
-    auto* batch_output = output.float_data.data() + batch * c_out * output_hw;
-    for (std::size_t oc = 0; oc < c_out; ++oc) {
+  if (is_pointwise_identity_spatial) {
+    const auto run_output_planes = [&](std::size_t begin, std::size_t end) {
+      for (std::size_t plane_index = begin; plane_index < end; ++plane_index) {
+        const auto batch = plane_index / c_out;
+        const auto oc = plane_index % c_out;
+        const auto* batch_input = input_data.data() + batch * c_in * input_hw;
+        auto* batch_output = output.float_data.data() + batch * c_out * output_hw;
+        auto* output_plane = batch_output + oc * output_hw;
+        const float bias_value = bias_data != nullptr ? (*bias_data)[oc] : 0.0f;
+        std::fill_n(output_plane, output_hw, bias_value);
+
+        const auto* weight_oc = weight_data.data() + oc * c_in;
+        for (std::size_t ic = 0; ic < c_in; ++ic) {
+          const auto* input_plane = batch_input + ic * input_hw;
+          const float weight_value = weight_oc[ic];
+          for (std::size_t i = 0; i < output_hw; ++i) {
+            output_plane[i] += input_plane[i] * weight_value;
+          }
+        }
+
+        if (post_op == ConvPostOp::kSiLU) {
+          for (std::size_t i = 0; i < output_hw; ++i) {
+            const auto value = output_plane[i];
+            output_plane[i] = value * (1.0f / (1.0f + std::exp(-value)));
+          }
+        }
+      }
+    };
+
+    const auto plane_work = c_in * output_hw;
+    std::size_t min_output_planes_per_thread = 4;
+    if (plane_work < 200000) {
+      min_output_planes_per_thread = 16;
+    } else if (plane_work < 800000) {
+      min_output_planes_per_thread = 8;
+    }
+    ParallelFor(n * c_out, min_output_planes_per_thread, run_output_planes);
+    return output;
+  }
+
+  std::vector<std::int64_t> input_h_bases(k_h);
+  std::vector<std::size_t> oh_begins(k_h);
+  std::vector<std::size_t> oh_ends(k_h);
+  for (std::size_t kh = 0; kh < k_h; ++kh) {
+    const auto input_h_base = static_cast<std::int64_t>(kh) * dilation_h - pad_top;
+    input_h_bases[kh] = input_h_base;
+    oh_begins[kh] =
+        input_h_base >= 0 ? 0 : static_cast<std::size_t>((-input_h_base + stride_h - 1) / stride_h);
+    oh_ends[kh] = static_cast<std::size_t>(
+        std::min<std::int64_t>(h_out, (static_cast<std::int64_t>(h_in) - 1 - input_h_base) / stride_h + 1));
+  }
+  std::vector<std::int64_t> input_w_bases(k_w);
+  std::vector<std::size_t> ow_begins(k_w);
+  std::vector<std::size_t> ow_ends(k_w);
+  for (std::size_t kw = 0; kw < k_w; ++kw) {
+    const auto input_w_base = static_cast<std::int64_t>(kw) * dilation_w - pad_left;
+    input_w_bases[kw] = input_w_base;
+    ow_begins[kw] =
+        input_w_base >= 0 ? 0 : static_cast<std::size_t>((-input_w_base + stride_w - 1) / stride_w);
+    ow_ends[kw] = static_cast<std::size_t>(
+        std::min<std::int64_t>(w_out, (static_cast<std::int64_t>(w_in) - 1 - input_w_base) / stride_w + 1));
+  }
+
+  const auto run_output_planes = [&](std::size_t begin, std::size_t end) {
+    for (std::size_t plane_index = begin; plane_index < end; ++plane_index) {
+      const auto batch = plane_index / c_out;
+      const auto oc = plane_index % c_out;
+      const auto* batch_input = input_data.data() + batch * c_in * input_hw;
+      auto* batch_output = output.float_data.data() + batch * c_out * output_hw;
       auto* output_plane = batch_output + oc * output_hw;
       const float bias_value = bias_data != nullptr ? (*bias_data)[oc] : 0.0f;
       std::fill_n(output_plane, output_hw, bias_value);
@@ -283,20 +358,17 @@ Tensor RunConv2D(const Node& node, const Tensor& input, const Tensor& weight, co
         const auto* weight_ic = weight_oc + ic * kernel_hw;
 
         for (std::size_t kh = 0; kh < k_h; ++kh) {
-          const auto input_h_base = static_cast<std::int64_t>(kh) * dilation_h - pad_top;
-          const auto oh_begin = input_h_base >= 0 ? 0 : static_cast<std::size_t>((-input_h_base + stride_h - 1) / stride_h);
-          const auto oh_end = static_cast<std::size_t>(
-              std::min<std::int64_t>(h_out, (static_cast<std::int64_t>(h_in) - 1 - input_h_base) / stride_h + 1));
+          const auto input_h_base = input_h_bases[kh];
+          const auto oh_begin = oh_begins[kh];
+          const auto oh_end = oh_ends[kh];
           if (oh_begin >= oh_end) {
             continue;
           }
 
           for (std::size_t kw = 0; kw < k_w; ++kw) {
-            const auto input_w_base = static_cast<std::int64_t>(kw) * dilation_w - pad_left;
-            const auto ow_begin =
-                input_w_base >= 0 ? 0 : static_cast<std::size_t>((-input_w_base + stride_w - 1) / stride_w);
-            const auto ow_end = static_cast<std::size_t>(
-                std::min<std::int64_t>(w_out, (static_cast<std::int64_t>(w_in) - 1 - input_w_base) / stride_w + 1));
+            const auto input_w_base = input_w_bases[kw];
+            const auto ow_begin = ow_begins[kw];
+            const auto ow_end = ow_ends[kw];
             if (ow_begin >= ow_end) {
               continue;
             }
@@ -314,8 +386,27 @@ Tensor RunConv2D(const Node& node, const Tensor& input, const Tensor& weight, co
           }
         }
       }
+
+      if (post_op == ConvPostOp::kSiLU) {
+        for (std::size_t i = 0; i < output_hw; ++i) {
+          const auto value = output_plane[i];
+          output_plane[i] = value * (1.0f / (1.0f + std::exp(-value)));
+        }
+      }
     }
+  };
+
+  // ORT's CPU thread-pool path uses a cost model to avoid over-parallelizing
+  // light kernels. Keep MiniORT simple, but scale down thread fan-out when a
+  // single output plane is relatively cheap.
+  const auto plane_work = c_in * kernel_hw * output_hw;
+  std::size_t min_output_planes_per_thread = 4;
+  if (plane_work < 200000) {
+    min_output_planes_per_thread = 16;
+  } else if (plane_work < 800000) {
+    min_output_planes_per_thread = 8;
   }
+  ParallelFor(n * c_out, min_output_planes_per_thread, run_output_planes);
 
   return output;
 }
@@ -421,10 +512,7 @@ void RegisterNnKernels(KernelRegistry& registry) {
       bias = &RequireTensor(context, node.inputs.at(2));
     }
 
-    auto output = RunConv2D(node, input, weight, bias, context);
-    for (auto& value : output.float_data) {
-      value = value * (1.0f / (1.0f + std::exp(-value)));
-    }
+    auto output = RunConv2D(node, input, weight, bias, context, ConvPostOp::kSiLU);
 
     context.BindTensor(std::move(output));
     if (trace != nullptr) {
