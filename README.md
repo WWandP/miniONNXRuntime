@@ -135,15 +135,17 @@ MINIORT_BUILD_CUDA_EP=ON CMAKE_BUILD_TYPE=Release BUILD_DIR=build_cuda_release \
 
 默认不设置 `MINIORT_BUILD_CUDA_EP=ON` 时，`run_phase.sh` 使用普通 CPU/default 构建。
 
-## 2026-06-06 CUDA 相关优化
+## 2026-06-09 当前性能快照
 
-这里整理了 2026-06-06 前后完成的一组 CUDA 路径优化，覆盖 YOLOv8n、GPT-2 KV-cache 和 Qwen2.5-0.5B KV-cache。下面数字来自同机本地实验，测试设备为 NVIDIA GeForce RTX 4090；ORT CPU 参考使用 ONNX Runtime 1.24.4 `CPUExecutionProvider`，ORT CUDA 参考使用 ONNX Runtime 1.23.2 `CUDAExecutionProvider`。
+下面数字来自同机本地实验，测试设备为 NVIDIA GeForce RTX 4090，构建目录为 `build_cuda_release`。表格统一使用
+`mean / p50 latency (ms)`：YOLOv8n 表示一次图推理；GPT-2/Qwen 表示一次文本生成端到端延迟（prefill + 全部 decode step），不包含模型加载时间和 CUDA initializer prepare 时间。
+YOLOv8n 当前已经支持 `ConvSiLU` 融合图走 CUDA；表中使用 `--graph-opt + --planned-memory-reuse` 作为默认 benchmark 口径。
 
-| 模型 / 路径 | 优化重点 | MiniORT CUDA | ORT CUDA 参考 | ORT CPU 参考 |
-| --- | --- | --- | --- | --- |
-| YOLOv8n mixed CUDA | device residency、CUDA buffer pool、CUDA im2col、Concat/Split/Resize 覆盖、dead tensor eviction、planned memory reuse | `repeat=50` mean `4.96 ms`，p50 `4.99 ms` | mean `1.86 ms`，p50 `1.86 ms` | mean `12.87 ms`，p50 `12.84 ms` |
-| GPT-2 KV CUDA | KV-cache 双图、CUDA hot-path 覆盖、greedy argmax、warmed benchmark、`--graph-opt` | `generate=96` 约 `227.40 tokens/s`（generation mean `422.16 ms`，prefill mean `11.13 ms`） | 约 `438.65 tokens/s`（generation mean `218.85 ms`，prefill mean `1.80 ms`） | 约 `83.46 tokens/s`（generation mean `1150.24 ms`，prefill mean `16.54 ms`） |
-| Qwen2.5-0.5B KV CUDA | eager CUDA initializer prepare、CUDA/cuBLAS warmup、RMSNorm primitive coverage、graph-scoped Constant reuse、tail-dimension CUDA broadcast | `generate=8` 约 `61.65 tokens/s`（generation mean `129.77 ms`，prefill mean `15.16 ms`） | 约 `171.36 tokens/s`（generation mean `46.68 ms`，prefill mean `4.75 ms`） | 约 `15.45 tokens/s`（generation mean `517.85 ms`，prefill mean `52.98 ms`） |
+| 模型 / workload | 测试参数 | MiniORT default/CUDA mean / p50 (ms) | MiniORT CPU-only mean / p50 (ms) |
+| --- | --- | --- | --- |
+| YOLOv8n | `--image pic/bus.jpg --warmup 3 --repeat 20 --planned-memory-reuse --graph-opt` | `4.219 / 4.211` | `84.089 / 82.115` |
+| GPT-2 KV cache | `--generate 48 --warmup 1 --repeat 5 --graph-opt` | `312.774 / 316.063` | `1098.070 / 1093.390` |
+| Qwen2.5-0.5B KV cache | `--generate 8 --warmup 1 --repeat 5 --graph-opt` | `188.249 / 186.674` | `526.887 / 529.762` |
 
 优化记录：
 
