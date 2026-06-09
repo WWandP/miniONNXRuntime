@@ -137,7 +137,7 @@ MINIORT_BUILD_CUDA_EP=ON CMAKE_BUILD_TYPE=Release BUILD_DIR=build_cuda_release \
 
 Without `MINIORT_BUILD_CUDA_EP=ON`, `run_phase.sh` uses the normal CPU/default build.
 
-## 2026-06-09 Performance Snapshot
+## 2026-06-09 Current Results
 
 These numbers were measured locally on the same machine with an NVIDIA GeForce RTX 4090, using the
 `build_cuda_release` build directory. The table uses a unified `mean / p50 latency (ms)` format:
@@ -146,21 +146,11 @@ YOLOv8n is a single image inference, while GPT-2 and Qwen report end-to-end text
 YOLOv8n now supports running the fused `ConvSiLU` graph path on CUDA; the table uses
 `--graph-opt + --planned-memory-reuse` as the default benchmark setup.
 
-| Model / workload | Benchmark args | MiniORT default/CUDA mean / p50 (ms) | MiniORT CPU-only mean / p50 (ms) |
+| Model / workload | Benchmark args | MiniORT default/CUDA mean / p50 (ms) | MiniORT CPU-only mean / p50 (ms) | ORT CPU mean / p50 (ms) |
 | --- | --- | --- | --- |
-| YOLOv8n | `--image pic/bus.jpg --warmup 3 --repeat 20 --planned-memory-reuse --graph-opt` | `4.219 / 4.211` | `84.089 / 82.115` |
-| GPT-2 KV cache | `--generate 48 --warmup 1 --repeat 5 --graph-opt` | `312.774 / 316.063` | `1098.070 / 1093.390` |
-| Qwen2.5-0.5B KV cache | `--generate 8 --warmup 1 --repeat 5 --graph-opt` | `188.249 / 186.674` | `526.887 / 529.762` |
-
-To preserve the earlier comparison against standard ONNX Runtime, the 2026-06-06 reference table is kept below.
-GPT-2 and Qwen still use the older tokens/s plus generation/prefill breakdown here so the historical numbers remain
-easy to compare with the earlier notes and summaries.
-
-| Model / path | Main optimizations | MiniORT CUDA | ORT CUDA reference | ORT CPU reference |
-| --- | --- | --- | --- | --- |
-| YOLOv8n mixed CUDA | device residency, CUDA buffer pool, CUDA im2col, Concat/Split/Resize coverage, dead tensor eviction, planned memory reuse | `repeat=50` mean `4.96 ms`, p50 `4.99 ms` | mean `1.86 ms`, p50 `1.86 ms` | mean `12.87 ms`, p50 `12.84 ms` |
-| GPT-2 KV CUDA | dual KV-cache graphs, CUDA hot-path coverage, greedy argmax, warmed benchmark, `--graph-opt` | `generate=96` about `227.40 tokens/s` (generation mean `422.16 ms`, prefill mean `11.13 ms`) | about `438.65 tokens/s` (generation mean `218.85 ms`, prefill mean `1.80 ms`) | about `83.46 tokens/s` (generation mean `1150.24 ms`, prefill mean `16.54 ms`) |
-| Qwen2.5-0.5B KV CUDA | eager CUDA initializer prepare, CUDA/cuBLAS warmup, RMSNorm primitive coverage, graph-scoped Constant reuse, tail-dimension CUDA broadcast | `generate=8` about `61.65 tokens/s` (generation mean `129.77 ms`, prefill mean `15.16 ms`) | about `171.36 tokens/s` (generation mean `46.68 ms`, prefill mean `4.75 ms`) | about `15.45 tokens/s` (generation mean `517.85 ms`, prefill mean `52.98 ms`) |
+| YOLOv8n | `--image pic/bus.jpg --warmup 3 --repeat 20 --planned-memory-reuse --graph-opt` | `4.219 / 4.211` | `84.089 / 82.115` | `33.679 / 36.564` |
+| GPT-2 KV cache | `--generate 48 --warmup 1 --repeat 5 --graph-opt` | `312.774 / 316.063` | `1098.070 / 1093.390` | `742.083 / 748.958` |
+| Qwen2.5-0.5B KV cache | `--generate 8 --warmup 1 --repeat 5 --graph-opt` | `188.249 / 186.674` | `526.887 / 529.762` | `568.310 / 575.832` |
 
 Optimization record:
 
