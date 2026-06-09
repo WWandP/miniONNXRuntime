@@ -187,6 +187,37 @@ void PrintConvShapeSummary(const miniort::Graph& graph) {
   std::cout << "\n";
 }
 
+void PrintMatMulShapeSummary(const miniort::Graph& graph) {
+  std::unordered_map<std::string, std::size_t> groups;
+  for (const auto& node : graph.nodes) {
+    if (node.op_type != "MatMul" || node.inputs.size() < 2) {
+      continue;
+    }
+    const auto lhs_shape = ReadShapeKey(graph, node.inputs.at(0));
+    const auto rhs_shape = ReadShapeKey(graph, node.inputs.at(1));
+    const auto output_shape = node.outputs.empty() ? "[]" : ReadShapeKey(graph, node.outputs.at(0));
+    const auto key = "lhs=" + lhs_shape + " rhs=" + rhs_shape + " output=" + output_shape;
+    ++groups[key];
+  }
+  if (groups.empty()) {
+    return;
+  }
+
+  std::vector<std::pair<std::string, std::size_t>> entries(groups.begin(), groups.end());
+  std::sort(entries.begin(), entries.end(), [](const auto& lhs, const auto& rhs) {
+    if (lhs.second != rhs.second) {
+      return lhs.second > rhs.second;
+    }
+    return lhs.first < rhs.first;
+  });
+
+  std::cout << "matmul_shape_summary:\n";
+  for (const auto& [key, count] : entries) {
+    std::cout << "  - count=" << count << " " << key << "\n";
+  }
+  std::cout << "\n";
+}
+
 void PrintGraphSummary(const miniort::Graph& graph, const miniort::SessionAssignmentSummary& assignment_summary) {
   constexpr std::size_t kShowTopology = 10;
   constexpr std::size_t kShowInitializers = 5;
@@ -244,6 +275,7 @@ void PrintGraphSummary(const miniort::Graph& graph, const miniort::SessionAssign
   }
   std::cout << "\n";
   PrintConvShapeSummary(graph);
+  PrintMatMulShapeSummary(graph);
 
   std::cout << "initializers_preview: first " << kShowInitializers << "\n";
   std::size_t initializer_index = 0;

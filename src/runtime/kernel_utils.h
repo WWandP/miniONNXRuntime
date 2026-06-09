@@ -1,10 +1,15 @@
 #pragma once
 
 #include <algorithm>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <deque>
+#include <exception>
 #include <functional>
+#include <memory>
+#include <mutex>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -16,31 +21,158 @@
 
 namespace miniort {
 
+namespace detail {
+
+class CpuThreadPool {
+ public:
+  inline static thread_local bool is_pool_worker_{false};
+
+  explicit CpuThreadPool(std::size_t worker_count) {
+    workers_.reserve(worker_count);
+    for (std::size_t i = 0; i < worker_count; ++i) {
+      workers_.emplace_back([this]() { WorkerLoop(); });
+    }
+  }
+
+  CpuThreadPool(const CpuThreadPool&) = delete;
+  CpuThreadPool& operator=(const CpuThreadPool&) = delete;
+
+  ~CpuThreadPool() {
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      stopping_ = true;
+    }
+    cv_.notify_all();
+    for (auto& worker : workers_) {
+      if (worker.joinable()) {
+        worker.join();
+      }
+    }
+  }
+
+  std::size_t WorkerCount() const {
+    return workers_.size();
+  }
+
+  void Schedule(std::function<void()> task) {
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      if (stopping_) {
+        throw std::runtime_error("CPU thread pool is stopping");
+      }
+      tasks_.push_back(std::move(task));
+    }
+    cv_.notify_one();
+  }
+
+ private:
+  void WorkerLoop() {
+    is_pool_worker_ = true;
+    while (true) {
+      std::function<void()> task;
+      {
+        std::unique_lock<std::mutex> lock(mutex_);
+        cv_.wait(lock, [this]() { return stopping_ || !tasks_.empty(); });
+        if (stopping_ && tasks_.empty()) {
+          break;
+        }
+        task = std::move(tasks_.front());
+        tasks_.pop_front();
+      }
+      task();
+    }
+    is_pool_worker_ = false;
+  }
+
+  std::vector<std::thread> workers_;
+  std::deque<std::function<void()>> tasks_;
+  std::mutex mutex_;
+  std::condition_variable cv_;
+  bool stopping_{false};
+};
+
+inline std::size_t CpuHardwareThreads() {
+  const auto hardware_threads = std::thread::hardware_concurrency();
+  return hardware_threads == 0 ? 1 : static_cast<std::size_t>(hardware_threads);
+}
+
+inline CpuThreadPool& GetCpuThreadPool() {
+  static CpuThreadPool pool(CpuHardwareThreads() > 1 ? CpuHardwareThreads() - 1 : 0);
+  return pool;
+}
+
+}  // namespace detail
+
 template <typename Fn>
 inline void ParallelFor(std::size_t count, std::size_t min_items_per_thread, Fn&& fn) {
   if (count == 0) {
     return;
   }
-  const auto hardware_threads = std::thread::hardware_concurrency();
-  const std::size_t max_threads = hardware_threads == 0 ? 1 : static_cast<std::size_t>(hardware_threads);
+  const std::size_t max_threads = detail::CpuHardwareThreads();
   const std::size_t desired_threads = std::min(max_threads, (count + min_items_per_thread - 1) / min_items_per_thread);
-  if (desired_threads <= 1) {
+  if (desired_threads <= 1 || detail::CpuThreadPool::is_pool_worker_) {
     fn(0, count);
     return;
   }
 
-  std::vector<std::thread> workers;
-  workers.reserve(desired_threads - 1);
+  struct TaskState {
+    std::mutex mutex;
+    std::condition_variable cv;
+    std::exception_ptr exception;
+    std::size_t remaining{0};
+  };
+
+  auto& pool = detail::GetCpuThreadPool();
+  if (pool.WorkerCount() == 0) {
+    fn(0, count);
+    return;
+  }
+
+  auto state = std::make_shared<TaskState>();
+  state->remaining = desired_threads - 1;
+
+  auto finish_task = [state](std::exception_ptr exception) {
+    {
+      std::lock_guard<std::mutex> lock(state->mutex);
+      if (exception != nullptr && state->exception == nullptr) {
+        state->exception = exception;
+      }
+      --state->remaining;
+    }
+    state->cv.notify_one();
+  };
+
   const auto block_size = (count + desired_threads - 1) / desired_threads;
   std::size_t begin = 0;
   for (std::size_t worker = 1; worker < desired_threads; ++worker) {
     const auto end = std::min(count, begin + block_size);
-    workers.emplace_back([begin, end, &fn]() { fn(begin, end); });
+    pool.Schedule([begin, end, &fn, finish_task]() {
+      try {
+        fn(begin, end);
+        finish_task(nullptr);
+      } catch (...) {
+        finish_task(std::current_exception());
+      }
+    });
     begin = end;
   }
-  fn(begin, count);
-  for (auto& worker : workers) {
-    worker.join();
+
+  std::exception_ptr caller_exception;
+  try {
+    fn(begin, count);
+  } catch (...) {
+    caller_exception = std::current_exception();
+  }
+
+  {
+    std::unique_lock<std::mutex> lock(state->mutex);
+    state->cv.wait(lock, [&state]() { return state->remaining == 0; });
+    if (caller_exception == nullptr && state->exception != nullptr) {
+      caller_exception = state->exception;
+    }
+  }
+  if (caller_exception != nullptr) {
+    std::rethrow_exception(caller_exception);
   }
 }
 

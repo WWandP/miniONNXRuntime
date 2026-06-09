@@ -27,6 +27,98 @@ namespace miniort {
 
 namespace {
 
+#if defined(MINIORT_ENABLE_AVX)
+inline __m256 MultiplyAdd(__m256 accum, __m256 lhs, __m256 rhs) {
+#if defined(__FMA__)
+  return _mm256_fmadd_ps(lhs, rhs, accum);
+#else
+  return _mm256_add_ps(accum, _mm256_mul_ps(lhs, rhs));
+#endif
+}
+#endif
+
+#if defined(MINIORT_ENABLE_SSE)
+inline __m128 MultiplyAdd(__m128 accum, __m128 lhs, __m128 rhs) {
+#if defined(__FMA__)
+  return _mm_fmadd_ps(lhs, rhs, accum);
+#else
+  return _mm_add_ps(accum, _mm_mul_ps(lhs, rhs));
+#endif
+}
+#endif
+
+#if defined(MINIORT_ENABLE_AVX)
+inline float HorizontalSum(__m256 values) {
+  alignas(32) float lanes[8];
+  _mm256_store_ps(lanes, values);
+  return lanes[0] + lanes[1] + lanes[2] + lanes[3] + lanes[4] + lanes[5] + lanes[6] + lanes[7];
+}
+#endif
+
+#if defined(MINIORT_ENABLE_SSE)
+inline float HorizontalSum(__m128 values) {
+  alignas(16) float lanes[4];
+  _mm_store_ps(lanes, values);
+  return lanes[0] + lanes[1] + lanes[2] + lanes[3];
+}
+#endif
+
+inline float DotProductContiguous(const float* lhs, const float* rhs, std::size_t count) {
+  std::size_t i = 0;
+  float sum = 0.0f;
+#if defined(MINIORT_ENABLE_AVX)
+  __m256 accum = _mm256_setzero_ps();
+  for (; i + 8 <= count; i += 8) {
+    const auto lhs_values = _mm256_loadu_ps(lhs + i);
+    const auto rhs_values = _mm256_loadu_ps(rhs + i);
+    accum = MultiplyAdd(accum, lhs_values, rhs_values);
+  }
+  sum += HorizontalSum(accum);
+#elif defined(MINIORT_ENABLE_SSE)
+  __m128 accum = _mm_setzero_ps();
+  for (; i + 4 <= count; i += 4) {
+    const auto lhs_values = _mm_loadu_ps(lhs + i);
+    const auto rhs_values = _mm_loadu_ps(rhs + i);
+    accum = MultiplyAdd(accum, lhs_values, rhs_values);
+  }
+  sum += HorizontalSum(accum);
+#endif
+  for (; i < count; ++i) {
+    sum += lhs[i] * rhs[i];
+  }
+  return sum;
+}
+
+inline void AddScaledRow(float* output, const float* row, float scale, std::size_t count) {
+  std::size_t i = 0;
+#if defined(MINIORT_ENABLE_AVX)
+  const auto scale_values = _mm256_set1_ps(scale);
+  for (; i + 8 <= count; i += 8) {
+    const auto row_values = _mm256_loadu_ps(row + i);
+    auto output_values = _mm256_loadu_ps(output + i);
+    output_values = MultiplyAdd(output_values, scale_values, row_values);
+    _mm256_storeu_ps(output + i, output_values);
+  }
+#elif defined(MINIORT_ENABLE_SSE)
+  const auto scale_values = _mm_set1_ps(scale);
+  for (; i + 4 <= count; i += 4) {
+    const auto row_values = _mm_loadu_ps(row + i);
+    auto output_values = _mm_loadu_ps(output + i);
+    output_values = MultiplyAdd(output_values, scale_values, row_values);
+    _mm_storeu_ps(output + i, output_values);
+  }
+#endif
+  for (; i < count; ++i) {
+    output[i] += scale * row[i];
+  }
+}
+
+inline bool ShouldParallelizeColumns(std::size_t m, std::size_t n, std::size_t k) {
+  constexpr std::size_t kMinColumns = 512;
+  constexpr std::size_t kMinOps = 256 * 1024;
+  return n >= kMinColumns && m * n * k >= kMinOps;
+}
+
 Tensor RunMatMul(const std::string& output_name, const Tensor& lhs, const Tensor& rhs, ExecutionContext& context) {
   const auto& lhs_data = RequireFloatData(lhs, "MatMul");
   const auto& rhs_data = RequireFloatData(rhs, "MatMul");
@@ -73,19 +165,23 @@ Tensor RunMatMul(const std::string& output_name, const Tensor& lhs, const Tensor
                 0.0f,
                 output.float_data.data() + output_base, static_cast<int>(n));
 #else
-    std::fill(output.float_data.begin() + static_cast<std::ptrdiff_t>(output_base),
-              output.float_data.begin() + static_cast<std::ptrdiff_t>(output_base + m * n), 0.0f);
-
-    for (std::size_t i = 0; i < m; ++i) {
-      const auto* lhs_row_ptr = lhs_data.data() + lhs_base + i * k;
-      auto* out_row_ptr = output.float_data.data() + output_base + i * n;
-      for (std::size_t kk = 0; kk < k; ++kk) {
-        const float lhs_value = lhs_row_ptr[kk];
-        const auto* rhs_row_ptr = rhs_data.data() + rhs_base + kk * n;
-        for (std::size_t j = 0; j < n; ++j) {
-          out_row_ptr[j] += lhs_value * rhs_row_ptr[j];
+    auto run_columns = [&](std::size_t column_begin, std::size_t column_end) {
+      const auto column_count = column_end - column_begin;
+      for (std::size_t i = 0; i < m; ++i) {
+        const auto* lhs_row_ptr = lhs_data.data() + lhs_base + i * k;
+        auto* out_row_ptr = output.float_data.data() + output_base + i * n + column_begin;
+        std::fill(out_row_ptr, out_row_ptr + column_count, 0.0f);
+        for (std::size_t kk = 0; kk < k; ++kk) {
+          const auto* rhs_row_ptr = rhs_data.data() + rhs_base + kk * n + column_begin;
+          AddScaledRow(out_row_ptr, rhs_row_ptr, lhs_row_ptr[kk], column_count);
         }
       }
+    };
+
+    if (ShouldParallelizeColumns(m, n, k)) {
+      ParallelFor(n, 16, run_columns);
+    } else {
+      run_columns(0, n);
     }
 #endif
   }
@@ -182,16 +278,40 @@ Tensor RunGemm2D(const Node& node, const Tensor& a, const Tensor& b, const Tenso
               0.0f,
               output.float_data.data(), static_cast<int>(n));
 #else
-  for (std::size_t i = 0; i < m; ++i) {
-    auto* out_row_ptr = output.float_data.data() + i * n;
-    const auto* a_row_ptr = trans_a ? nullptr : a_data.data() + i * a_cols;
-    for (std::size_t kk = 0; kk < k_a; ++kk) {
-      const auto a_value = trans_a ? a_data[kk * a_cols + i] : a_row_ptr[kk];
-      const auto* b_row_ptr = trans_b ? nullptr : b_data.data() + kk * b_cols;
-      for (std::size_t j = 0; j < n; ++j) {
-        const auto b_value = trans_b ? b_data[j * b_cols + kk] : b_row_ptr[j];
-        out_row_ptr[j] += alpha * a_value * b_value;
+  if (!trans_a && trans_b) {
+    auto run_columns = [&](std::size_t column_begin, std::size_t column_end) {
+      for (std::size_t i = 0; i < m; ++i) {
+        const auto* a_row_ptr = a_data.data() + i * a_cols;
+        auto* out_row_ptr = output.float_data.data() + i * n;
+        for (std::size_t j = column_begin; j < column_end; ++j) {
+          out_row_ptr[j] = alpha * DotProductContiguous(a_row_ptr, b_data.data() + j * b_cols, k_a);
+        }
       }
+    };
+    if (ShouldParallelizeColumns(m, n, k_a)) {
+      ParallelFor(n, 16, run_columns);
+    } else {
+      run_columns(0, n);
+    }
+  } else {
+    auto run_columns = [&](std::size_t column_begin, std::size_t column_end) {
+      for (std::size_t i = 0; i < m; ++i) {
+        auto* out_row_ptr = output.float_data.data() + i * n;
+        const auto* a_row_ptr = trans_a ? nullptr : a_data.data() + i * a_cols;
+        for (std::size_t kk = 0; kk < k_a; ++kk) {
+          const auto a_value = trans_a ? a_data[kk * a_cols + i] : a_row_ptr[kk];
+          const auto* b_row_ptr = trans_b ? nullptr : b_data.data() + kk * b_cols;
+          for (std::size_t j = column_begin; j < column_end; ++j) {
+            const auto b_value = trans_b ? b_data[j * b_cols + kk] : b_row_ptr[j];
+            out_row_ptr[j] += alpha * a_value * b_value;
+          }
+        }
+      }
+    };
+    if (ShouldParallelizeColumns(m, n, k_a)) {
+      ParallelFor(n, 16, run_columns);
+    } else {
+      run_columns(0, n);
     }
   }
 #endif
@@ -216,26 +336,6 @@ enum class ConvPostOp {
   kNone,
   kSiLU,
 };
-
-#if defined(MINIORT_ENABLE_AVX)
-inline __m256 MultiplyAdd(__m256 accum, __m256 lhs, __m256 rhs) {
-#if defined(__FMA__)
-  return _mm256_fmadd_ps(lhs, rhs, accum);
-#else
-  return _mm256_add_ps(accum, _mm256_mul_ps(lhs, rhs));
-#endif
-}
-#endif
-
-#if defined(MINIORT_ENABLE_SSE)
-inline __m128 MultiplyAdd(__m128 accum, __m128 lhs, __m128 rhs) {
-#if defined(__FMA__)
-  return _mm_fmadd_ps(lhs, rhs, accum);
-#else
-  return _mm_add_ps(accum, _mm_mul_ps(lhs, rhs));
-#endif
-}
-#endif
 
 Tensor RunConv2D(const Node& node, const Tensor& input, const Tensor& weight, const Tensor* bias,
                  ExecutionContext& context, ConvPostOp post_op = ConvPostOp::kNone) {
